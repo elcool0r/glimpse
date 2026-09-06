@@ -20,12 +20,15 @@ import (
 	"github.com/elcool0r/glimpse/internal/collect/cgroupv2"
 	"github.com/elcool0r/glimpse/internal/collect/containers"
 	"github.com/elcool0r/glimpse/internal/collect/cpu"
+	"github.com/elcool0r/glimpse/internal/collect/deletedfiles"
 	"github.com/elcool0r/glimpse/internal/collect/disk"
 	"github.com/elcool0r/glimpse/internal/collect/dnsresolution"
 	"github.com/elcool0r/glimpse/internal/collect/filesystem"
 	"github.com/elcool0r/glimpse/internal/collect/gatewayping"
 	"github.com/elcool0r/glimpse/internal/collect/hardware"
 	"github.com/elcool0r/glimpse/internal/collect/httpcheck"
+	"github.com/elcool0r/glimpse/internal/collect/icmpcheck"
+	"github.com/elcool0r/glimpse/internal/collect/ipv6check"
 	"github.com/elcool0r/glimpse/internal/collect/kernel"
 	"github.com/elcool0r/glimpse/internal/collect/memory"
 	"github.com/elcool0r/glimpse/internal/collect/network"
@@ -59,9 +62,9 @@ func main() {
 	flag.BoolVar(&jsonOutput, "json", false, "emit stable JSON")
 	flag.BoolVar(&noColor, "no-color", false, "disable color output")
 	flag.BoolVar(&verbose, "verbose", false, "show every check performed, not just problems")
-	flag.BoolVar(&disableExternalChecks, "disable-external-checks", false, "disable active checks that send real network traffic (DNS resolution against 1.1.1.1, gateway ping, path MTU probe, HTTP/HTTPS GET to example.com); on by default")
+	flag.BoolVar(&disableExternalChecks, "disable-external-checks", false, "disable active checks that send real network traffic (DNS resolution, gateway/external/IPv6 ICMP, path MTU probe, HTTP/HTTPS GET); on by default")
 	flag.BoolVar(&showVersion, "version", false, "print version")
-	flag.BoolVar(&bashCompletion, "bash-completion", false, "print Bash completion script")
+	flag.BoolVar(&bashCompletion, "bash-completion", false, "print Bash completion script; use as: source <(glimpse --bash-completion)")
 	flag.CommandLine.Usage = usage
 	if err := flag.CommandLine.Parse(os.Args[1:]); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -110,13 +113,13 @@ func defaultCollectors(includeContainers, enableExternalChecks bool) []collect.C
 		network.Collector{}, network.TCPCollector{}, networkstate.New(), thermal.Collector{},
 		process.Collector{}, systemd.New(), kernel.New(), timesync.New(), resources.New(),
 		security.New(), cgroupv2.New(), zfs.New(), storage.New(), hardware.New(),
-		storagehealth.New(),
+		storagehealth.New(), deletedfiles.New(),
 	}
 	if includeContainers {
 		collectors = append(collectors, containers.New())
 	}
 	if enableExternalChecks {
-		collectors = append(collectors, dnsresolution.New(), gatewayping.New(), pathmtu.New(), httpcheck.New())
+		collectors = append(collectors, dnsresolution.New(), gatewayping.New(), pathmtu.New(), httpcheck.New(), icmpcheck.New(), ipv6check.New())
 	}
 	return collectors
 }

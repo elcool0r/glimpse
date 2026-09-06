@@ -225,6 +225,33 @@ func TestProcessesAreVerboseUnlessActionable(t *testing.T) {
 	}
 }
 
+// A CPU (or memory) finding names no culprit by itself; Top CPU/RAM must
+// surface in the default report so the reader does not have to reach for
+// --verbose just to see which process is responsible.
+func TestTopCPUShownOnCPUFindingWithoutVerbose(t *testing.T) {
+	report := model.Report{
+		Metrics:  model.Metrics{Processes: &model.Processes{TopCPU: []model.Process{{Command: "yes", PID: 123}}}},
+		Findings: []model.Finding{{ID: "cpu-contention", Severity: model.SeverityWarning, Category: "cpu", Title: "Sustained CPU contention"}},
+	}
+	var output bytes.Buffer
+	Write(&output, report, Options{})
+	if !strings.Contains(output.String(), "Top CPU") || !strings.Contains(output.String(), "yes") {
+		t.Fatal(output.String())
+	}
+}
+
+func TestTopRAMShownOnMemoryFindingWithoutVerbose(t *testing.T) {
+	report := model.Report{
+		Metrics:  model.Metrics{Processes: &model.Processes{TopRSS: []model.Process{{Command: "leaky", PID: 456}}}},
+		Findings: []model.Finding{{ID: "memory-pressure", Severity: model.SeverityWarning, Category: "memory", Title: "Memory pressure observed"}},
+	}
+	var output bytes.Buffer
+	Write(&output, report, Options{})
+	if !strings.Contains(output.String(), "Top RAM") || !strings.Contains(output.String(), "leaky") {
+		t.Fatal(output.String())
+	}
+}
+
 func TestFormatSuggestionColorsPrefixAndCommand(t *testing.T) {
 	got := formatSuggestion("Review with docker logs --since 1h samba", true)
 	want := "\x1b[37mReview with \x1b[0m\x1b[34mdocker logs --since 1h samba\x1b[0m"

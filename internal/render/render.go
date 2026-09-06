@@ -190,10 +190,28 @@ func Write(w io.Writer, r model.Report, o Options) {
 			note("resources")
 		}
 	}
-	if p := r.Metrics.Processes; p != nil && (o.Verbose || severityRank(sectionSeverity(r.Findings, "process")) >= severityRank(model.SeverityWarning)) {
-		severity := sectionSeverity(r.Findings, "process")
-		renderProcesses(w, width, sectionLabel("Top CPU", severity, o.Color), p.TopCPU, separator, p.CPUSampled)
-		renderProcesses(w, width, sectionLabel("Top RAM", severity, o.Color), withoutPIDs(p.TopRSS, p.TopCPU), separator, p.CPUSampled)
+	if p := r.Metrics.Processes; p != nil {
+		processSeverity := sectionSeverity(r.Findings, "process")
+		// A CPU or memory finding names no culprit by itself; showing the
+		// ranked process lists here is what turns "CPU contention" into
+		// "CPU contention, and this is probably why" without waiting for
+		// --verbose.
+		cpuSeverity := sectionSeverity(r.Findings, "cpu")
+		memSeverity := sectionSeverity(r.Findings, "memory")
+		if o.Verbose || severityRank(processSeverity) >= severityRank(model.SeverityWarning) || severityRank(cpuSeverity) >= severityRank(model.SeverityWarning) {
+			topCPUSeverity := processSeverity
+			if severityRank(cpuSeverity) > severityRank(topCPUSeverity) {
+				topCPUSeverity = cpuSeverity
+			}
+			renderProcesses(w, width, sectionLabel("Top CPU", topCPUSeverity, o.Color), p.TopCPU, separator, p.CPUSampled)
+		}
+		if o.Verbose || severityRank(processSeverity) >= severityRank(model.SeverityWarning) || severityRank(memSeverity) >= severityRank(model.SeverityWarning) {
+			topRAMSeverity := processSeverity
+			if severityRank(memSeverity) > severityRank(topRAMSeverity) {
+				topRAMSeverity = memSeverity
+			}
+			renderProcesses(w, width, sectionLabel("Top RAM", topRAMSeverity, o.Color), withoutPIDs(p.TopRSS, p.TopCPU), separator, p.CPUSampled)
+		}
 	}
 	renderIntegrations(w, width, r, separator, o.Color, o.Verbose)
 	findings := actionableFindings(r.Findings)

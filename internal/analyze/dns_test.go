@@ -113,7 +113,7 @@ func TestDNSResolutionLocalOnlyFailIsWarning(t *testing.T) {
 	}
 }
 
-func TestDNSResolutionExternalOnlyFailIsInfo(t *testing.T) {
+func TestDNSResolutionExternalOnlyFailIsCritical(t *testing.T) {
 	report := resolutionReport(&model.DNSResolution{
 		Available: true,
 		Local:     &model.DNSResolutionResult{Server: "192.0.2.53", Domain: "example.com", Resolved: true},
@@ -124,8 +124,8 @@ func TestDNSResolutionExternalOnlyFailIsInfo(t *testing.T) {
 	if found == nil {
 		t.Fatalf("no finding when only the external resolver failed: %+v", report.Findings)
 	}
-	if found.Severity != model.SeverityInfo {
-		t.Fatalf("severity = %s, want info", found.Severity)
+	if found.Severity != model.SeverityCritical {
+		t.Fatalf("severity = %s, want critical", found.Severity)
 	}
 }
 

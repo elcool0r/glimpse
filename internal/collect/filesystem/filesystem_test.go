@@ -18,7 +18,9 @@ func TestParseMountInfo(t *testing.T) {
 	if len(mounts) != 4 || mounts[3].Target != "/srv data" || !mounts[3].ReadOnly {
 		t.Fatalf("unexpected mounts: %#v", mounts)
 	}
-	if !IsReal(mounts[0]) || IsReal(mounts[1]) || IsReal(mounts[2]) {
+	// tmpfs (mounts[1]) is real: it can be provisioned with a fixed size and
+	// genuinely fill up, unlike proc (mounts[2]).
+	if !IsReal(mounts[0]) || !IsReal(mounts[1]) || IsReal(mounts[2]) {
 		t.Fatalf("wrong real filesystem classification")
 	}
 }

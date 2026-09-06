@@ -64,10 +64,11 @@ func Report(report *model.Report) {
 				name  string
 				count uint64
 			}{{"errors", direction.errors}, {"drops", direction.drops}, {"overruns", direction.overruns}} {
-				if signal.count < networkMinimumEvents || float64(signal.count)/(float64(direction.packets)+float64(signal.count)) < networkWarningRatio {
+				ratio := float64(signal.count) / (float64(direction.packets) + float64(signal.count))
+				if signal.count < networkMinimumEvents || ratio < networkWarningRatio {
 					continue
 				}
-				findings = append(findings, finding("network-"+n.Name+"-"+direction.name+"-"+signal.name, model.SeverityWarning, "network", "Elevated network "+signal.name, fmt.Sprintf("%s %s recorded %d %s alongside %d packets during the sample.", n.Name, direction.name, signal.count, signal.name, direction.packets), "Inspect interface and peer counters; for drops and overruns, also inspect queues and application receive capacity.", 7))
+				findings = append(findings, finding("network-"+n.Name+"-"+direction.name+"-"+signal.name, model.SeverityWarning, "network", "Elevated network "+signal.name, fmt.Sprintf("%s %s recorded %d %s alongside %d packets during the sample (%.1f%%).", n.Name, direction.name, signal.count, signal.name, direction.packets, ratio*100), "Inspect interface and peer counters; for drops and overruns, also inspect queues and application receive capacity.", 7))
 			}
 		}
 		findings = append(findings, linkFindings(n)...)

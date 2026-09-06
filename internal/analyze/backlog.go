@@ -18,6 +18,9 @@ func backlogFindings(report *model.Report) []model.Finding {
 	findings = append(findings, gatewayFindings(report.Metrics.GatewayCheck)...)
 	findings = append(findings, pathMTUFindings(report.Metrics.PathMTUCheck)...)
 	findings = append(findings, httpCheckFindings(report.Metrics.HTTPCheck)...)
+	findings = append(findings, icmpCheckFindings(report.Metrics.ICMPCheck)...)
+	findings = append(findings, ipv6CheckFindings(report.Metrics.IPv6Check)...)
+	findings = append(findings, deletedFilesFindings(report.Metrics.DeletedFiles)...)
 	findings = append(findings, hardwareErrorFindings(report.Metrics.Hardware)...)
 	return findings
 }
@@ -157,11 +160,12 @@ func dnsFindings(state *model.NetworkState, systemd *model.Systemd) []model.Find
 	return nil
 }
 
-// dnsResolutionFindings judges the active probe: --check-dns-resolution sends
-// a real query to the local nameserver and to 1.1.1.1. Losing only the
-// external one is common on hosts with restricted outbound access and is not
-// by itself a fault, so it stays informational; losing the local resolver, or
-// losing both, means names cannot be resolved and is reported accordingly.
+// dnsResolutionFindings judges the active probe: the external checks send a
+// real query to the local nameserver and to 1.1.1.1 (--disable-external-checks
+// turns this off). Losing the external resolver while the local one still
+// answers means this host cannot resolve names anywhere on the public
+// internet, which is treated as critical; losing the local resolver, or
+// losing both, is reported accordingly.
 func dnsResolutionFindings(resolution *model.DNSResolution) []model.Finding {
 	if resolution == nil || !resolution.Available {
 		return nil
@@ -186,9 +190,9 @@ func dnsResolutionFindings(resolution *model.DNSResolution) []model.Finding {
 			fmt.Sprintf("Resolving %s against the configured nameserver (%s) failed, but the same query succeeded against %s.", resolution.Local.Domain, resolution.Local.Server, resolution.External.Server),
 			"Inspect the local DNS server or forwarder; clients depending on it cannot resolve names.", 15)}
 	case externalAttempted && !externalOK:
-		return []model.Finding{finding("dns-resolution-external-failed", model.SeverityInfo, "network", "External DNS server unreachable",
-			fmt.Sprintf("Resolving %s against %s failed, though the local nameserver resolves it; this may be intentional (restricted outbound access).", resolution.External.Domain, resolution.External.Server),
-			"Confirm whether outbound DNS to public resolvers is intentionally restricted.", 0)}
+		return []model.Finding{finding("dns-resolution-external-failed", model.SeverityCritical, "network", "External DNS server unreachable",
+			fmt.Sprintf("Resolving %s against %s failed, though the local nameserver resolves it. If this is not an intentionally firewalled host, outbound DNS to the public internet is broken.", resolution.External.Domain, resolution.External.Server),
+			"Confirm whether outbound DNS to public resolvers is intentionally restricted; if not, inspect the network path and firewall rules for UDP/TCP 53 to public resolvers.", 15)}
 	}
 	return nil
 }
@@ -197,6 +201,17 @@ func dnsResolutionFindings(resolution *model.DNSResolution) []model.Finding {
 // nothing off-link is reachable; partial loss is reported only past a
 // majority threshold so an occasional dropped ping on a healthy link does not
 // warn.
+// gatewayLatencyWarningMillis and gatewayLatencyCriticalMillis are deliberately
+// strict: the default gateway is normally on the same local network segment,
+// where round-trip time is expected in the low single-digit milliseconds
+// even over a loaded home network. Triple-digit latency there is a real,
+// unusual fault (a saturated link, a misbehaving switch, traffic shaping) and
+// not a normal condition to filter out.
+const (
+	gatewayLatencyWarningMillis  = 200.0
+	gatewayLatencyCriticalMillis = 500.0
+)
+
 func gatewayFindings(check *model.GatewayCheck) []model.Finding {
 	if check == nil || !check.Available || check.Sent == 0 {
 		return nil
@@ -206,12 +221,22 @@ func gatewayFindings(check *model.GatewayCheck) []model.Finding {
 			fmt.Sprintf("All %d ICMP echo requests to the default gateway (%s) went unanswered.", check.Sent, check.Gateway),
 			"Inspect the local network link, switch/router, and default gateway configuration.", 20)}
 	}
+	var findings []model.Finding
 	if check.PacketLossPct >= 50 {
-		return []model.Finding{finding("gateway-packet-loss", model.SeverityWarning, "network", "Default gateway is dropping pings",
+		findings = append(findings, finding("gateway-packet-loss", model.SeverityWarning, "network", "Default gateway is dropping pings",
 			fmt.Sprintf("%.0f%% of ICMP echo requests to the default gateway (%s) were lost (%d of %d).", check.PacketLossPct, check.Gateway, check.Sent-check.Received, check.Sent),
-			"Inspect the local network link and gateway health.", 10)}
+			"Inspect the local network link and gateway health.", 10))
 	}
-	return nil
+	if check.AvgLatencyMillis >= gatewayLatencyWarningMillis {
+		severity, impact := model.SeverityWarning, 8
+		if check.AvgLatencyMillis >= gatewayLatencyCriticalMillis {
+			severity, impact = model.SeverityCritical, 15
+		}
+		findings = append(findings, finding("gateway-high-latency", severity, "network", "Default gateway latency is elevated",
+			fmt.Sprintf("Average round-trip time to the default gateway (%s) was %.0f ms during the sample; a local, same-segment gateway is normally single-digit milliseconds.", check.Gateway, check.AvgLatencyMillis),
+			"Inspect local link saturation, duplex/speed mismatches, and traffic shaping on the path to the gateway.", impact))
+	}
+	return findings
 }
 
 // pathMTUFindings judges the discovered path MTU, not just whether the
@@ -267,6 +292,100 @@ func httpCheckFindings(check *model.HTTPCheck) []model.Finding {
 			"This is unusual since HTTPS succeeded; inspect port 80 filtering specifically.", 0)}
 	}
 	return nil
+}
+
+// externalLatencyWarningMillis and externalLatencyCriticalMillis are looser
+// than the gateway thresholds: 1.1.1.1 is anycast with points of presence in
+// most regions, but real, healthy round trips still vary far more than a
+// same-segment gateway does depending on the user's own location and access
+// network. These stay conservative enough to avoid warning on ordinary
+// broadband or a distant-but-working path, while still catching a gross
+// degradation like a saturated link or heavy shaping.
+const (
+	externalLatencyWarningMillis  = 300.0
+	externalLatencyCriticalMillis = 800.0
+)
+
+// icmpCheckFindings judges the external ICMP probe. No reply at all means
+// this host cannot reach anything beyond its own gateway over ICMP, which a
+// healthy gateway-only check cannot see; partial loss and elevated latency
+// are judged the same way the gateway check judges its own probe.
+func icmpCheckFindings(check *model.ICMPCheck) []model.Finding {
+	if check == nil || !check.Available || check.Sent == 0 {
+		return nil
+	}
+	if check.Received == 0 {
+		return []model.Finding{finding("icmp-external-unreachable", model.SeverityCritical, "network", "External network is not reachable via ICMP",
+			fmt.Sprintf("All %d ICMP echo requests to %s went unanswered, even though this is independent of the default gateway check.", check.Sent, check.Target),
+			"Inspect outbound ICMP filtering, the upstream network path, and whether this host has working internet access at all.", 20)}
+	}
+	var findings []model.Finding
+	if check.PacketLossPct >= 50 {
+		findings = append(findings, finding("icmp-external-packet-loss", model.SeverityWarning, "network", "External ICMP packets are being dropped",
+			fmt.Sprintf("%.0f%% of ICMP echo requests to %s were lost (%d of %d).", check.PacketLossPct, check.Target, check.Sent-check.Received, check.Sent),
+			"Inspect the upstream network path for congestion or filtering.", 10))
+	}
+	if check.AvgLatencyMillis >= externalLatencyWarningMillis {
+		severity, impact := model.SeverityWarning, 8
+		if check.AvgLatencyMillis >= externalLatencyCriticalMillis {
+			severity, impact = model.SeverityCritical, 15
+		}
+		findings = append(findings, finding("icmp-external-high-latency", severity, "network", "External network latency is elevated",
+			fmt.Sprintf("Average round-trip time to %s was %.0f ms during the sample.", check.Target, check.AvgLatencyMillis),
+			"Inspect upstream link saturation and traffic shaping; a persistently high round trip degrades every network-dependent service.", impact))
+	}
+	return findings
+}
+
+// ipv6CheckFindings judges the external IPv6 probe. It only ever runs (see
+// internal/collect/ipv6check) when the host has a global IPv6 address
+// configured, so reaching this function at all means the host believes it
+// has working IPv6 -- an IPv4-only host never produces a check to judge.
+func ipv6CheckFindings(check *model.IPv6Check) []model.Finding {
+	if check == nil || !check.Available || check.Sent == 0 {
+		return nil
+	}
+	if check.Received == 0 {
+		return []model.Finding{finding("ipv6-unreachable", model.SeverityCritical, "network", "IPv6 is configured but unreachable",
+			fmt.Sprintf("This host has a global IPv6 address, but all %d ICMPv6 echo requests to %s went unanswered.", check.Sent, check.Target),
+			"Inspect IPv6 firewall rules, the upstream IPv6 path, and router/prefix advertisements.", 15)}
+	}
+	if check.PacketLossPct >= 50 {
+		return []model.Finding{finding("ipv6-packet-loss", model.SeverityWarning, "network", "IPv6 packets are being dropped",
+			fmt.Sprintf("%.0f%% of ICMPv6 echo requests to %s were lost (%d of %d).", check.PacketLossPct, check.Target, check.Sent-check.Received, check.Sent),
+			"Inspect the IPv6 network path for congestion or filtering.", 8)}
+	}
+	return nil
+}
+
+// deletedFilesWarningBytes and deletedFilesCriticalBytes are deliberately
+// well above what an ordinary rotated log or short-lived temp file leaves
+// behind for a moment; this is meant to catch a genuine, sustained "where
+// did my disk space go" condition, not routine housekeeping churn.
+const (
+	deletedFilesWarningBytes  = 200 << 20 // 200 MiB
+	deletedFilesCriticalBytes = 2 << 30   // 2 GiB
+)
+
+// deletedFilesFindings judges the /proc/*/fd scan. The scan is inherently
+// partial for a non-root run (it only sees processes this user can inspect),
+// so this only judges what was actually found -- it never claims host-wide
+// coverage.
+func deletedFilesFindings(df *model.DeletedFiles) []model.Finding {
+	if df == nil || !df.Available || df.TotalBytes < deletedFilesWarningBytes {
+		return nil
+	}
+	severity, impact := model.SeverityWarning, 10
+	if df.TotalBytes >= deletedFilesCriticalBytes {
+		severity, impact = model.SeverityCritical, 20
+	}
+	detail := fmt.Sprintf("%s across %d process(es) scanned is held open by deleted-but-still-open files; this space will not be freed until those descriptors close.", bytes(df.TotalBytes), df.ProcessesScanned)
+	if len(df.Handles) > 0 {
+		top := df.Handles[0]
+		detail += fmt.Sprintf(" Largest: %s (pid %d) holding %s at %s.", top.Command, top.PID, bytes(top.Bytes), top.Path)
+	}
+	return []model.Finding{finding("deleted-files-open", severity, "storage", "Deleted files are still held open, consuming disk space",
+		detail, "Identify the process(es) holding these descriptors (lsof +L1, or inspect /proc/<pid>/fd) and restart or signal them to release the space.", impact)}
 }
 
 func resolvedFailed(failed []string) bool {

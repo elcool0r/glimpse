@@ -29,11 +29,19 @@ type Usage struct {
 	UsedInodeFraction float64
 }
 
+// tmpfs is deliberately not in this set: it is RAM-backed but genuinely
+// mountable with a fixed size, and can fill up exactly like a disk-backed
+// filesystem (a provisioned scratch/cache volume, a container's shared
+// memory segment under real load). Excluding it entirely hid a real "disk"
+// full condition. The usual small system tmpfs mounts (/run, /dev/shm,
+// per-session XDG runtime dirs) rarely approach the existing conservative
+// capacity thresholds, so this does not trade away the "avoid false
+// positives" rule -- it only stops hiding a genuine one.
 var pseudoTypes = map[string]struct{}{
 	"autofs": {}, "bpf": {}, "cgroup": {}, "cgroup2": {}, "configfs": {}, "debugfs": {},
 	"devpts": {}, "devtmpfs": {}, "efivarfs": {}, "fusectl": {}, "hugetlbfs": {},
 	"mqueue": {}, "nsfs": {}, "overlay": {}, "proc": {}, "pstore": {}, "ramfs": {},
-	"securityfs": {}, "sysfs": {}, "tmpfs": {}, "tracefs": {},
+	"securityfs": {}, "sysfs": {}, "tracefs": {},
 }
 
 // ParseMountInfo reads mount records. It delegates to the shared parser so
@@ -55,7 +63,7 @@ func IsReal(m Mount) bool {
 var localTypes = map[string]struct{}{
 	"btrfs": {}, "ext2": {}, "ext3": {}, "ext4": {}, "f2fs": {},
 	"vfat": {}, "exfat": {}, "ntfs3": {}, "erofs": {}, "squashfs": {}, "iso9660": {}, "udf": {},
-	"jfs": {}, "nilfs2": {}, "reiserfs": {}, "xfs": {}, "zfs": {},
+	"jfs": {}, "nilfs2": {}, "reiserfs": {}, "xfs": {}, "zfs": {}, "tmpfs": {},
 }
 
 // Collect reads /proc/self/mountinfo and statfs data. Missing procfs is reported
