@@ -15,10 +15,6 @@ jobs:
     strategy:
       matrix:
         goarch: [amd64, arm64]
-    env:
-      GOOS: linux
-      GOARCH: ${{ matrix.goarch }}
-      CGO_ENABLED: 0
     steps:
       - uses: actions/checkout@v4
 
@@ -27,10 +23,17 @@ jobs:
           go-version: "1.24"
           check-latest: true
 
+      # Runs natively on the runner's own architecture (amd64), regardless of
+      # which arch this matrix leg is cross-compiling for below -- a cross-
+      # compiled arm64 test binary cannot execute on an amd64 runner.
       - name: Test
         run: go test ./...
 
       - name: Build
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
         run: |
           mkdir -p dist
           go build -trimpath -ldflags="-s -w -X github.com/elcool0r/glimpse/internal/version.Version=${GITHUB_REF_NAME}" \
