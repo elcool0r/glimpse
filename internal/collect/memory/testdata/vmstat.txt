@@ -1,0 +1,6 @@
+pgpgin 1
+pgpgout 2
+pswpin 3
+pswpout 4
+pgfault 5
+pgmajfault 6

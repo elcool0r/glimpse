@@ -1,0 +1,26 @@
+# Build artifacts
+/glimpse
+/dist/
+*.exe
+*.test
+*.out
+
+# Go
+/vendor/
+
+# Coverage
+coverage.txt
+coverage.html
+
+# Editor / OS cruft
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local scratch
+Claude outputs/
+CODE-REVIEW.md
+
+AGENTS.md
+CLAUDE.md

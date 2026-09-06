@@ -1,0 +1,265 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"os/signal"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/elcool0r/glimpse/internal/analyze"
+	"github.com/elcool0r/glimpse/internal/app"
+	"github.com/elcool0r/glimpse/internal/collect"
+	"github.com/elcool0r/glimpse/internal/collect/cgroupv2"
+	"github.com/elcool0r/glimpse/internal/collect/containers"
+	"github.com/elcool0r/glimpse/internal/collect/cpu"
+	"github.com/elcool0r/glimpse/internal/collect/disk"
+	"github.com/elcool0r/glimpse/internal/collect/dnsresolution"
+	"github.com/elcool0r/glimpse/internal/collect/filesystem"
+	"github.com/elcool0r/glimpse/internal/collect/gatewayping"
+	"github.com/elcool0r/glimpse/internal/collect/hardware"
+	"github.com/elcool0r/glimpse/internal/collect/httpcheck"
+	"github.com/elcool0r/glimpse/internal/collect/kernel"
+	"github.com/elcool0r/glimpse/internal/collect/memory"
+	"github.com/elcool0r/glimpse/internal/collect/network"
+	"github.com/elcool0r/glimpse/internal/collect/networkstate"
+	"github.com/elcool0r/glimpse/internal/collect/pathmtu"
+	"github.com/elcool0r/glimpse/internal/collect/process"
+	"github.com/elcool0r/glimpse/internal/collect/resources"
+	"github.com/elcool0r/glimpse/internal/collect/security"
+	"github.com/elcool0r/glimpse/internal/collect/storage"
+	"github.com/elcool0r/glimpse/internal/collect/storagehealth"
+	"github.com/elcool0r/glimpse/internal/collect/systemd"
+	"github.com/elcool0r/glimpse/internal/collect/thermal"
+	"github.com/elcool0r/glimpse/internal/collect/timesync"
+	"github.com/elcool0r/glimpse/internal/collect/zfs"
+	"github.com/elcool0r/glimpse/internal/model"
+	"github.com/elcool0r/glimpse/internal/platform"
+	"github.com/elcool0r/glimpse/internal/render"
+	"github.com/elcool0r/glimpse/internal/version"
+)
+
+func main() {
+	if err := requireLongOptions(os.Args[1:]); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(3)
+	}
+	flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
+	var duration time.Duration
+	var noContainers, jsonOutput, noColor, verbose, disableExternalChecks, showVersion, bashCompletion bool
+	flag.DurationVar(&duration, "duration", 5*time.Second, "sampling duration (default: 5s); increase for a longer, more thorough sample, e.g. --duration 60s")
+	flag.BoolVar(&noContainers, "no-containers", false, "disable automatic container inspection")
+	flag.BoolVar(&jsonOutput, "json", false, "emit stable JSON")
+	flag.BoolVar(&noColor, "no-color", false, "disable color output")
+	flag.BoolVar(&verbose, "verbose", false, "show every check performed, not just problems")
+	flag.BoolVar(&disableExternalChecks, "disable-external-checks", false, "disable active checks that send real network traffic (DNS resolution against 1.1.1.1, gateway ping, path MTU probe, HTTP/HTTPS GET to example.com); on by default")
+	flag.BoolVar(&showVersion, "version", false, "print version")
+	flag.BoolVar(&bashCompletion, "bash-completion", false, "print Bash completion script")
+	flag.CommandLine.Usage = usage
+	if err := flag.CommandLine.Parse(os.Args[1:]); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return
+		}
+		os.Exit(3)
+	}
+	if bashCompletion {
+		fmt.Fprint(os.Stdout, bashCompletionScript)
+		return
+	}
+	if showVersion {
+		fmt.Println(version.Version)
+		return
+	}
+	if duration < 0 || flag.NArg() != 0 {
+		fmt.Fprintln(os.Stderr, "duration must be non-negative and positional arguments are not supported")
+		os.Exit(3)
+	}
+	containerEnabled := !noContainers && runtimeAvailable()
+	collectors := defaultCollectors(containerEnabled, !disableExternalChecks)
+	tty := platform.IsTerminal(os.Stdout)
+	var progress func(app.Progress)
+	if tty && !jsonOutput {
+		progress = progressWriter(os.Stderr)
+	}
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	report := app.Run(ctx, app.Config{Duration: duration, SampleInterval: time.Second, Full: true, IncludeContainers: containerEnabled, Progress: progress}, collectors)
+	analyze.Report(&report)
+	code := writeReport(os.Stdout, os.Stderr, report, jsonOutput, verbose, render.Options{Color: !noColor && os.Getenv("NO_COLOR") == "" && tty, Verbose: verbose, Width: platform.TerminalWidth(os.Stdout), ASCII: !tty})
+	if ctx.Err() != nil {
+		code = 3
+	}
+	os.Exit(code)
+}
+
+// defaultCollectors is the registered collection profile. It is a function so
+// a test can assert that every metric the analyzer and renderer branch on is
+// actually reachable: the TCP collector previously existed, was tested, and
+// was documented, but was never registered, leaving its model field, its
+// findings and its report row unreachable in the shipped binary.
+func defaultCollectors(includeContainers, enableExternalChecks bool) []collect.Collector {
+	collectors := []collect.Collector{
+		cpu.Collector{}, memory.Collector{}, filesystem.Collector{}, disk.Collector{},
+		network.Collector{}, network.TCPCollector{}, networkstate.New(), thermal.Collector{},
+		process.Collector{}, systemd.New(), kernel.New(), timesync.New(), resources.New(),
+		security.New(), cgroupv2.New(), zfs.New(), storage.New(), hardware.New(),
+		storagehealth.New(),
+	}
+	if includeContainers {
+		collectors = append(collectors, containers.New())
+	}
+	if enableExternalChecks {
+		collectors = append(collectors, dnsresolution.New(), gatewayping.New(), pathmtu.New(), httpcheck.New())
+	}
+	return collectors
+}
+
+func requireLongOptions(args []string) error {
+	for _, arg := range args {
+		if arg == "--" {
+			break
+		}
+		if strings.HasPrefix(arg, "-") && !strings.HasPrefix(arg, "--") {
+			return fmt.Errorf("single-dash option %q is not supported; use --%s", arg, strings.TrimPrefix(arg, "-"))
+		}
+	}
+	return nil
+}
+
+func writeReport(stdout, stderr io.Writer, report model.Report, jsonOutput, verbose bool, options render.Options) int {
+	if jsonOutput {
+		encoder := json.NewEncoder(stdout)
+		encoder.SetIndent("", "  ")
+		if err := encoder.Encode(report); err != nil {
+			fmt.Fprintln(stderr, err)
+			return 3
+		}
+	} else {
+		output := &checkedWriter{Writer: stdout}
+		render.Write(output, report, options)
+		if output.err != nil {
+			fmt.Fprintln(stderr, output.err)
+			return 3
+		}
+	}
+	if verbose {
+		for _, status := range report.Collection {
+			if status.Status != "ok" {
+				fmt.Fprintf(stderr, "%s: %s %s\n", render.SafeText(status.Collector), render.SafeText(status.Status), render.SafeText(status.Detail))
+			}
+		}
+	}
+	for _, status := range report.Collection {
+		if status.Collector == "sampling" && status.Status == "error" {
+			return 3
+		}
+	}
+	switch report.Score.Status {
+	case model.SeverityCritical:
+		return 2
+	case model.SeverityWarning:
+		return 1
+	case model.SeverityUnknown:
+		return 3
+	default:
+		return 0
+	}
+}
+
+func runtimeAvailable() bool {
+	for _, runtime := range []string{"podman", "docker"} {
+		if _, err := exec.LookPath(runtime); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+func progressWriter(w io.Writer) func(app.Progress) {
+	shown := false
+	const cyan = "\033[36m"
+	const white = "\033[37m"
+	const reset = "\033[0m"
+	const clearLine = "\r\033[2K"
+	formatDuration := func(d time.Duration) string {
+		if d < 0 {
+			d = 0
+		}
+		return fmt.Sprintf("%02ds", int(d.Round(time.Second)/time.Second))
+	}
+	return func(progress app.Progress) {
+		switch progress.Phase {
+		case "baseline":
+			if !shown {
+				fmt.Fprint(w, cyan+"Collecting health data..."+reset)
+				shown = true
+			}
+		case "sampling":
+			fmt.Fprintf(w, clearLine+cyan+"Sampling health data: "+white+"%s / %s"+reset,
+				formatDuration(progress.Elapsed), formatDuration(progress.Duration))
+			shown = true
+		case "final":
+			fmt.Fprint(w, clearLine+cyan+"Processing health data..."+reset)
+			shown = true
+		case "complete":
+			if shown {
+				// Clear the transient TTY status so the final report starts at the
+				// first visible line, without a stale timer or progress history.
+				fmt.Fprint(w, clearLine)
+			}
+		}
+	}
+}
+
+func usage() {
+	fmt.Fprintln(flag.CommandLine.Output(), "Usage: glimpse [--duration DURATION] [--json] [--no-color]")
+	fmt.Fprintln(flag.CommandLine.Output(), "")
+	fmt.Fprintln(flag.CommandLine.Output(), "By default glimpse performs a quick 5-second health check. Pass --duration for a longer, more thorough sample. All options use long --names.")
+	fmt.Fprintln(flag.CommandLine.Output(), "")
+	fmt.Fprintln(flag.CommandLine.Output(), "Options:")
+	flag.VisitAll(func(f *flag.Flag) {
+		name, value := "--"+f.Name, ""
+		if f.DefValue != "false" && f.DefValue != "" {
+			value = "=" + f.DefValue
+		}
+		fmt.Fprintf(flag.CommandLine.Output(), "  %-34s %s\n", name+value, f.Usage)
+	})
+}
+
+const bashCompletionScript = `# Bash completion for glimpse.
+_glimpse() {
+    local current previous
+    current="${COMP_WORDS[COMP_CWORD]}"
+    previous="${COMP_WORDS[COMP_CWORD-1]}"
+    case "$previous" in
+        --duration) COMPREPLY=( $(compgen -W '5s 30s 60s 5m' -- "$current") ); return 0 ;;
+    esac
+    COMPREPLY=( $(compgen -W '--duration --no-containers --json --no-color --verbose --disable-external-checks --version --bash-completion --help' -- "$current") )
+}
+complete -F _glimpse glimpse
+`
+
+// Keep renderer's writer-only API while propagating failed output to callers.
+type checkedWriter struct {
+	io.Writer
+	err error
+}
+
+func (w *checkedWriter) Write(p []byte) (int, error) {
+	if w.err != nil {
+		return 0, w.err
+	}
+	n, err := w.Writer.Write(p)
+	if err == nil && n != len(p) {
+		err = io.ErrShortWrite
+	}
+	w.err = err
+	return n, err
+}

@@ -1,0 +1,70 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.goarch }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goarch: [amd64, arm64]
+    env:
+      GOOS: linux
+      GOARCH: ${{ matrix.goarch }}
+      CGO_ENABLED: 0
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          check-latest: true
+
+      - name: Test
+        run: go test ./...
+
+      - name: Build
+        run: |
+          mkdir -p dist
+          go build -trimpath -ldflags="-s -w -X github.com/elcool0r/glimpse/internal/version.Version=${GITHUB_REF_NAME}" \
+            -o "dist/glimpse-${GITHUB_REF_NAME}-linux-${{ matrix.goarch }}" ./cmd/glimpse
+
+      - name: Package
+        run: |
+          cd dist
+          tar -czf "glimpse-${GITHUB_REF_NAME}-linux-${{ matrix.goarch }}.tar.gz" \
+            "glimpse-${GITHUB_REF_NAME}-linux-${{ matrix.goarch }}"
+          sha256sum "glimpse-${GITHUB_REF_NAME}-linux-${{ matrix.goarch }}.tar.gz" \
+            > "glimpse-${GITHUB_REF_NAME}-linux-${{ matrix.goarch }}.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-${{ matrix.goarch }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
+  release:
+    name: Publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-linux-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
