@@ -491,18 +491,34 @@ func renderIntegrations(w io.Writer, width int, r model.Report, separator string
 
 	if df := m.DeletedFiles; df != nil && df.Available {
 		severity := findingSeverity(r.Findings, "deleted-files-open")
-		writeWrapped(w, width, "", fmt.Sprintf("%s %s  %s held open across %d process(es) scanned", sectionLabel("Deleted files", severity, color), badge(severity, color), size(df.TotalBytes), df.ProcessesScanned))
+		writeWrapped(w, width, "", fmt.Sprintf("%s %s  %s across %d unique file(s)%s%d process(es) holding", sectionLabel("Deleted files", severity, color), badge(severity, color), size(df.TotalBytes), df.UniqueFiles, separator, df.ProcessesHolding))
 		if verbose {
-			checkLine(w, width, "    ", "Coverage", model.SeverityOK, color, fmt.Sprintf("%d scanned%s%d skipped (permission)", df.ProcessesScanned, separator, df.ProcessesSkipped))
-			for i, handle := range df.Handles {
+			checkLine(w, width, "    ", "Coverage", model.SeverityOK, color, fmt.Sprintf("%d process(es) scanned%s%d skipped (permission)%s%d total reference(s)", df.ProcessesScanned, separator, df.ProcessesSkipped, separator, df.TotalReferences))
+			if df.LargestHolderBytes > 0 {
+				label := df.LargestHolderCommand
+				if label == "" {
+					label = fmt.Sprintf("pid %d", df.LargestHolderPID)
+				}
+				checkLine(w, width, "    ", "Largest holder", severity, color, fmt.Sprintf("%s (pid %d) -- %s across %d unique file(s)", cleanText(label), df.LargestHolderPID, size(df.LargestHolderBytes), df.LargestHolderFileCount))
+			}
+			// Grouped by unique inode, not by fd: a file held open on three
+			// descriptors by one process appears once here with all three
+			// listed as one holder, so the duplication is visible without
+			// being counted three times.
+			for i, f := range df.Files {
 				if i >= 5 {
 					break
 				}
-				label := handle.Command
-				if label == "" {
-					label = fmt.Sprintf("pid %d", handle.PID)
+				holders := make([]string, 0, len(f.Holders))
+				for _, h := range f.Holders {
+					name := h.Command
+					if name == "" {
+						name = fmt.Sprintf("pid %d", h.PID)
+					}
+					holders = append(holders, fmt.Sprintf("%s (pid %d, fd %s)", cleanText(name), h.PID, strings.Join(h.FDs, ",")))
 				}
-				checkLine(w, width, "    ", label, severity, color, fmt.Sprintf("%s at %s (pid %d)", size(handle.Bytes), cleanText(handle.Path), handle.PID))
+				detail := fmt.Sprintf("%s at %s -- held by %s", size(f.Bytes), cleanText(f.Path), strings.Join(holders, "; "))
+				checkLine(w, width, "    ", fmt.Sprintf("dev %s inode %d", f.Device, f.Inode), severity, color, detail)
 			}
 		}
 	}

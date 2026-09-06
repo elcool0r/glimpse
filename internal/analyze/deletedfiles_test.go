@@ -20,8 +20,12 @@ func TestDeletedFilesBelowThresholdStaysSilent(t *testing.T) {
 
 func TestDeletedFilesWarnsAboveThreshold(t *testing.T) {
 	report := deletedFilesReport(&model.DeletedFiles{
-		Available: true, TotalBytes: 300 << 20, ProcessesScanned: 10,
-		Handles: []model.DeletedFileHandle{{PID: 42, Command: "leaky", Path: "/var/log/app.log", Bytes: 300 << 20}},
+		Available: true, TotalBytes: 300 << 20, ProcessesScanned: 10, UniqueFiles: 1, ProcessesHolding: 1, TotalReferences: 3,
+		Files:                  []model.DeletedFile{{Device: "253:3", Inode: 42, Path: "/var/log/app.log", Bytes: 300 << 20}},
+		LargestHolderPID:       42,
+		LargestHolderCommand:   "leaky",
+		LargestHolderBytes:     300 << 20,
+		LargestHolderFileCount: 1,
 	})
 	Report(&report)
 	found := findingByID(report, "deleted-files-open")
@@ -30,6 +34,9 @@ func TestDeletedFilesWarnsAboveThreshold(t *testing.T) {
 	}
 	if found.Severity != model.SeverityWarning {
 		t.Fatalf("severity = %s, want warning", found.Severity)
+	}
+	if len(found.Evidence) != 2 {
+		t.Fatalf("expected largest-holder and largest-file evidence, got %+v", found.Evidence)
 	}
 }
 

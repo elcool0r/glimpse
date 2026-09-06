@@ -245,27 +245,61 @@ type IPv6Check struct {
 	AvgLatencyMillis float64 `json:"avg_latency_millis,omitempty"`
 }
 
-// DeletedFileHandle is one open file descriptor still referencing deleted
-// (unlinked) file data, which continues to occupy real disk space until
-// every process holding it closes the descriptor or exits.
-type DeletedFileHandle struct {
-	PID     int    `json:"pid"`
-	Command string `json:"command,omitempty"`
-	Path    string `json:"path"`
-	Bytes   uint64 `json:"bytes"`
+// DeletedFileHolder is one process holding one or more open references
+// (file descriptors) to the same deleted inode. FDs is the fd numbers as
+// seen under /proc/<pid>/fd, kept for troubleshooting; it does not affect
+// how much space the inode counts for, which is independent of how many
+// references exist.
+type DeletedFileHolder struct {
+	PID     int      `json:"pid"`
+	Command string   `json:"command,omitempty"`
+	FDs     []string `json:"fds,omitempty"`
+}
+
+// DeletedFile is one unique deleted (unlinked) inode still occupying disk
+// space, identified by (Device, Inode) -- never by path, PID, fd number, or
+// size, any of which can coincide across genuinely distinct files or
+// genuinely duplicate references to the same one. Bytes is the allocated
+// space (st_blocks * 512) when available, falling back to the logical size
+// for a filesystem or platform that does not expose block counts; either
+// way it is counted exactly once here regardless of how many Holders (or
+// how many FDs within one holder) reference this inode.
+type DeletedFile struct {
+	Device  string              `json:"device"`
+	Inode   uint64              `json:"inode"`
+	Path    string              `json:"path"`
+	Bytes   uint64              `json:"bytes"`
+	Holders []DeletedFileHolder `json:"holders,omitempty"`
 }
 
 // DeletedFiles is a bounded, best-effort scan of /proc/*/fd for descriptors
 // still open on deleted files -- the "df says the disk is full but nothing
 // looks large" symptom. It only sees processes this user has permission to
 // inspect, which ProcessesScanned/ProcessesSkipped make explicit rather than
-// silently under-reporting.
+// silently under-reporting. TotalBytes sums each unique (device, inode) in
+// Files exactly once; TotalReferences counts every fd that pointed at one of
+// them, which is normally larger than UniqueFiles when the same deleted
+// file is held open more than once (a common pattern for journald and
+// similar append-heavy writers).
+// LargestHolder* is computed across every unique file this scan found,
+// before Files is truncated to the largest few for the report -- summing,
+// per process, the bytes of each unique inode it holds exactly once
+// (holding the same file on three fds does not triple its contribution to
+// that process's total). Ties are broken by the lower PID, so the value is
+// stable across runs of an otherwise-identical scan.
 type DeletedFiles struct {
-	Available        bool                `json:"available"`
-	TotalBytes       uint64              `json:"total_bytes"`
-	Handles          []DeletedFileHandle `json:"handles,omitempty"`
-	ProcessesScanned int                 `json:"processes_scanned"`
-	ProcessesSkipped int                 `json:"processes_skipped"`
+	Available              bool          `json:"available"`
+	TotalBytes             uint64        `json:"total_bytes"`
+	Files                  []DeletedFile `json:"files,omitempty"`
+	UniqueFiles            int           `json:"unique_files"`
+	ProcessesHolding       int           `json:"processes_holding"`
+	TotalReferences        int           `json:"total_references"`
+	ProcessesScanned       int           `json:"processes_scanned"`
+	ProcessesSkipped       int           `json:"processes_skipped"`
+	LargestHolderPID       int           `json:"largest_holder_pid,omitempty"`
+	LargestHolderCommand   string        `json:"largest_holder_command,omitempty"`
+	LargestHolderBytes     uint64        `json:"largest_holder_bytes,omitempty"`
+	LargestHolderFileCount int           `json:"largest_holder_file_count,omitempty"`
 }
 
 // PathMTUCheck discovers the usable path MTU to a fixed external anchor by

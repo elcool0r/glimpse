@@ -7,6 +7,16 @@
 // process holding the descriptor closes it or exits; nothing in a normal
 // directory listing shows it.
 //
+// Space is accounted once per unique underlying inode, identified by
+// (device, inode) -- never by path, PID, fd number, or size, any of which
+// can coincide across genuinely distinct files (two different deleted
+// journal segments happen to be the same size) or fail to coincide across
+// genuinely duplicate references to one file (the same deleted journal held
+// open on three separate file descriptors by one process is one 128 MiB
+// file, not 384 MiB). Every matching fd still contributes holder
+// information for troubleshooting; only the first time an inode is seen
+// does it contribute to the space total.
+//
 // This is a bounded, best-effort scan of /proc/*/fd: it only sees processes
 // this user has permission to inspect (the kernel restricts listing another
 // user's fd directory), so a non-root run reports fewer processes than a
@@ -18,6 +28,7 @@ package deletedfiles
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -33,11 +44,12 @@ const (
 	defaultProcRoot = "/proc"
 	// minReportBytes ignores small deleted-but-open files (a log rotated a
 	// moment before the writer noticed, a temp file mid-cleanup): common,
-	// harmless, and not what this check exists to catch.
+	// harmless, and not what this check exists to catch. They are still
+	// counted toward the total, just not listed individually.
 	minReportBytes = 1 << 20 // 1 MiB
-	// maxHandles keeps the report to the largest offenders rather than every
-	// match, which can otherwise run into the hundreds on a busy host.
-	maxHandles = 10
+	// maxFiles keeps the report to the largest unique offenders rather than
+	// every match, which can otherwise run into the hundreds on a busy host.
+	maxFiles = 10
 	// maxProcesses bounds the scan on a host running many thousands of
 	// processes; this is a health snapshot, not an exhaustive audit.
 	maxProcesses = 4096
@@ -67,6 +79,15 @@ func (c *Collector) Name() string { return "deleted-files" }
 // needing two boundaries.
 func (c *Collector) Static() {}
 
+// inodeKey identifies one underlying file independently of path, PID, fd
+// number, or size -- the only identity that cannot be fooled by two
+// distinct deleted files sharing a name/size, or by many fds referencing
+// one deleted file.
+type inodeKey struct {
+	dev uint64
+	ino uint64
+}
+
 func (c *Collector) Collect(ctx context.Context) (collect.Data, error) {
 	root := c.procRoot
 	if root == "" {
@@ -81,9 +102,14 @@ func (c *Collector) Collect(ctx context.Context) (collect.Data, error) {
 		return collect.Data{Diagnostics: []model.CollectionStatus{{Status: "unavailable", Detail: "proc: " + err.Error()}}}, nil
 	}
 
-	var handles []model.DeletedFileHandle
+	files := make(map[inodeKey]*model.DeletedFile)
+	holderSlot := make(map[inodeKey]map[int]int) // inodeKey -> pid -> index into that file's Holders
+	var order []inodeKey                         // first-seen order, for deterministic output before the final sort
+
 	var total uint64
-	scanned, skipped := 0, 0
+	scanned, skipped, references := 0, 0, 0
+	holdingPIDs := make(map[int]struct{})
+
 	for _, entry := range entries {
 		if ctx.Err() != nil {
 			return collect.Data{}, ctx.Err()
@@ -123,25 +149,121 @@ func (c *Collector) Collect(ctx context.Context) (collect.Data, error) {
 			if onTmpfs(statfs, fdPath) {
 				continue
 			}
-			size := uint64(info.Size())
-			total += size
-			if size >= minReportBytes {
-				handles = append(handles, model.DeletedFileHandle{
-					PID: pid, Command: comm, Path: strings.TrimSuffix(target, " (deleted)"), Bytes: size,
-				})
+			stat, ok := info.Sys().(*syscall.Stat_t)
+			if !ok {
+				continue
+			}
+			key := inodeKey{dev: uint64(stat.Dev), ino: stat.Ino}
+			references++
+			holdingPIDs[pid] = struct{}{}
+
+			file, seen := files[key]
+			if !seen {
+				bytes := allocatedBytes(stat, info.Size())
+				file = &model.DeletedFile{
+					Device: formatDevice(uint64(stat.Dev)),
+					Inode:  stat.Ino,
+					Path:   strings.TrimSuffix(target, " (deleted)"),
+					Bytes:  bytes,
+				}
+				files[key] = file
+				holderSlot[key] = make(map[int]int)
+				order = append(order, key)
+				total += bytes
+			}
+			if slot, ok := holderSlot[key][pid]; ok {
+				file.Holders[slot].FDs = append(file.Holders[slot].FDs, fd.Name())
+			} else {
+				holderSlot[key][pid] = len(file.Holders)
+				file.Holders = append(file.Holders, model.DeletedFileHolder{PID: pid, Command: comm, FDs: []string{fd.Name()}})
 			}
 		}
 	}
 
-	sort.Slice(handles, func(i, j int) bool { return handles[i].Bytes > handles[j].Bytes })
-	if len(handles) > maxHandles {
-		handles = handles[:maxHandles]
+	// The largest holder is computed here, over every unique file, before
+	// Files below is truncated to the largest few for the report -- a
+	// process holding many just-under-the-cutoff files could otherwise be
+	// invisible despite retaining more total space than the single largest
+	// file's owner.
+	holderPID, holderCommand, holderBytes, holderFileCount := largestHolder(order, files)
+
+	reported := make([]model.DeletedFile, 0, len(order))
+	for _, key := range order {
+		f := *files[key]
+		if f.Bytes >= minReportBytes {
+			reported = append(reported, f)
+		}
+	}
+	sort.Slice(reported, func(i, j int) bool { return reported[i].Bytes > reported[j].Bytes })
+	if len(reported) > maxFiles {
+		reported = reported[:maxFiles]
 	}
 
 	return collect.Data{DeletedFiles: &model.DeletedFiles{
-		Available: true, TotalBytes: total, Handles: handles,
+		Available: true, TotalBytes: total, Files: reported,
+		UniqueFiles: len(files), ProcessesHolding: len(holdingPIDs), TotalReferences: references,
 		ProcessesScanned: scanned, ProcessesSkipped: skipped,
+		LargestHolderPID: holderPID, LargestHolderCommand: holderCommand,
+		LargestHolderBytes: holderBytes, LargestHolderFileCount: holderFileCount,
 	}}, nil
+}
+
+// largestHolder sums, per process, the bytes of each unique file it holds
+// (once per file regardless of how many fds reference it) and returns the
+// process with the largest total. Ties break on the lower PID by iterating
+// candidates in sorted order and keeping only strict improvements.
+func largestHolder(order []inodeKey, files map[inodeKey]*model.DeletedFile) (pid int, command string, bytes uint64, fileCount int) {
+	totals := make(map[int]uint64)
+	counts := make(map[int]int)
+	commands := make(map[int]string)
+	for _, key := range order {
+		f := files[key]
+		for _, h := range f.Holders {
+			totals[h.PID] += f.Bytes
+			counts[h.PID]++
+			if h.Command != "" {
+				commands[h.PID] = h.Command
+			}
+		}
+	}
+	pids := make([]int, 0, len(totals))
+	for p := range totals {
+		pids = append(pids, p)
+	}
+	sort.Ints(pids)
+	for _, p := range pids {
+		if totals[p] > bytes {
+			bytes, pid = totals[p], p
+		}
+	}
+	return pid, commands[pid], bytes, counts[pid]
+}
+
+// allocatedBytes prefers actual allocated filesystem space (st_blocks * 512)
+// over logical size: a sparse file's st_size can vastly overstate how much
+// disk it actually occupies. It falls back to the logical size only when
+// blocks are unavailable (stat.Blocks is zero for a genuinely empty/fully
+// sparse file too, in which case the two agree at zero or the fallback is
+// harmless).
+func allocatedBytes(stat *syscall.Stat_t, logicalSize int64) uint64 {
+	if stat.Blocks > 0 {
+		return uint64(stat.Blocks) * 512
+	}
+	if logicalSize > 0 {
+		return uint64(logicalSize)
+	}
+	return 0
+}
+
+// formatDevice renders a raw dev_t as the familiar "major:minor" form (as
+// lsof and /proc/self/mountinfo show it), using glibc's encoding of the
+// 64-bit dev_t Linux stat syscalls return. This is display-only -- the
+// dedup key uses the raw value directly -- so an encoding mismatch on some
+// exotic platform would be cosmetic, never a correctness issue.
+func formatDevice(dev uint64) string {
+	major := uint32(((dev >> 8) & 0xfff) | ((dev >> 32) & 0xfffff000))
+	minor := uint32((dev & 0xff) | ((dev >> 12) & 0xffffff00))
+	return fmt.Sprintf("%d:%d", major, minor)
 }
 
 // onTmpfs reports whether the file behind fdPath lives on a tmpfs/shmem

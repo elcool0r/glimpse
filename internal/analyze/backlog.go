@@ -379,13 +379,30 @@ func deletedFilesFindings(df *model.DeletedFiles) []model.Finding {
 	if df.TotalBytes >= deletedFilesCriticalBytes {
 		severity, impact = model.SeverityCritical, 20
 	}
-	detail := fmt.Sprintf("%s across %d process(es) scanned is held open by deleted-but-still-open files; this space will not be freed until those descriptors close.", bytes(df.TotalBytes), df.ProcessesScanned)
-	if len(df.Handles) > 0 {
-		top := df.Handles[0]
-		detail += fmt.Sprintf(" Largest: %s (pid %d) holding %s at %s.", top.Command, top.PID, bytes(top.Bytes), top.Path)
+	detail := fmt.Sprintf("%s across %d unique deleted file(s) is still allocated because %d process(es) hold references to them (%d total open reference(s)); this space will not be freed until those descriptors close.",
+		bytes(df.TotalBytes), df.UniqueFiles, df.ProcessesHolding, df.TotalReferences)
+
+	var evidence []model.Evidence
+	if df.LargestHolderBytes > 0 {
+		label := df.LargestHolderCommand
+		if label == "" {
+			label = fmt.Sprintf("pid %d", df.LargestHolderPID)
+		}
+		evidence = append(evidence, model.Evidence{Label: "Largest holder", Value: fmt.Sprintf("%s (pid %d), %s retained across %d unique file(s)", label, df.LargestHolderPID, bytes(df.LargestHolderBytes), df.LargestHolderFileCount)})
 	}
-	return []model.Finding{finding("deleted-files-open", severity, "storage", "Deleted files are still held open, consuming disk space",
-		detail, "Identify the process(es) holding these descriptors (lsof +L1, or inspect /proc/<pid>/fd) and restart or signal them to release the space.", impact)}
+	if len(df.Files) > 0 {
+		top := df.Files[0]
+		evidence = append(evidence, model.Evidence{Label: "Largest file", Value: fmt.Sprintf("%s at %s", bytes(top.Bytes), top.Path)})
+	}
+
+	return []model.Finding{{
+		ID: "deleted-files-open", Severity: severity, Category: "storage",
+		Title:       "Deleted files are still held open, consuming disk space",
+		Summary:     detail,
+		Evidence:    evidence,
+		Suggestion:  "Identify the process(es) holding these descriptors (lsof +L1, or inspect /proc/<pid>/fd) and restart or signal them to release the space.",
+		ScoreImpact: impact,
+	}}
 }
 
 func resolvedFailed(failed []string) bool {
