@@ -45,10 +45,12 @@ CRIT  Failed systemd units
 **Download a release binary** (Linux amd64/arm64, no dependencies):
 
 ```bash
-curl -LO https://github.com/elcool0r/glimpse/releases/latest/download/glimpse-linux-amd64.tar.gz
-tar -xzf glimpse-linux-amd64.tar.gz
-sudo mv glimpse-linux-* /usr/local/bin/glimpse
+curl -LO https://github.com/elcool0r/glimpse/releases/latest/download/glimpse-linux-amd64
+chmod +x glimpse-linux-amd64
+sudo mv glimpse-linux-amd64 /usr/local/bin/glimpse
 ```
+
+(swap `amd64` for `arm64` on an ARM host)
 
 **Or with Go:**
 
