@@ -322,3 +322,38 @@ func TestVerboseExternalTextIsSanitized(t *testing.T) {
 		t.Fatalf("unsanitized control sequence reached the terminal:\n%q", out.String())
 	}
 }
+
+// A reduced-but-discovered path MTU is common (PPPoE, VPNs) and permanent
+// for a given host, so its INFO row would otherwise reappear on every run
+// forever; it stays quiet by default and only shows under --verbose. OK and
+// WARN/CRIT rows for this same check are unaffected.
+func TestPathMTUInfoRowHiddenUnlessVerbose(t *testing.T) {
+	report := model.Report{
+		Metrics:  model.Metrics{PathMTUCheck: &model.PathMTUCheck{Available: true, Target: "1.1.1.1", CeilingMTU: 1500, FloorMTU: 576, BaselineOK: true, DiscoveredMTU: 1420}},
+		Findings: []model.Finding{{ID: "path-mtu-reduced", Severity: model.SeverityInfo, Category: "network", Title: "Path MTU is 1420 bytes, not 1500 -- this is normal, not a fault"}},
+	}
+
+	var compact strings.Builder
+	Write(&compact, report, Options{})
+	if strings.Contains(compact.String(), "Path MTU") {
+		t.Fatalf("expected the Path MTU row to be hidden for an INFO-severity result in the default report:\n%s", compact.String())
+	}
+
+	var verbose strings.Builder
+	Write(&verbose, report, Options{Verbose: true})
+	if !strings.Contains(verbose.String(), "Path MTU") {
+		t.Fatalf("expected the Path MTU row to still show under --verbose:\n%s", verbose.String())
+	}
+}
+
+func TestPathMTUCriticalRowAlwaysShown(t *testing.T) {
+	report := model.Report{
+		Metrics:  model.Metrics{PathMTUCheck: &model.PathMTUCheck{Available: true, Target: "1.1.1.1", CeilingMTU: 1500, FloorMTU: 576, BaselineOK: true, DiscoveredMTU: 0}},
+		Findings: []model.Finding{{ID: "path-mtu-blackhole", Severity: model.SeverityWarning, Category: "network", Title: "Possible path MTU black hole"}},
+	}
+	var out strings.Builder
+	Write(&out, report, Options{})
+	if !strings.Contains(out.String(), "Path MTU") {
+		t.Fatalf("expected the Path MTU row to show by default when it found a real problem:\n%s", out.String())
+	}
+}

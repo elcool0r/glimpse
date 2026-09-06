@@ -95,6 +95,23 @@ func Report(report *model.Report) {
 	if s := m.Systemd; s != nil && len(s.FailedUnits) > 0 {
 		findings = append(findings, finding("failed-units", model.SeverityCritical, "services", "Failed systemd units", fmt.Sprintf("%d failed units: %v", len(s.FailedUnits), s.FailedUnits), "Run systemctl --failed and inspect the affected unit logs.", 25))
 	}
+	if s := m.Systemd; s != nil {
+		// A unit using Restart=always crash-looping never appears in
+		// `systemctl --failed` -- systemd keeps restarting it, so it can
+		// read as "active (running)" between crashes. A unit restarting at
+		// all during a short observation window is already unusual; several
+		// restarts in that same window is unambiguous crash-looping,
+		// independent of whatever the CPU/memory/network metrics say.
+		for _, u := range s.RestartingUnits {
+			severity, impact := model.SeverityWarning, 15
+			if u.RestartsDelta >= 3 {
+				severity, impact = model.SeverityCritical, 25
+			}
+			findings = append(findings, finding("systemd-restarting-"+u.Unit, severity, "services", fmt.Sprintf("Systemd unit %s is restarting repeatedly", u.Unit),
+				fmt.Sprintf("%s restarted %d time(s) during the sampling window. A unit does not normally restart while being observed; this can mean the service is crash-looping even though it may show as active between restarts.", u.Unit, u.RestartsDelta),
+				fmt.Sprintf("Inspect recent logs (journalctl -u %s) and the unit's exit status.", u.Unit), impact))
+		}
+	}
 	if k := m.Kernel; k != nil {
 		for _, event := range k.Events {
 			findings = append(findings, kernelFinding(event))

@@ -62,7 +62,7 @@ func httpCheckReport(check *model.HTTPCheck) model.Report {
 	return model.Report{Metrics: model.Metrics{CPU: &model.CPU{}, HTTPCheck: check}}
 }
 
-func TestHTTPCheckBothFailIsInfo(t *testing.T) {
+func TestHTTPCheckBothFailIsCritical(t *testing.T) {
 	report := httpCheckReport(&model.HTTPCheck{
 		Available: true,
 		HTTP:      &model.HTTPCheckResult{URL: "http://example.com/", Succeeded: false, Error: "timeout"},
@@ -73,12 +73,12 @@ func TestHTTPCheckBothFailIsInfo(t *testing.T) {
 	if found == nil {
 		t.Fatalf("no finding when both requests failed: %+v", report.Findings)
 	}
-	if found.Severity != model.SeverityInfo {
-		t.Fatalf("severity = %s, want info (blocked egress is common and legitimate)", found.Severity)
+	if found.Severity != model.SeverityCritical {
+		t.Fatalf("severity = %s, want critical", found.Severity)
 	}
 }
 
-func TestHTTPCheckHTTPSOnlyFailIsInfo(t *testing.T) {
+func TestHTTPCheckHTTPSOnlyFailIsWarning(t *testing.T) {
 	report := httpCheckReport(&model.HTTPCheck{
 		Available: true,
 		HTTP:      &model.HTTPCheckResult{URL: "http://example.com/", Succeeded: true},
@@ -89,8 +89,8 @@ func TestHTTPCheckHTTPSOnlyFailIsInfo(t *testing.T) {
 	if found == nil {
 		t.Fatalf("no finding when only https failed: %+v", report.Findings)
 	}
-	if found.Severity != model.SeverityInfo {
-		t.Fatalf("severity = %s, want info", found.Severity)
+	if found.Severity != model.SeverityWarning {
+		t.Fatalf("severity = %s, want warning", found.Severity)
 	}
 	if findingByID(report, "http-check-failed") != nil {
 		t.Fatalf("should not also fire the both-failed finding: %+v", report.Findings)

@@ -266,11 +266,10 @@ func pathMTUFindings(check *model.PathMTUCheck) []model.Finding {
 	return nil
 }
 
-// httpCheckFindings judges the outbound web probe conservatively: an
-// intentionally firewalled, proxied, or air-gapped host produces exactly the
-// same signal as a genuine fault, and the former is common and legitimate.
-// Every finding here is therefore informational only, the same treatment the
-// external-only DNS resolution failure gets.
+// httpCheckFindings judges the outbound web probe: one protocol failing
+// while the other succeeds is a warning (a firewall rule or proxy scoped to
+// one port, or TLS interception on 443 specifically); both failing is
+// critical, matching the external-only DNS resolution failure treatment.
 func httpCheckFindings(check *model.HTTPCheck) []model.Finding {
 	if check == nil || !check.Available {
 		return nil
@@ -279,17 +278,17 @@ func httpCheckFindings(check *model.HTTPCheck) []model.Finding {
 	httpsFailed := check.HTTPS != nil && !check.HTTPS.Succeeded
 	switch {
 	case httpFailed && httpsFailed:
-		return []model.Finding{finding("http-check-failed", model.SeverityInfo, "network", "Outbound HTTP and HTTPS requests are both failing",
+		return []model.Finding{finding("http-check-failed", model.SeverityCritical, "network", "Outbound HTTP and HTTPS requests are both failing",
 			fmt.Sprintf("A GET to %s failed (%s) and a GET to %s failed (%s).", check.HTTP.URL, check.HTTP.Error, check.HTTPS.URL, check.HTTPS.Error),
-			"Confirm whether outbound web access is intentionally restricted (firewall, proxy, air-gapped network).", 0)}
+			"Confirm whether outbound web access is intentionally restricted (firewall, proxy, air-gapped network); if not, this host has no working outbound web access at all.", 15)}
 	case httpsFailed:
-		return []model.Finding{finding("https-check-failed", model.SeverityInfo, "network", "Outbound HTTPS request failed while HTTP succeeded",
+		return []model.Finding{finding("https-check-failed", model.SeverityWarning, "network", "Outbound HTTPS request failed while HTTP succeeded",
 			fmt.Sprintf("A GET to %s failed: %s", check.HTTPS.URL, check.HTTPS.Error),
-			"Inspect TLS interception, certificate trust, or firewalling of port 443 specifically.", 0)}
+			"Inspect TLS interception, certificate trust, or firewalling of port 443 specifically.", 8)}
 	case httpFailed:
-		return []model.Finding{finding("http-check-http-failed", model.SeverityInfo, "network", "Outbound HTTP request failed while HTTPS succeeded",
+		return []model.Finding{finding("http-check-http-failed", model.SeverityWarning, "network", "Outbound HTTP request failed while HTTPS succeeded",
 			fmt.Sprintf("A GET to %s failed: %s", check.HTTP.URL, check.HTTP.Error),
-			"This is unusual since HTTPS succeeded; inspect port 80 filtering specifically.", 0)}
+			"This is unusual since HTTPS succeeded; inspect port 80 filtering specifically.", 8)}
 	}
 	return nil
 }

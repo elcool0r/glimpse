@@ -420,7 +420,14 @@ func renderIntegrations(w io.Writer, width int, r model.Report, separator string
 		case check.DiscoveredMTU < check.CeilingMTU:
 			result = fmt.Sprintf("%d/%d bytes usable (reduced but working normally, typical for a VPN or tunnel)", check.DiscoveredMTU, check.CeilingMTU)
 		}
-		writeWrapped(w, width, "", fmt.Sprintf("%s %s  %s%s%s", sectionLabel("Path MTU", severity, color), badge(severity, color), cleanText(check.Target), separator, result))
+		// A reduced-but-discovered MTU is common and expected (PPPoE, VPNs,
+		// tunnels); showing that INFO badge on every run is noise for a
+		// permanent, intentional configuration, so it is quiet by default
+		// and stays available under --verbose. OK and WARN/CRIT rows still
+		// always show, consistent with every other active check.
+		if verbose || severity != model.SeverityInfo {
+			writeWrapped(w, width, "", fmt.Sprintf("%s %s  %s%s%s", sectionLabel("Path MTU", severity, color), badge(severity, color), cleanText(check.Target), separator, result))
+		}
 		if verbose {
 			checkLine(w, width, "    ", "Baseline (small packet)", model.SeverityOK, color, "reachable")
 			mtuSeverity := model.SeverityOK

@@ -1,12 +1,14 @@
-// Package systemd collects failed unit names through systemctl when it is
-// available. It is intentionally optional: containers and non-systemd hosts
-// commonly do not expose a usable system bus.
+// Package systemd collects failed unit names and per-unit restart counts
+// through systemctl when it is available. It is intentionally optional:
+// containers and non-systemd hosts commonly do not expose a usable system
+// bus.
 package systemd
 
 import (
 	"context"
 	"os/exec"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -15,10 +17,17 @@ import (
 	"github.com/elcool0r/glimpse/internal/model"
 )
 
-const commandTimeout = 3 * time.Second
+const (
+	commandTimeout = 3 * time.Second
+	maxOutput      = 256 << 10
+	// maxUnits bounds the restart-count query to a reasonable number of
+	// services; this is a health snapshot, not an exhaustive inventory.
+	maxUnits = 512
+)
 
-// Collector collects current failed systemd units. Timeout is configurable for
-// tests; a zero value uses the conservative default.
+// Collector collects current failed systemd units and, across the sampling
+// window, which units' restart counters increased. Timeout is configurable
+// for tests; a zero value uses the conservative default.
 type Collector struct {
 	Timeout  time.Duration
 	lookPath func(string) (string, error)
@@ -31,8 +40,11 @@ func New() *Collector {
 
 func (c *Collector) Name() string { return "systemd" }
 
-// Static marks failed-unit state as a gauge: only the final observation is used.
-func (c *Collector) Static() {}
+// snapshot carries each unit's raw, cumulative NRestarts between the two
+// collection boundaries so Delta can compute how many happened during the
+// sample -- the cumulative value alone would flag any unit that has ever
+// restarted since boot as perpetually suspicious.
+type snapshot struct{ restarts map[string]uint64 }
 
 func (c *Collector) Collect(parent context.Context) (collect.Data, error) {
 	lookup := c.lookPath
@@ -47,26 +59,100 @@ func (c *Collector) Collect(parent context.Context) (collect.Data, error) {
 	if timeout <= 0 {
 		timeout = commandTimeout
 	}
-	ctx, cancel := context.WithTimeout(parent, timeout)
-	defer cancel()
 	run := c.run
 	if run == nil {
 		run = runCommand
 	}
-	output, err := run(ctx, path, "--failed", "--no-legend", "--plain", "--no-pager")
+
+	failedCtx, cancel := context.WithTimeout(parent, timeout)
+	failedOutput, failedErr := run(failedCtx, path, "--failed", "--no-legend", "--plain", "--no-pager")
+	cancel()
 	// A disconnected user/container bus is an unavailable capability, not a
 	// health error. Context cancellation remains meaningful to the caller.
-	if err != nil {
+	if failedErr != nil {
 		if parent.Err() != nil {
 			return collect.Data{}, parent.Err()
 		}
-		return collect.Data{Systemd: &model.Systemd{Available: false}, Diagnostics: []model.CollectionStatus{{Status: "unavailable", Detail: err.Error()}}}, nil
+		return collect.Data{Systemd: &model.Systemd{Available: false}, Diagnostics: []model.CollectionStatus{{Status: "unavailable", Detail: failedErr.Error()}}}, nil
 	}
-	return collect.Data{Systemd: &model.Systemd{Available: true, FailedUnits: ParseFailedUnits(string(output))}}, nil
+
+	var diagnostics []model.CollectionStatus
+	restarts := map[string]uint64{}
+	listCtx, cancel := context.WithTimeout(parent, timeout)
+	listOutput, listErr := run(listCtx, path, "list-units", "--type=service", "--all", "--no-legend", "--plain", "--no-pager")
+	cancel()
+	switch {
+	case listErr != nil && parent.Err() != nil:
+		return collect.Data{}, parent.Err()
+	case listErr != nil:
+		diagnostics = append(diagnostics, model.CollectionStatus{Status: "unavailable", Detail: "list-units: " + listErr.Error()})
+	default:
+		names := parseUnitNames(string(listOutput))
+		if len(names) > maxUnits {
+			names = names[:maxUnits]
+		}
+		if len(names) > 0 {
+			args := append([]string{"show"}, names...)
+			args = append(args, "--property=Id,NRestarts", "--no-pager")
+			showCtx, cancel := context.WithTimeout(parent, timeout)
+			showOutput, showErr := run(showCtx, path, args...)
+			cancel()
+			switch {
+			case showErr != nil && parent.Err() != nil:
+				return collect.Data{}, parent.Err()
+			case showErr != nil:
+				diagnostics = append(diagnostics, model.CollectionStatus{Status: "unavailable", Detail: "show: " + showErr.Error()})
+			default:
+				restarts = parseRestarts(string(showOutput))
+			}
+		}
+	}
+
+	return collect.Data{
+		Systemd:     &model.Systemd{Available: true, FailedUnits: ParseFailedUnits(string(failedOutput))},
+		Snapshot:    snapshot{restarts: restarts},
+		Diagnostics: diagnostics,
+	}, nil
+}
+
+// Delta compares each unit's restart counter between the two boundaries.
+// A unit missing from the baseline (created during the window) has no
+// interval to report and is left alone; a counter that went backwards
+// (systemd was reloaded, resetting its tracked state) is not a clean delta
+// and is also left alone rather than reported as a negative or wrapped
+// count.
+func (c *Collector) Delta(first, last collect.Data) (collect.Data, error) {
+	if last.Systemd == nil {
+		return last, nil
+	}
+	a, aok := first.Snapshot.(snapshot)
+	b, bok := last.Snapshot.(snapshot)
+	if !aok || !bok {
+		return last, nil
+	}
+	var restarting []model.SystemdUnitRestart
+	for unit, after := range b.restarts {
+		before, ok := a.restarts[unit]
+		if !ok || after < before {
+			continue
+		}
+		if delta := after - before; delta > 0 {
+			restarting = append(restarting, model.SystemdUnitRestart{Unit: unit, RestartsDelta: delta})
+		}
+	}
+	sort.Slice(restarting, func(i, j int) bool {
+		if restarting[i].RestartsDelta != restarting[j].RestartsDelta {
+			return restarting[i].RestartsDelta > restarting[j].RestartsDelta
+		}
+		return restarting[i].Unit < restarting[j].Unit
+	})
+	last.Systemd.RestartingUnits = restarting
+	return last, nil
 }
 
 func runCommand(ctx context.Context, name string, args ...string) ([]byte, error) {
-	return command.Output(ctx, name, args...)
+	result, err := command.Run(ctx, command.Options{MaxOutput: maxOutput}, name, args...)
+	return result.Output, err
 }
 
 // ParseFailedUnits parses the stable first column of `systemctl --failed`
@@ -90,4 +176,49 @@ func ParseFailedUnits(output string) []string {
 	}
 	sort.Strings(units)
 	return units
+}
+
+// parseUnitNames reads the stable first column of `systemctl list-units`.
+func parseUnitNames(output string) []string {
+	names := make([]string, 0)
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 || !strings.HasSuffix(fields[0], ".service") {
+			continue
+		}
+		names = append(names, fields[0])
+	}
+	return names
+}
+
+// parseRestarts reads `systemctl show <units...> --property=Id,NRestarts`
+// output: one block of "Key=Value" lines per unit, separated by a blank
+// line. Parsing by key rather than relying on the property order keeps this
+// resilient to systemd emitting properties in a different order.
+func parseRestarts(output string) map[string]uint64 {
+	restarts := make(map[string]uint64)
+	var currentID string
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			currentID = ""
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		switch key {
+		case "Id":
+			currentID = value
+		case "NRestarts":
+			if currentID == "" {
+				continue
+			}
+			if n, err := strconv.ParseUint(value, 10, 64); err == nil {
+				restarts[currentID] = n
+			}
+		}
+	}
+	return restarts
 }

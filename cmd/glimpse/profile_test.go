@@ -54,7 +54,7 @@ func TestDefaultProfileRegistersEveryAnalyzedCollector(t *testing.T) {
 // Collectors that shell out must be marked static, or every optional command
 // runs twice per report with the first result discarded by merge.
 func TestOptionalCommandCollectorsAreStatic(t *testing.T) {
-	for _, name := range []string{"systemd", "kernel", "time-sync", "zfs", "storage", "network-state", "device-health", "security", "filesystems", "thermal", "resources", "hardware-errors", "dns-resolution", "gateway-ping", "path-mtu", "http-check", "icmp-check", "ipv6-check", "deleted-files"} {
+	for _, name := range []string{"kernel", "time-sync", "zfs", "storage", "network-state", "device-health", "security", "filesystems", "thermal", "resources", "hardware-errors", "dns-resolution", "gateway-ping", "path-mtu", "http-check", "icmp-check", "ipv6-check", "deleted-files"} {
 		collector := find(defaultCollectors(false, true), name)
 		if collector == nil {
 			t.Fatalf("%s missing from the profile", name)
@@ -64,7 +64,9 @@ func TestOptionalCommandCollectorsAreStatic(t *testing.T) {
 		}
 	}
 	// Counter-based collectors must not be static: merge needs both boundaries.
-	for _, name := range []string{"cpu", "memory", "disk", "network", "tcp", "processes"} {
+	// systemd joined this group once it started tracking per-unit restart
+	// counts across the sample, alongside the gauge-only failed-unit list.
+	for _, name := range []string{"cpu", "memory", "disk", "network", "tcp", "processes", "systemd"} {
 		collector := find(defaultCollectors(false, false), name)
 		if _, ok := collector.(collect.DeltaCollector); !ok {
 			t.Errorf("%s should derive sampled values from two observations", name)

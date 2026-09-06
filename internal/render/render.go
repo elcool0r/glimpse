@@ -135,6 +135,13 @@ func Write(w io.Writer, r model.Report, o Options) {
 			for _, unit := range s.FailedUnits {
 				checkLine(w, width, "    ", cleanText(unit), model.SeverityCritical, o.Color, "failed")
 			}
+			for _, unit := range s.RestartingUnits {
+				severity := findingSeverity(r.Findings, "systemd-restarting-"+unit.Unit)
+				checkLine(w, width, "    ", cleanText(unit.Unit), severity, o.Color, fmt.Sprintf("restarted %d time(s) during the sample", unit.RestartsDelta))
+			}
+		} else if len(s.RestartingUnits) > 0 {
+			worst := s.RestartingUnits[0]
+			checkLine(w, width, "    ", "Restart loop", findingSeverity(r.Findings, "systemd-restarting-"+worst.Unit), o.Color, fmt.Sprintf("%s restarted %d time(s)", cleanText(worst.Unit), worst.RestartsDelta))
 		}
 		note("systemd")
 	}

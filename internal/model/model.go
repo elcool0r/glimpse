@@ -392,6 +392,19 @@ type Process struct {
 type Systemd struct {
 	Available   bool     `json:"available"`
 	FailedUnits []string `json:"failed_units,omitempty"`
+	// RestartingUnits lists services whose systemd-tracked restart counter
+	// increased during the sampling window -- a real-time signal, unlike
+	// the counter's raw cumulative-since-boot value, which would flag any
+	// unit that has ever restarted as perpetually suspicious. A unit using
+	// Restart=always crash-looping never appears in FailedUnits, since
+	// systemd keeps restarting it; this is how that case still surfaces.
+	RestartingUnits []SystemdUnitRestart `json:"restarting_units,omitempty"`
+}
+
+// SystemdUnitRestart is one unit that restarted during the sample.
+type SystemdUnitRestart struct {
+	Unit          string `json:"unit"`
+	RestartsDelta uint64 `json:"restarts_delta"`
 }
 
 type Kernel struct {
