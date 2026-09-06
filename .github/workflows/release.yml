@@ -29,6 +29,19 @@ jobs:
       - name: Test
         run: go test ./...
 
+      # internal/version/VERSION is the single source of truth for the
+      # binary's version; the tag is only how a release gets triggered.
+      # Failing fast here beats shipping a binary whose --version disagrees
+      # with the release it was attached to.
+      - name: Verify VERSION matches the tag
+        run: |
+          version="$(tr -d '[:space:]' < internal/version/VERSION)"
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$version" != "$tag" ]; then
+            echo "internal/version/VERSION is $version but the pushed tag is v$tag" >&2
+            exit 1
+          fi
+
       - name: Build
         env:
           GOOS: linux
@@ -36,8 +49,7 @@ jobs:
           CGO_ENABLED: 0
         run: |
           mkdir -p dist
-          go build -trimpath -ldflags="-s -w -X github.com/elcool0r/glimpse/internal/version.Version=${GITHUB_REF_NAME}" \
-            -o "dist/glimpse-linux-${{ matrix.goarch }}" ./cmd/glimpse
+          go build -trimpath -ldflags="-s -w" -o "dist/glimpse-linux-${{ matrix.goarch }}" ./cmd/glimpse
 
       - uses: actions/upload-artifact@v4
         with:
