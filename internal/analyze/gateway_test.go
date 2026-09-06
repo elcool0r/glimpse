@@ -47,6 +47,30 @@ func TestGatewayMinorLossStaysSilent(t *testing.T) {
 	}
 }
 
+func TestGatewayHighLatencyWarnsThenCriticals(t *testing.T) {
+	warn := gatewayReport(&model.GatewayCheck{Available: true, Gateway: "192.168.1.1", Sent: 3, Received: 3, AvgLatencyMillis: 250})
+	Report(&warn)
+	found := findingByID(warn, "gateway-high-latency")
+	if found == nil || found.Severity != model.SeverityWarning {
+		t.Fatalf("expected a warning at 250ms: %+v", warn.Findings)
+	}
+
+	crit := gatewayReport(&model.GatewayCheck{Available: true, Gateway: "192.168.1.1", Sent: 3, Received: 3, AvgLatencyMillis: 600})
+	Report(&crit)
+	found = findingByID(crit, "gateway-high-latency")
+	if found == nil || found.Severity != model.SeverityCritical {
+		t.Fatalf("expected critical at 600ms: %+v", crit.Findings)
+	}
+}
+
+func TestGatewayNormalLatencyStaysSilent(t *testing.T) {
+	report := gatewayReport(&model.GatewayCheck{Available: true, Gateway: "192.168.1.1", Sent: 3, Received: 3, AvgLatencyMillis: 2.5})
+	Report(&report)
+	if findingByID(report, "gateway-high-latency") != nil {
+		t.Fatalf("unexpected latency finding for a healthy LAN gateway: %+v", report.Findings)
+	}
+}
+
 func TestGatewayUnavailableProducesNoFinding(t *testing.T) {
 	report := gatewayReport(nil)
 	Report(&report)

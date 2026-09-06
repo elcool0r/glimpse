@@ -103,14 +103,18 @@ Exit codes are meaningful for scripting:
 
 glimpse reads `/proc` and `/sys` directly wherever possible, and shells out to well-known optional commands (`systemctl`, `smartctl`, `zpool`, `ss`, `ping`, docker/podman CLIs, ...) with bounded timeouts when they're needed and available. Every check gracefully degrades to "unavailable" rather than failing the whole report — a missing `smartctl` or a rootless container runtime never crashes glimpse, it just shows up as a coverage note.
 
-Four checks are active rather than passive — they send real traffic instead of only reading local kernel state:
+Several checks are active rather than passive — they send real traffic instead of only reading local kernel state:
 
 - **DNS resolution** against your configured local nameserver *and* an external resolver, analyzed separately so a firewalled outbound path isn't confused with a broken local resolver
-- **Gateway ping** to detect an unreachable or lossy default gateway
+- **Gateway ping** to detect an unreachable, lossy, or high-latency default gateway
+- **External ICMP ping** to a fixed internet anchor, independent of the gateway — a healthy gateway only proves the local link works
+- **IPv6 ping** to an external anchor, but only when the host has a global IPv6 address configured; an IPv4-only host is not a fault and is skipped entirely
 - **Path MTU discovery** to catch a black-holed path (as opposed to a merely reduced-but-healthy MTU behind a VPN or PPPoE, which is normal and not flagged)
-- **HTTP/HTTPS GET** to catch the case where DNS and ICMP both work but web traffic specifically doesn't (captive portal, proxy, TLS interception)
+- **HTTP/HTTPS GET, forced over IPv4,** to catch the case where DNS and ICMP both work but web traffic specifically doesn't (captive portal, proxy, TLS interception, a firewall rule scoped to one protocol)
 
-All four are on by default and can be turned off with `--disable-external-checks`.
+All of the above are on by default and can be turned off together with `--disable-external-checks`.
+
+One more check reads only local state but is worth calling out: a bounded scan of `/proc/*/fd` finds file descriptors still open on deleted files — the classic "disk is full but nothing looks large" symptom, where a process keeps a rotated or removed file's data alive until it closes the handle.
 
 The full list of checks, their thresholds, and the reasoning behind each one is documented in [`HEALTH-CHECKS.md`](HEALTH-CHECKS.md).
 

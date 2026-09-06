@@ -376,6 +376,15 @@ func apply(metrics *model.Metrics, data collect.Data) {
 	if data.HTTPCheck != nil {
 		metrics.HTTPCheck = data.HTTPCheck
 	}
+	if data.ICMPCheck != nil {
+		metrics.ICMPCheck = data.ICMPCheck
+	}
+	if data.IPv6Check != nil {
+		metrics.IPv6Check = data.IPv6Check
+	}
+	if data.DeletedFiles != nil {
+		metrics.DeletedFiles = data.DeletedFiles
+	}
 	if data.Hardware != nil {
 		metrics.Hardware = data.Hardware
 	}

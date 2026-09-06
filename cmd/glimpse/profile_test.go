@@ -20,6 +20,7 @@ func TestDefaultProfileRegistersEveryAnalyzedCollector(t *testing.T) {
 		"cpu", "memory", "filesystems", "disk", "network", "tcp", "network-state",
 		"thermal", "processes", "systemd", "kernel", "time-sync", "resources",
 		"security", "cgroup-v2", "zfs", "storage", "hardware-errors", "device-health",
+		"deleted-files",
 	}
 	registered := map[string]bool{}
 	for _, collector := range defaultCollectors(false, false) {
@@ -39,7 +40,7 @@ func TestDefaultProfileRegistersEveryAnalyzedCollector(t *testing.T) {
 	if contains(defaultCollectors(false, false), "containers") {
 		t.Error("container inspection registered while disabled")
 	}
-	activeCheckCollectors := []string{"dns-resolution", "gateway-ping", "path-mtu", "http-check"}
+	activeCheckCollectors := []string{"dns-resolution", "gateway-ping", "path-mtu", "http-check", "icmp-check", "ipv6-check"}
 	for _, name := range activeCheckCollectors {
 		if contains(defaultCollectors(false, false), name) {
 			t.Errorf("%s registered with external checks disabled", name)
@@ -53,7 +54,7 @@ func TestDefaultProfileRegistersEveryAnalyzedCollector(t *testing.T) {
 // Collectors that shell out must be marked static, or every optional command
 // runs twice per report with the first result discarded by merge.
 func TestOptionalCommandCollectorsAreStatic(t *testing.T) {
-	for _, name := range []string{"systemd", "kernel", "time-sync", "zfs", "storage", "network-state", "device-health", "security", "filesystems", "thermal", "resources", "hardware-errors", "dns-resolution", "gateway-ping", "path-mtu", "http-check"} {
+	for _, name := range []string{"systemd", "kernel", "time-sync", "zfs", "storage", "network-state", "device-health", "security", "filesystems", "thermal", "resources", "hardware-errors", "dns-resolution", "gateway-ping", "path-mtu", "http-check", "icmp-check", "ipv6-check", "deleted-files"} {
 		collector := find(defaultCollectors(false, true), name)
 		if collector == nil {
 			t.Fatalf("%s missing from the profile", name)

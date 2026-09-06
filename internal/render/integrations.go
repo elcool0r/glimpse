@@ -471,6 +471,43 @@ func renderIntegrations(w io.Writer, width int, r model.Report, separator string
 	}
 	note("http-check")
 
+	if check := m.ICMPCheck; check != nil && check.Available {
+		severity := findingSeverity(r.Findings, "icmp-external-unreachable", "icmp-external-packet-loss", "icmp-external-high-latency")
+		writeWrapped(w, width, "", fmt.Sprintf("%s %s  %s%s%d/%d replies%s%.0f%% loss", sectionLabel("External ICMP", severity, color), badge(severity, color), cleanText(check.Target), separator, check.Received, check.Sent, separator, check.PacketLossPct))
+		if verbose && check.Received > 0 {
+			checkLine(w, width, "    ", "Latency", model.SeverityOK, color, fmt.Sprintf("%.1fms average", check.AvgLatencyMillis))
+		}
+	}
+	note("icmp-check")
+
+	if check := m.IPv6Check; check != nil && check.Available {
+		severity := findingSeverity(r.Findings, "ipv6-unreachable", "ipv6-packet-loss")
+		writeWrapped(w, width, "", fmt.Sprintf("%s %s  %s%s%d/%d replies%s%.0f%% loss", sectionLabel("IPv6", severity, color), badge(severity, color), cleanText(check.Target), separator, check.Received, check.Sent, separator, check.PacketLossPct))
+		if verbose && check.Received > 0 {
+			checkLine(w, width, "    ", "Latency", model.SeverityOK, color, fmt.Sprintf("%.1fms average", check.AvgLatencyMillis))
+		}
+	}
+	note("ipv6-check")
+
+	if df := m.DeletedFiles; df != nil && df.Available {
+		severity := findingSeverity(r.Findings, "deleted-files-open")
+		writeWrapped(w, width, "", fmt.Sprintf("%s %s  %s held open across %d process(es) scanned", sectionLabel("Deleted files", severity, color), badge(severity, color), size(df.TotalBytes), df.ProcessesScanned))
+		if verbose {
+			checkLine(w, width, "    ", "Coverage", model.SeverityOK, color, fmt.Sprintf("%d scanned%s%d skipped (permission)", df.ProcessesScanned, separator, df.ProcessesSkipped))
+			for i, handle := range df.Handles {
+				if i >= 5 {
+					break
+				}
+				label := handle.Command
+				if label == "" {
+					label = fmt.Sprintf("pid %d", handle.PID)
+				}
+				checkLine(w, width, "    ", label, severity, color, fmt.Sprintf("%s at %s (pid %d)", size(handle.Bytes), cleanText(handle.Path), handle.PID))
+			}
+		}
+	}
+	note("deleted-files")
+
 	if hardware := m.Hardware; hardware != nil && hardware.Available {
 		severity := model.SeverityOK
 		correctable, uncorrectable := uint64(0), uint64(0)

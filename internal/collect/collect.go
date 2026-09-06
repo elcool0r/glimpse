@@ -45,6 +45,9 @@ type Data struct {
 	GatewayCheck  *model.GatewayCheck
 	PathMTUCheck  *model.PathMTUCheck
 	HTTPCheck     *model.HTTPCheck
+	ICMPCheck     *model.ICMPCheck
+	IPv6Check     *model.IPv6Check
+	DeletedFiles  *model.DeletedFiles
 	Hardware      *model.HardwareErrors
 	Trends        []model.Trend
 }

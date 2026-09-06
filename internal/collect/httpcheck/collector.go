@@ -10,6 +10,7 @@ package httpcheck
 import (
 	"context"
 	"io"
+	"net"
 	"net/http"
 	"time"
 
@@ -24,6 +25,19 @@ const (
 	target  = "example.com"
 	timeout = 5 * time.Second
 )
+
+// client forces IPv4 connections. Without this, a dual-stack host that
+// blocks only IPv4 egress (the common way to test this with plain iptables,
+// which does not touch IPv6 at all) would silently succeed over IPv6
+// instead, hiding exactly the fault this check exists to catch. IPv6
+// reachability has its own dedicated check (internal/collect/ipv6check).
+var client = &http.Client{
+	Transport: &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "tcp4", addr)
+		},
+	},
+}
 
 type Collector struct {
 	get func(ctx context.Context, url string) (status int, latency time.Duration, err error)
@@ -81,7 +95,7 @@ func doGet(ctx context.Context, url string) (int, time.Duration, error) {
 	}
 	req.Header.Set("User-Agent", "glimpse-health-check/1")
 	start := time.Now()
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := client.Do(req)
 	latency := time.Since(start)
 	if err != nil {
 		return 0, latency, err

@@ -73,6 +73,9 @@ type Metrics struct {
 	GatewayCheck  *GatewayCheck      `json:"gateway_check,omitempty"`
 	PathMTUCheck  *PathMTUCheck      `json:"path_mtu_check,omitempty"`
 	HTTPCheck     *HTTPCheck         `json:"http_check,omitempty"`
+	ICMPCheck     *ICMPCheck         `json:"icmp_check,omitempty"`
+	IPv6Check     *IPv6Check         `json:"ipv6_check,omitempty"`
+	DeletedFiles  *DeletedFiles      `json:"deleted_files,omitempty"`
 	Hardware      *HardwareErrors    `json:"hardware_errors,omitempty"`
 	Trends        []Trend            `json:"trends,omitempty"`
 }
@@ -211,6 +214,58 @@ type GatewayCheck struct {
 	Received         int     `json:"received"`
 	PacketLossPct    float64 `json:"packet_loss_percent"`
 	AvgLatencyMillis float64 `json:"avg_latency_millis,omitempty"`
+}
+
+// ICMPCheck actively pings a fixed external anchor host over IPv4 ICMP,
+// independently of the default gateway: a healthy gateway only proves the
+// local link works, not that anything beyond it is reachable. Like the
+// other active checks, it sends real packets and only runs in the
+// active-check profile (--disable-external-checks turns it off).
+type ICMPCheck struct {
+	Available        bool    `json:"available"`
+	Target           string  `json:"target"`
+	Sent             int     `json:"sent"`
+	Received         int     `json:"received"`
+	PacketLossPct    float64 `json:"packet_loss_percent"`
+	AvgLatencyMillis float64 `json:"avg_latency_millis,omitempty"`
+}
+
+// IPv6Check actively pings a fixed external anchor host over IPv6, but only
+// when the host has a global IPv6 address configured. An IPv4-only host is
+// not a fault and is skipped entirely; this only fires when the host
+// believes it has working IPv6 and that belief turns out to be wrong
+// (egress filtering, a broken upstream IPv6 path), a failure mode the IPv4
+// checks cannot see at all.
+type IPv6Check struct {
+	Available        bool    `json:"available"`
+	Target           string  `json:"target"`
+	Sent             int     `json:"sent"`
+	Received         int     `json:"received"`
+	PacketLossPct    float64 `json:"packet_loss_percent"`
+	AvgLatencyMillis float64 `json:"avg_latency_millis,omitempty"`
+}
+
+// DeletedFileHandle is one open file descriptor still referencing deleted
+// (unlinked) file data, which continues to occupy real disk space until
+// every process holding it closes the descriptor or exits.
+type DeletedFileHandle struct {
+	PID     int    `json:"pid"`
+	Command string `json:"command,omitempty"`
+	Path    string `json:"path"`
+	Bytes   uint64 `json:"bytes"`
+}
+
+// DeletedFiles is a bounded, best-effort scan of /proc/*/fd for descriptors
+// still open on deleted files -- the "df says the disk is full but nothing
+// looks large" symptom. It only sees processes this user has permission to
+// inspect, which ProcessesScanned/ProcessesSkipped make explicit rather than
+// silently under-reporting.
+type DeletedFiles struct {
+	Available        bool                `json:"available"`
+	TotalBytes       uint64              `json:"total_bytes"`
+	Handles          []DeletedFileHandle `json:"handles,omitempty"`
+	ProcessesScanned int                 `json:"processes_scanned"`
+	ProcessesSkipped int                 `json:"processes_skipped"`
 }
 
 // PathMTUCheck discovers the usable path MTU to a fixed external anchor by
