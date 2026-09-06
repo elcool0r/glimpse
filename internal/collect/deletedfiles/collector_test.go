@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 )
 
@@ -34,11 +35,18 @@ func newFakeProc(t *testing.T, pid string, comm string, deletedFile string, dele
 	if deletedFile != "" {
 		// os.Readlink on a real symlink returns exactly what was written, so
 		// this fakes the kernel's "target (deleted)" convention by pointing
-		// the symlink at a path whose name literally ends that way, and
-		// backing it with a real file of the desired size so os.Stat on the
-		// symlink succeeds.
+		// the symlink at a path whose name literally ends that way. The
+		// backing file is created sparse (Truncate, not actually written) so
+		// a multi-gigabyte test size costs no real disk I/O or memory.
 		backing := filepath.Join(root, filepath.Base(deletedFile)+" (deleted)")
-		if err := os.WriteFile(backing, make([]byte, deletedSize), 0o644); err != nil {
+		f, err := os.Create(backing)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := f.Truncate(int64(deletedSize)); err != nil {
+			t.Fatal(err)
+		}
+		if err := f.Close(); err != nil {
 			t.Fatal(err)
 		}
 		if err := os.Symlink(backing, filepath.Join(fdDir, "1")); err != nil {
@@ -99,6 +107,38 @@ func TestCollectSkipsNonPIDEntriesAndReportsUnavailableWithoutProcRoot(t *testin
 	}
 	if len(data.Diagnostics) != 1 || data.Diagnostics[0].Status != "unavailable" {
 		t.Fatalf("expected an unavailable diagnostic, got %+v", data.Diagnostics)
+	}
+}
+
+// A memfd_create() object (the .NET runtime's JIT "doublemapper", among
+// others) shows up in /proc exactly like a deleted regular file, "(deleted)"
+// suffix included, but lives on tmpfs/shmem and is not disk-backed. Its
+// logical size can be enormous (a virtual/maximum extent, not real usage),
+// so counting it here would both wildly overcount and point at the wrong
+// remediation.
+func TestCollectExcludesTmpfsBackedMemfd(t *testing.T) {
+	root := newFakeProc(t, "789", "jellyfin", "/memfd:doublemapper", 2<<30) // 2 GiB logical size
+	c := &Collector{
+		procRoot: root,
+		statfs: func(path string, stat *syscall.Statfs_t) error {
+			if filepath.Base(path) == "1" { // the deleted-memfd fd from newFakeProc
+				stat.Type = tmpfsMagic
+			}
+			return nil
+		},
+	}
+	data, err := c.Collect(context.Background())
+	if err != nil {
+		t.Fatalf("Collect returned error: %v", err)
+	}
+	if data.DeletedFiles.TotalBytes != 0 || len(data.DeletedFiles.Handles) != 0 {
+		t.Fatalf("expected the tmpfs-backed memfd to be excluded entirely, got %+v", data.DeletedFiles)
+	}
+}
+
+func TestOnTmpfsReturnsFalseOnStatfsError(t *testing.T) {
+	if onTmpfs(func(string, *syscall.Statfs_t) error { return os.ErrNotExist }, "/does/not/matter") {
+		t.Fatal("a statfs error must not be treated as tmpfs")
 	}
 }
 

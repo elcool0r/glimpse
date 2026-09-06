@@ -23,6 +23,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/elcool0r/glimpse/internal/collect"
 	"github.com/elcool0r/glimpse/internal/model"
@@ -40,13 +41,25 @@ const (
 	// maxProcesses bounds the scan on a host running many thousands of
 	// processes; this is a health snapshot, not an exhaustive audit.
 	maxProcesses = 4096
+	// tmpfsMagic is TMPFS_MAGIC from linux/magic.h. shmem-backed anonymous
+	// memory -- notably memfd_create() objects, which the .NET runtime uses
+	// for JIT code under names like "/memfd:doublemapper" -- lives on this
+	// same pseudo-filesystem and shows up identically to a deleted regular
+	// file, "(deleted)" suffix included, even though it was never backed by
+	// disk at all. Its reported size is virtual/logical (the memfd's max
+	// extent), not resident memory or disk usage, so counting it here would
+	// both overcount and point at the wrong remediation (this is RAM
+	// accounting, not reclaimable disk space). Anything on this filesystem
+	// is excluded regardless of name.
+	tmpfsMagic = 0x01021994
 )
 
 type Collector struct {
 	procRoot string
+	statfs   func(string, *syscall.Statfs_t) error
 }
 
-func New() *Collector { return &Collector{procRoot: defaultProcRoot} }
+func New() *Collector { return &Collector{procRoot: defaultProcRoot, statfs: syscall.Statfs} }
 
 func (c *Collector) Name() string { return "deleted-files" }
 
@@ -58,6 +71,10 @@ func (c *Collector) Collect(ctx context.Context) (collect.Data, error) {
 	root := c.procRoot
 	if root == "" {
 		root = defaultProcRoot
+	}
+	statfs := c.statfs
+	if statfs == nil {
+		statfs = syscall.Statfs
 	}
 	entries, err := os.ReadDir(root)
 	if err != nil {
@@ -103,6 +120,9 @@ func (c *Collector) Collect(ctx context.Context) (collect.Data, error) {
 			if err != nil || !info.Mode().IsRegular() {
 				continue
 			}
+			if onTmpfs(statfs, fdPath) {
+				continue
+			}
 			size := uint64(info.Size())
 			total += size
 			if size >= minReportBytes {
@@ -122,6 +142,17 @@ func (c *Collector) Collect(ctx context.Context) (collect.Data, error) {
 		Available: true, TotalBytes: total, Handles: handles,
 		ProcessesScanned: scanned, ProcessesSkipped: skipped,
 	}}, nil
+}
+
+// onTmpfs reports whether the file behind fdPath lives on a tmpfs/shmem
+// filesystem -- RAM-backed anonymous memory (memfd_create, /dev/shm), never
+// real disk space, regardless of what its "(deleted)" name suggests.
+func onTmpfs(statfs func(string, *syscall.Statfs_t) error, fdPath string) bool {
+	var stat syscall.Statfs_t
+	if err := statfs(fdPath, &stat); err != nil {
+		return false
+	}
+	return stat.Type == tmpfsMagic
 }
 
 func readComm(root, pid string) string {

@@ -138,7 +138,7 @@ them are on by default; `--disable-external-checks` turns them off.
 
 | Check / source | Informational result | Warning default | Critical / error default |
 | --- | --- | --- | --- |
-| Deleted-but-open files (`internal/collect/deletedfiles`) | A bounded scan of `/proc/*/fd` for descriptors still open on unlinked files -- the "disk is full but nothing looks large" symptom. Only sees processes this user can inspect; processes scanned vs. skipped is shown explicitly rather than under-reporting silently. Individual files under 1 MiB are counted toward the total but not listed | Total held-open bytes ≥200 MiB, naming the largest offender (command, PID, path, size) | Total held-open bytes ≥2 GiB |
+| Deleted-but-open files (`internal/collect/deletedfiles`) | A bounded scan of `/proc/*/fd` for descriptors still open on unlinked files -- the "disk is full but nothing looks large" symptom. Only sees processes this user can inspect; processes scanned vs. skipped is shown explicitly rather than under-reporting silently. Individual files under 1 MiB are counted toward the total but not listed. Anything living on tmpfs/shmem (`statfs` type check) is excluded entirely, not just by name: `memfd_create()` objects -- for example the .NET runtime's JIT "doublemapper" -- appear identically to a deleted regular file, "(deleted)" suffix included, but are RAM-backed with a virtual/logical size, not real disk usage | Total held-open bytes ≥200 MiB, naming the largest offender (command, PID, path, size) | Total held-open bytes ≥2 GiB |
 
 ## Severity and coverage
 
