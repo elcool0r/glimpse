@@ -357,3 +357,105 @@ func TestPathMTUCriticalRowAlwaysShown(t *testing.T) {
 		t.Fatalf("expected the Path MTU row to show by default when it found a real problem:\n%s", out.String())
 	}
 }
+
+// An unrelated informational finding elsewhere in the broad "network"
+// category (path MTU, DNS, gateway, HTTP, and TCP findings all share it for
+// scoring) must not bump the Network and TCP summary badges to INFO when
+// neither interface counters nor TCP counters actually have anything wrong.
+func TestNetworkAndTCPBadgesIgnoreUnrelatedNetworkCategoryFindings(t *testing.T) {
+	report := model.Report{
+		Host: model.Host{Hostname: "host"},
+		Metrics: model.Metrics{
+			Network: []model.Network{{Name: "eth0"}},
+			TCP:     &model.TCP{SegmentsOut: 100},
+		},
+		Findings: []model.Finding{
+			{ID: "path-mtu-reduced", Severity: model.SeverityInfo, Category: "network", Title: "Path MTU is 1420 bytes, not 1500 -- this is normal, not a fault"},
+			{ID: "dns-resolution-external-failed", Severity: model.SeverityCritical, Category: "network", Title: "External DNS server unreachable"},
+		},
+	}
+	var out strings.Builder
+	Write(&out, report, Options{ASCII: true})
+	text := out.String()
+	if !strings.Contains(text, "Network OK") {
+		t.Fatalf("expected Network row to stay OK despite an unrelated network-category finding:\n%s", text)
+	}
+	if !strings.Contains(text, "TCP OK") {
+		t.Fatalf("expected TCP row to stay OK despite an unrelated network-category finding:\n%s", text)
+	}
+}
+
+// A finding that genuinely concerns an interface (elevated errors, a missing
+// default route, conntrack drops) or TCP counters must still raise the
+// matching row's badge.
+func TestNetworkAndTCPBadgesReflectTheirOwnFindings(t *testing.T) {
+	report := model.Report{
+		Host:     model.Host{Hostname: "host"},
+		Metrics:  model.Metrics{Network: []model.Network{{Name: "eth0"}}},
+		Findings: []model.Finding{{ID: "network-no-default-route", Severity: model.SeverityInfo, Category: "network", Title: "No default route observed"}},
+	}
+	var out strings.Builder
+	Write(&out, report, Options{ASCII: true})
+	if !strings.Contains(out.String(), "Network INFO") {
+		t.Fatalf("expected Network row to reflect its own finding:\n%s", out.String())
+	}
+
+	tcpReport := model.Report{
+		Host:     model.Host{Hostname: "host"},
+		Metrics:  model.Metrics{TCP: &model.TCP{SegmentsOut: 100, RetransmittedSegments: 40}},
+		Findings: []model.Finding{{ID: "tcp-retransmits", Severity: model.SeverityWarning, Category: "network", Title: "Elevated TCP retransmissions"}},
+	}
+	var tcpOut strings.Builder
+	Write(&tcpOut, tcpReport, Options{ASCII: true})
+	if !strings.Contains(tcpOut.String(), "TCP WARN") {
+		t.Fatalf("expected TCP row to reflect its own finding:\n%s", tcpOut.String())
+	}
+}
+
+// --quiet drops rows that are fully healthy (OK) but keeps anything with
+// something to say, plus the Details section and host header.
+func TestQuietHidesOnlyOKRows(t *testing.T) {
+	report := model.Report{
+		Host: model.Host{Hostname: "host"},
+		Metrics: model.Metrics{
+			CPU:     &model.CPU{Load1: 0.1},
+			Memory:  &model.Memory{AvailableFraction: 0.9, TotalBytes: 1 << 30, AvailableBytes: 900 << 20},
+			Disks:   []model.Disk{{Name: "sda"}},
+			Network: []model.Network{{Name: "eth0"}},
+		},
+		Findings: []model.Finding{{ID: "disk-contention-sda", Severity: model.SeverityCritical, Category: "disk", Title: "Disk contention"}},
+	}
+	var out strings.Builder
+	Write(&out, report, Options{Quiet: true, ASCII: true})
+	text := out.String()
+	for _, mustNotContain := range []string{"CPU OK", "Memory OK", "Network OK"} {
+		if strings.Contains(text, mustNotContain) {
+			t.Errorf("quiet output should hide fully healthy rows, found %q:\n%s", mustNotContain, text)
+		}
+	}
+	if !strings.Contains(text, "Disk CRIT") {
+		t.Errorf("quiet output should keep rows with a problem:\n%s", text)
+	}
+	if !strings.Contains(text, "Disk contention") {
+		t.Errorf("quiet output should keep the Details section:\n%s", text)
+	}
+	if !strings.Contains(text, "host") {
+		t.Errorf("quiet output should keep the host header:\n%s", text)
+	}
+}
+
+func TestQuietWithoutIssuesStillShowsHeaderAndNoFindingsLine(t *testing.T) {
+	report := model.Report{
+		Host:    model.Host{Hostname: "host"},
+		Metrics: model.Metrics{CPU: &model.CPU{Load1: 0.1}},
+	}
+	var out strings.Builder
+	Write(&out, report, Options{Quiet: true, ASCII: true})
+	text := out.String()
+	if strings.Contains(text, "CPU OK") {
+		t.Errorf("quiet output should hide the healthy CPU row:\n%s", text)
+	}
+	if !strings.Contains(text, "No actionable findings") {
+		t.Errorf("quiet output should still state that nothing actionable was found:\n%s", text)
+	}
+}

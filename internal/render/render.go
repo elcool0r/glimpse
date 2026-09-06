@@ -22,6 +22,10 @@ type Options struct {
 	Width int
 	// ASCII avoids Unicode separators and sparklines for limited terminals.
 	ASCII bool
+	// Quiet suppresses rows and detail lines that are fully healthy (a
+	// section badge of OK), leaving only rows with something to say:
+	// INFO, WARN, CRIT, or UNKNOWN.
+	Quiet bool
 }
 
 func Write(w io.Writer, r model.Report, o Options) {
@@ -42,8 +46,7 @@ func Write(w io.Writer, r model.Report, o Options) {
 		}
 		return s
 	}
-	metric := func(name, category, text string) string {
-		severity := sectionSeverity(r.Findings, category)
+	metricSeverity := func(name string, severity model.Severity, text string) string {
 		return fmt.Sprintf("%s %s  %s", sectionLabel(name, severity, o.Color), badge(severity, o.Color), text)
 	}
 	note := func(collector string) {
@@ -51,34 +54,45 @@ func Write(w io.Writer, r model.Report, o Options) {
 			writeCollectionNote(w, width, r, collector, o.Color)
 		}
 	}
+	quietSkip := func(severity model.Severity) bool {
+		return o.Quiet && severity == model.SeverityOK
+	}
 	writeWrapped(w, width, "", fmt.Sprintf("%s  %s", bold("GLIMPSE"), cleanText(r.Host.Hostname)))
 	writeWrapped(w, width, "", metadata(strings.Join(nonEmpty(r.Host.OS, r.Host.Kernel, fmt.Sprintf("%d CPUs", r.Host.CPUCount), fmt.Sprintf("sampled %.0fs", r.SampleDurationSeconds)), separator), o.Color))
 	fmt.Fprintln(w)
-	writeWrapped(w, width, "", fmt.Sprintf("%s  %s  %d/100 %s", sectionLabel("Overall", r.Score.Status, o.Color), badge(r.Score.Status, o.Color), r.Score.Value, r.Score.Label))
 	if c := r.Metrics.CPU; c != nil {
-		writeWrapped(w, width, "", metric("CPU", "cpu", fmt.Sprintf("%s%sload %.2f%sI/O wait %.1f%%", cpuUtilization(c), separator, c.Load1, separator, c.IOWait*100)))
-		note("cpu")
+		severity := sectionSeverity(r.Findings, "cpu")
+		if !quietSkip(severity) {
+			writeWrapped(w, width, "", metricSeverity("CPU", severity, fmt.Sprintf("%s%sload %.2f%sI/O wait %.1f%%", cpuUtilization(c), separator, c.Load1, separator, c.IOWait*100)))
+			note("cpu")
+		}
 	}
 	if m := r.Metrics.Memory; m != nil {
-		writeWrapped(w, width, "", metric("Memory", "memory", fmt.Sprintf("%.1f%% available (%s / %s)%sswap %s / %s used", m.AvailableFraction*100, size(m.AvailableBytes), size(m.TotalBytes), separator, size(swapUsed(m)), size(m.SwapTotalBytes))))
-		note("memory")
+		severity := sectionSeverity(r.Findings, "memory")
+		if !quietSkip(severity) {
+			writeWrapped(w, width, "", metricSeverity("Memory", severity, fmt.Sprintf("%.1f%% available (%s / %s)%sswap %s / %s used", m.AvailableFraction*100, size(m.AvailableBytes), size(m.TotalBytes), separator, size(swapUsed(m)), size(m.SwapTotalBytes))))
+			note("memory")
+		}
 	}
 	if len(r.Metrics.Filesystems) > 0 {
 		// Read-only image mounts are full by construction, so reporting one as
 		// the fullest filesystem says nothing about the host's capacity.
 		fullest := fullestWritable(r.Metrics.Filesystems)
-		writeWrapped(w, width, "", metric("Storage", "filesystem", fmt.Sprintf("%d mounted%s%s %.1f%% used%s%s available", len(r.Metrics.Filesystems), separator, cleanText(fullest.MountPoint), fullest.UsedFraction*100, separator, size(fullest.AvailableBytes))))
-		if o.Verbose {
-			for _, fs := range r.Metrics.Filesystems {
-				severity := findingSeverity(r.Findings, "filesystem-"+fs.MountPoint, "filesystem-inodes-"+fs.MountPoint, "filesystem-read-only-"+fs.MountPoint)
-				detail := fmt.Sprintf("%s%s%.1f%% used%s%s available", cleanText(fs.Type), separator, fs.UsedFraction*100, separator, size(fs.AvailableBytes))
-				if fs.ReadOnly {
-					detail += separator + "read-only"
+		severity := sectionSeverity(r.Findings, "filesystem")
+		if !quietSkip(severity) {
+			writeWrapped(w, width, "", metricSeverity("Storage", severity, fmt.Sprintf("%d mounted%s%s %.1f%% used%s%s available", len(r.Metrics.Filesystems), separator, cleanText(fullest.MountPoint), fullest.UsedFraction*100, separator, size(fullest.AvailableBytes))))
+			if o.Verbose {
+				for _, fs := range r.Metrics.Filesystems {
+					fsSeverity := findingSeverity(r.Findings, "filesystem-"+fs.MountPoint, "filesystem-inodes-"+fs.MountPoint, "filesystem-read-only-"+fs.MountPoint)
+					detail := fmt.Sprintf("%s%s%.1f%% used%s%s available", cleanText(fs.Type), separator, fs.UsedFraction*100, separator, size(fs.AvailableBytes))
+					if fs.ReadOnly {
+						detail += separator + "read-only"
+					}
+					checkLine(w, width, "    ", cleanText(fs.MountPoint), fsSeverity, o.Color, detail)
 				}
-				checkLine(w, width, "    ", cleanText(fs.MountPoint), severity, o.Color, detail)
 			}
+			note("filesystems")
 		}
-		note("filesystems")
 	}
 	if len(r.Metrics.Disks) > 0 {
 		busiest := busiestDisk(r.Metrics.Disks)
@@ -86,19 +100,22 @@ func Write(w io.Writer, r model.Report, o Options) {
 		if duration <= 0 {
 			duration = r.SampleDurationSeconds
 		}
-		writeWrapped(w, width, "", metric("Disk", "disk", fmt.Sprintf("%d %s%s%s %.0f%% busy%s%s/s", len(r.Metrics.Disks), diskKind(r.Metrics.Disks), separator, cleanText(busiest.Name), busiest.Utilization*100, separator, sizePerSecond(busiest.ReadBytes+busiest.WriteBytes, duration))))
-		if o.Verbose {
-			for _, disk := range r.Metrics.Disks {
-				diskDuration := disk.SampleDurationSeconds
-				if diskDuration <= 0 {
-					diskDuration = r.SampleDurationSeconds
+		severity := sectionSeverity(r.Findings, "disk")
+		if !quietSkip(severity) {
+			writeWrapped(w, width, "", metricSeverity("Disk", severity, fmt.Sprintf("%d %s%s%s %.0f%% busy%s%s/s", len(r.Metrics.Disks), diskKind(r.Metrics.Disks), separator, cleanText(busiest.Name), busiest.Utilization*100, separator, sizePerSecond(busiest.ReadBytes+busiest.WriteBytes, duration))))
+			if o.Verbose {
+				for _, disk := range r.Metrics.Disks {
+					diskDuration := disk.SampleDurationSeconds
+					if diskDuration <= 0 {
+						diskDuration = r.SampleDurationSeconds
+					}
+					diskSeverity := findingSeverity(r.Findings, "disk-contention-"+disk.Name)
+					detail := fmt.Sprintf("%.0f%% busy%s%s/s", disk.Utilization*100, separator, sizePerSecond(disk.ReadBytes+disk.WriteBytes, diskDuration))
+					checkLine(w, width, "    ", cleanText(disk.Name), diskSeverity, o.Color, detail)
 				}
-				severity := findingSeverity(r.Findings, "disk-contention-"+disk.Name)
-				detail := fmt.Sprintf("%.0f%% busy%s%s/s", disk.Utilization*100, separator, sizePerSecond(disk.ReadBytes+disk.WriteBytes, diskDuration))
-				checkLine(w, width, "    ", cleanText(disk.Name), severity, o.Color, detail)
 			}
+			note("disk")
 		}
-		note("disk")
 	}
 	if len(r.Metrics.Network) > 0 {
 		busiest := busiestNetwork(r.Metrics.Network)
@@ -106,19 +123,22 @@ func Write(w io.Writer, r model.Report, o Options) {
 		if duration <= 0 {
 			duration = r.SampleDurationSeconds
 		}
-		writeWrapped(w, width, "", metric("Network", "network", fmt.Sprintf("%d interfaces%s%s%s RX %s/s%sTX %s/s", len(r.Metrics.Network), separator, cleanText(busiest.Name), linkSummary(busiest), sizePerSecond(busiest.RXBytes, duration), separator, sizePerSecond(busiest.TXBytes, duration))))
-		if o.Verbose {
-			for _, iface := range r.Metrics.Network {
-				ifaceDuration := iface.SampleDurationSeconds
-				if ifaceDuration <= 0 {
-					ifaceDuration = r.SampleDurationSeconds
+		netSeverity := maxSeverity(findingSeverityByPrefix(r.Findings, "network", "network-"), findingSeverity(r.Findings, "conntrack-drops"))
+		if !quietSkip(netSeverity) {
+			writeWrapped(w, width, "", metricSeverity("Network", netSeverity, fmt.Sprintf("%d interfaces%s%s%s RX %s/s%sTX %s/s", len(r.Metrics.Network), separator, cleanText(busiest.Name), linkSummary(busiest), sizePerSecond(busiest.RXBytes, duration), separator, sizePerSecond(busiest.TXBytes, duration))))
+			if o.Verbose {
+				for _, iface := range r.Metrics.Network {
+					ifaceDuration := iface.SampleDurationSeconds
+					if ifaceDuration <= 0 {
+						ifaceDuration = r.SampleDurationSeconds
+					}
+					severity := findingSeverityByPrefix(r.Findings, "network", "network-"+iface.Name+"-")
+					detail := fmt.Sprintf("RX %s/s%sTX %s/s%s", sizePerSecond(iface.RXBytes, ifaceDuration), separator, sizePerSecond(iface.TXBytes, ifaceDuration), linkSummary(iface))
+					checkLine(w, width, "    ", cleanText(iface.Name), severity, o.Color, strings.TrimSuffix(detail, " "))
 				}
-				severity := findingSeverityByPrefix(r.Findings, "network", "network-"+iface.Name+"-")
-				detail := fmt.Sprintf("RX %s/s%sTX %s/s%s", sizePerSecond(iface.RXBytes, ifaceDuration), separator, sizePerSecond(iface.TXBytes, ifaceDuration), linkSummary(iface))
-				checkLine(w, width, "    ", cleanText(iface.Name), severity, o.Color, strings.TrimSuffix(detail, " "))
 			}
+			note("network")
 		}
-		note("network")
 	}
 	if len(r.Metrics.Thermal) > 0 {
 		unit := "°C"
@@ -126,75 +146,90 @@ func Write(w io.Writer, r model.Report, o Options) {
 			unit = "C"
 		}
 		sensor := hottestSensor(r.Metrics.Thermal)
-		writeWrapped(w, width, "", metric("Thermal", "thermal", fmt.Sprintf("%.1f%s maximum reported temperature (%s)", sensor.TemperatureC, unit, thermalLabel(sensor.Name))))
-		note("thermal")
+		severity := sectionSeverity(r.Findings, "thermal")
+		if !quietSkip(severity) {
+			writeWrapped(w, width, "", metricSeverity("Thermal", severity, fmt.Sprintf("%.1f%s maximum reported temperature (%s)", sensor.TemperatureC, unit, thermalLabel(sensor.Name))))
+			note("thermal")
+		}
 	}
 	if s := r.Metrics.Systemd; s != nil && s.Available {
-		writeWrapped(w, width, "", metric("Services", "services", fmt.Sprintf("%d failed units", len(s.FailedUnits))))
-		if o.Verbose {
-			for _, unit := range s.FailedUnits {
-				checkLine(w, width, "    ", cleanText(unit), model.SeverityCritical, o.Color, "failed")
+		severity := sectionSeverity(r.Findings, "services")
+		if !quietSkip(severity) {
+			writeWrapped(w, width, "", metricSeverity("Services", severity, fmt.Sprintf("%d failed units", len(s.FailedUnits))))
+			if o.Verbose {
+				for _, unit := range s.FailedUnits {
+					checkLine(w, width, "    ", cleanText(unit), model.SeverityCritical, o.Color, "failed")
+				}
+				for _, unit := range s.RestartingUnits {
+					unitSeverity := findingSeverity(r.Findings, "systemd-restarting-"+unit.Unit)
+					checkLine(w, width, "    ", cleanText(unit.Unit), unitSeverity, o.Color, fmt.Sprintf("restarted %d time(s) during the sample", unit.RestartsDelta))
+				}
+			} else if len(s.RestartingUnits) > 0 {
+				worst := s.RestartingUnits[0]
+				checkLine(w, width, "    ", "Restart loop", findingSeverity(r.Findings, "systemd-restarting-"+worst.Unit), o.Color, fmt.Sprintf("%s restarted %d time(s)", cleanText(worst.Unit), worst.RestartsDelta))
 			}
-			for _, unit := range s.RestartingUnits {
-				severity := findingSeverity(r.Findings, "systemd-restarting-"+unit.Unit)
-				checkLine(w, width, "    ", cleanText(unit.Unit), severity, o.Color, fmt.Sprintf("restarted %d time(s) during the sample", unit.RestartsDelta))
-			}
-		} else if len(s.RestartingUnits) > 0 {
-			worst := s.RestartingUnits[0]
-			checkLine(w, width, "    ", "Restart loop", findingSeverity(r.Findings, "systemd-restarting-"+worst.Unit), o.Color, fmt.Sprintf("%s restarted %d time(s)", cleanText(worst.Unit), worst.RestartsDelta))
+			note("systemd")
 		}
-		note("systemd")
 	}
 	if tcp := r.Metrics.TCP; tcp != nil {
-		writeWrapped(w, width, "", metric("TCP", "network", fmt.Sprintf("%d retransmits / %d outbound%s%d listen drops", tcp.RetransmittedSegments, tcp.SegmentsOut, separator, tcp.ListenOverflows+tcp.ListenDrops)))
-		if o.Verbose {
-			checkLine(w, width, "    ", "Retransmits", findingSeverity(r.Findings, "tcp-retransmits"), o.Color, fmt.Sprintf("%d of %d outbound", tcp.RetransmittedSegments, tcp.SegmentsOut))
-			checkLine(w, width, "    ", "Listen queue", findingSeverity(r.Findings, "tcp-listen-overflow"), o.Color, fmt.Sprintf("%d overflow%s%d drops", tcp.ListenOverflows, separator, tcp.ListenDrops))
-			checkLine(w, width, "    ", "Connection attempts", findingSeverity(r.Findings, "tcp-connect-failures"), o.Color, fmt.Sprintf("%d of %d failed", tcp.AttemptFails, tcp.ActiveOpens+tcp.PassiveOpens))
-			udpSeverity := model.SeverityOK
-			if tcp.UDPInErrors > 0 {
-				udpSeverity = model.SeverityInfo
-			}
-			checkLine(w, width, "    ", "UDP errors", udpSeverity, o.Color, fmt.Sprintf("%d", tcp.UDPInErrors))
-			ipSeverity := model.SeverityOK
-			if tcp.IPReassemblyFailures > 0 || tcp.IPFragmentationFailures > 0 {
-				ipSeverity = model.SeverityInfo
-			}
-			checkLine(w, width, "    ", "IP reassembly/fragmentation", ipSeverity, o.Color, fmt.Sprintf("reassembly %d%sfragmentation %d", tcp.IPReassemblyFailures, separator, tcp.IPFragmentationFailures))
-			if resources := r.Metrics.Resources; resources != nil {
-				if resources.TimeWaitMaximum > 0 {
-					checkLine(w, width, "    ", "TIME_WAIT table", findingSeverity(r.Findings, "tcp-time-wait-saturation"), o.Color, fmt.Sprintf("%d/%d", tcp.TimeWaitSockets, resources.TimeWaitMaximum))
+		tcpSeverity := findingSeverityByPrefix(r.Findings, "network", "tcp-")
+		if !quietSkip(tcpSeverity) {
+			writeWrapped(w, width, "", metricSeverity("TCP", tcpSeverity, fmt.Sprintf("%d retransmits / %d outbound%s%d listen drops", tcp.RetransmittedSegments, tcp.SegmentsOut, separator, tcp.ListenOverflows+tcp.ListenDrops)))
+			if o.Verbose {
+				checkLine(w, width, "    ", "Retransmits", findingSeverity(r.Findings, "tcp-retransmits"), o.Color, fmt.Sprintf("%d of %d outbound", tcp.RetransmittedSegments, tcp.SegmentsOut))
+				checkLine(w, width, "    ", "Listen queue", findingSeverity(r.Findings, "tcp-listen-overflow"), o.Color, fmt.Sprintf("%d overflow%s%d drops", tcp.ListenOverflows, separator, tcp.ListenDrops))
+				checkLine(w, width, "    ", "Connection attempts", findingSeverity(r.Findings, "tcp-connect-failures"), o.Color, fmt.Sprintf("%d of %d failed", tcp.AttemptFails, tcp.ActiveOpens+tcp.PassiveOpens))
+				udpSeverity := model.SeverityOK
+				if tcp.UDPInErrors > 0 {
+					udpSeverity = model.SeverityInfo
 				}
-				if resources.OrphanMaximum > 0 {
-					checkLine(w, width, "    ", "Orphan sockets", findingSeverity(r.Findings, "tcp-orphan-saturation"), o.Color, fmt.Sprintf("%d/%d", tcp.OrphanSockets, resources.OrphanMaximum))
+				checkLine(w, width, "    ", "UDP errors", udpSeverity, o.Color, fmt.Sprintf("%d", tcp.UDPInErrors))
+				ipSeverity := model.SeverityOK
+				if tcp.IPReassemblyFailures > 0 || tcp.IPFragmentationFailures > 0 {
+					ipSeverity = model.SeverityInfo
+				}
+				checkLine(w, width, "    ", "IP reassembly/fragmentation", ipSeverity, o.Color, fmt.Sprintf("reassembly %d%sfragmentation %d", tcp.IPReassemblyFailures, separator, tcp.IPFragmentationFailures))
+				if resources := r.Metrics.Resources; resources != nil {
+					if resources.TimeWaitMaximum > 0 {
+						checkLine(w, width, "    ", "TIME_WAIT table", findingSeverity(r.Findings, "tcp-time-wait-saturation"), o.Color, fmt.Sprintf("%d/%d", tcp.TimeWaitSockets, resources.TimeWaitMaximum))
+					}
+					if resources.OrphanMaximum > 0 {
+						checkLine(w, width, "    ", "Orphan sockets", findingSeverity(r.Findings, "tcp-orphan-saturation"), o.Color, fmt.Sprintf("%d/%d", tcp.OrphanSockets, resources.OrphanMaximum))
+					}
 				}
 			}
+			note("tcp")
 		}
-		note("tcp")
 	}
 	if sync := r.Metrics.TimeSync; sync != nil && sync.Available {
-		writeWrapped(w, width, "", metric("Time", "time", timeSyncStatus(sync)))
-		note("time-sync")
+		severity := sectionSeverity(r.Findings, "time")
+		if !quietSkip(severity) {
+			writeWrapped(w, width, "", metricSeverity("Time", severity, timeSyncStatus(sync)))
+			note("time-sync")
+		}
 	}
 	if resources := r.Metrics.Resources; resources != nil {
 		if text := resourceSummary(resources); text != "" {
-			writeWrapped(w, width, "", metric("Limits", "resources", text))
-			if o.Verbose {
-				for _, limit := range []struct {
-					id, label    string
-					current, max uint64
-				}{
-					{"resource-file-descriptors", "File descriptors", resources.OpenFiles, resources.OpenFilesMaximum},
-					{"resource-tasks", "Tasks", resources.Processes, taskCeiling(resources)},
-					{"resource-conntrack", "Conntrack", resources.Conntrack, resources.ConntrackMaximum},
-				} {
-					if limit.max == 0 {
-						continue
+			severity := sectionSeverity(r.Findings, "resources")
+			if !quietSkip(severity) {
+				writeWrapped(w, width, "", metricSeverity("Limits", severity, text))
+				if o.Verbose {
+					for _, limit := range []struct {
+						id, label    string
+						current, max uint64
+					}{
+						{"resource-file-descriptors", "File descriptors", resources.OpenFiles, resources.OpenFilesMaximum},
+						{"resource-tasks", "Tasks", resources.Processes, taskCeiling(resources)},
+						{"resource-conntrack", "Conntrack", resources.Conntrack, resources.ConntrackMaximum},
+					} {
+						if limit.max == 0 {
+							continue
+						}
+						checkLine(w, width, "    ", limit.label, findingSeverity(r.Findings, limit.id), o.Color, fmt.Sprintf("%d/%d (%.0f%%)", limit.current, limit.max, float64(limit.current)*100/float64(limit.max)))
 					}
-					checkLine(w, width, "    ", limit.label, findingSeverity(r.Findings, limit.id), o.Color, fmt.Sprintf("%d/%d (%.0f%%)", limit.current, limit.max, float64(limit.current)*100/float64(limit.max)))
 				}
+				note("resources")
 			}
-			note("resources")
 		}
 	}
 	if p := r.Metrics.Processes; p != nil {
@@ -205,14 +240,14 @@ func Write(w io.Writer, r model.Report, o Options) {
 		// --verbose.
 		cpuSeverity := sectionSeverity(r.Findings, "cpu")
 		memSeverity := sectionSeverity(r.Findings, "memory")
-		if o.Verbose || severityRank(processSeverity) >= severityRank(model.SeverityWarning) || severityRank(cpuSeverity) >= severityRank(model.SeverityWarning) {
+		if (o.Verbose && !o.Quiet) || severityRank(processSeverity) >= severityRank(model.SeverityWarning) || severityRank(cpuSeverity) >= severityRank(model.SeverityWarning) {
 			topCPUSeverity := processSeverity
 			if severityRank(cpuSeverity) > severityRank(topCPUSeverity) {
 				topCPUSeverity = cpuSeverity
 			}
 			renderProcesses(w, width, sectionLabel("Top CPU", topCPUSeverity, o.Color), p.TopCPU, separator, p.CPUSampled)
 		}
-		if o.Verbose || severityRank(processSeverity) >= severityRank(model.SeverityWarning) || severityRank(memSeverity) >= severityRank(model.SeverityWarning) {
+		if (o.Verbose && !o.Quiet) || severityRank(processSeverity) >= severityRank(model.SeverityWarning) || severityRank(memSeverity) >= severityRank(model.SeverityWarning) {
 			topRAMSeverity := processSeverity
 			if severityRank(memSeverity) > severityRank(topRAMSeverity) {
 				topRAMSeverity = memSeverity
@@ -220,7 +255,7 @@ func Write(w io.Writer, r model.Report, o Options) {
 			renderProcesses(w, width, sectionLabel("Top RAM", topRAMSeverity, o.Color), withoutPIDs(p.TopRSS, p.TopCPU), separator, p.CPUSampled)
 		}
 	}
-	renderIntegrations(w, width, r, separator, o.Color, o.Verbose)
+	renderIntegrations(w, width, r, separator, o.Color, o.Verbose, o.Quiet)
 	findings := actionableFindings(r.Findings)
 	if o.Verbose {
 		findings = r.Findings
@@ -465,6 +500,13 @@ func findingSeverityByPrefix(findings []model.Finding, category, prefix string) 
 		}
 	}
 	return severity
+}
+
+func maxSeverity(a, b model.Severity) model.Severity {
+	if severityRank(b) > severityRank(a) {
+		return b
+	}
+	return a
 }
 
 func sectionSeverity(findings []model.Finding, category string) model.Severity {

@@ -13,7 +13,6 @@ $ glimpse
 GLIMPSE  web-03
 Linux · 6.8.0-45-generic · 8 CPUs · sampled 5s
 
-Overall  CRIT  55/100 CRITICAL
 CPU OK  18% avg · load 1.42 · I/O wait 2.1%
 Memory OK  61.0% available (9.6 GiB / 16.0 GiB) · swap 0 B / 4.0 GiB used
 Storage CRIT  2 mounted · / 97.0% used · 2.0 GiB available
@@ -75,6 +74,7 @@ glimpse                              # quick 5-second health check
 glimpse --duration 60s               # longer, more thorough sample
 glimpse --json                       # machine-readable output
 glimpse --verbose                    # show every check performed, not just problems
+glimpse --quiet                      # only show checks that are not OK
 glimpse --disable-external-checks    # passive collection only, no network traffic sent
 glimpse --no-containers              # skip Docker/Podman inspection
 ```
@@ -84,6 +84,7 @@ glimpse --no-containers              # skip Docker/Podman inspection
 | `--duration <dur>` | Sampling window (default `5s`) |
 | `--json` | Emit a stable, versioned JSON report instead of the terminal report |
 | `--verbose` | Show every check performed and its full detail, not just problems |
+| `--quiet` | Only show checks that are not OK (INFO, WARN, CRIT, or UNKNOWN) |
 | `--no-color` | Disable ANSI colors (also respects `NO_COLOR`) |
 | `--no-containers` | Disable Docker/Podman inspection |
 | `--disable-external-checks` | Disable the active DNS/gateway/MTU/HTTP checks that send real network traffic |

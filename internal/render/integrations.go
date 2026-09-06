@@ -13,12 +13,15 @@ import (
 // immediately (in verbose mode) by that same check's own detail lines and
 // any collection diagnostic for it. Detail always sits directly under the
 // row it belongs to; nothing is appended in a separate pass at the end.
-func renderIntegrations(w io.Writer, width int, r model.Report, separator string, color, verbose bool) {
+func renderIntegrations(w io.Writer, width int, r model.Report, separator string, color, verbose, quiet bool) {
 	m := r.Metrics
 	note := func(collector string) {
 		if verbose {
 			writeCollectionNote(w, width, r, collector, color)
 		}
+	}
+	skip := func(severity model.Severity) bool {
+		return quiet && severity == model.SeverityOK
 	}
 	for _, runtime := range m.Containers {
 		running, unhealthy, restarting, logIssues, oomKilled, exited := 0, 0, 0, 0, 0, 0
@@ -82,30 +85,32 @@ func renderIntegrations(w io.Writer, width int, r model.Report, separator string
 		if oomKilled > 0 {
 			text += fmt.Sprintf("%s%d OOM-killed", separator, oomKilled)
 		}
-		writeWrapped(w, width, "", text)
-		if verbose {
-			for _, c := range runtime.Containers {
-				name := c.Name
-				if name == "" {
-					name = c.ID
-				}
-				prefix := "container-" + runtime.Runtime + "-" + name
-				containerSeverity := findingSeverityByPrefix(r.Findings, "containers", prefix+"-")
-				detail := cleanText(c.State)
-				if c.Healthy != nil {
-					if *c.Healthy {
-						detail += separator + "healthy"
-					} else {
-						detail += separator + "unhealthy"
+		if !skip(severity) {
+			writeWrapped(w, width, "", text)
+			if verbose {
+				for _, c := range runtime.Containers {
+					name := c.Name
+					if name == "" {
+						name = c.ID
 					}
+					prefix := "container-" + runtime.Runtime + "-" + name
+					containerSeverity := findingSeverityByPrefix(r.Findings, "containers", prefix+"-")
+					detail := cleanText(c.State)
+					if c.Healthy != nil {
+						if *c.Healthy {
+							detail += separator + "healthy"
+						} else {
+							detail += separator + "unhealthy"
+						}
+					}
+					if c.RestartCount > 0 {
+						detail += fmt.Sprintf("%s%d restart(s)", separator, c.RestartCount)
+					}
+					if len(c.LogEvents) > 0 {
+						detail += fmt.Sprintf("%s%d log event(s)", separator, len(c.LogEvents))
+					}
+					checkLine(w, width, "    ", cleanText(name), containerSeverity, color, detail)
 				}
-				if c.RestartCount > 0 {
-					detail += fmt.Sprintf("%s%d restart(s)", separator, c.RestartCount)
-				}
-				if len(c.LogEvents) > 0 {
-					detail += fmt.Sprintf("%s%d log event(s)", separator, len(c.LogEvents))
-				}
-				checkLine(w, width, "    ", cleanText(name), containerSeverity, color, detail)
 			}
 		}
 	}
@@ -131,24 +136,26 @@ func renderIntegrations(w io.Writer, width int, r model.Report, separator string
 		if severityRank(errorsSeverity) > severityRank(severity) {
 			severity = errorsSeverity
 		}
-		writeWrapped(w, width, "", fmt.Sprintf("%s %s  %s", sectionLabel("ZFS", severity, color), badge(severity, color), cleanText(pool.Name)))
-		if verbose {
-			checkLine(w, width, "    ", "Pool health", healthSeverity, color, health)
-			errorsDetail := fmt.Sprintf("read %d%swrite %d%schecksum %d", pool.ReadErrors, separator, pool.WriteErrors, separator, pool.ChecksumErrors)
-			if pool.PermanentErrors {
-				errorsDetail += separator + "permanent errors present"
+		if !skip(severity) {
+			writeWrapped(w, width, "", fmt.Sprintf("%s %s  %s", sectionLabel("ZFS", severity, color), badge(severity, color), cleanText(pool.Name)))
+			if verbose {
+				checkLine(w, width, "    ", "Pool health", healthSeverity, color, health)
+				errorsDetail := fmt.Sprintf("read %d%swrite %d%schecksum %d", pool.ReadErrors, separator, pool.WriteErrors, separator, pool.ChecksumErrors)
+				if pool.PermanentErrors {
+					errorsDetail += separator + "permanent errors present"
+				}
+				checkLine(w, width, "    ", "Data integrity", errorsSeverity, color, errorsDetail)
+				scanSeverity := model.SeverityOK
+				scanDetail := cleanText(pool.ScanState)
+				if scanDetail == "" {
+					scanDetail = "no scrub/resilver recorded"
+				} else if strings.Contains(strings.ToLower(scanDetail), "in progress") {
+					scanSeverity = model.SeverityInfo
+				}
+				checkLine(w, width, "    ", "Scrub/resilver", scanSeverity, color, scanDetail)
+			} else if healthSeverity != model.SeverityOK || errorsSeverity != model.SeverityOK {
+				writeWrapped(w, width, "    ", fmt.Sprintf("health %s%serrors read %d/write %d/checksum %d", health, separator, pool.ReadErrors, pool.WriteErrors, pool.ChecksumErrors))
 			}
-			checkLine(w, width, "    ", "Data integrity", errorsSeverity, color, errorsDetail)
-			scanSeverity := model.SeverityOK
-			scanDetail := cleanText(pool.ScanState)
-			if scanDetail == "" {
-				scanDetail = "no scrub/resilver recorded"
-			} else if strings.Contains(strings.ToLower(scanDetail), "in progress") {
-				scanSeverity = model.SeverityInfo
-			}
-			checkLine(w, width, "    ", "Scrub/resilver", scanSeverity, color, scanDetail)
-		} else if healthSeverity != model.SeverityOK || errorsSeverity != model.SeverityOK {
-			writeWrapped(w, width, "    ", fmt.Sprintf("health %s%serrors read %d/write %d/checksum %d", health, separator, pool.ReadErrors, pool.WriteErrors, pool.ChecksumErrors))
 		}
 	}
 	note("zfs")
@@ -208,58 +215,60 @@ func renderIntegrations(w io.Writer, width int, r model.Report, separator string
 				severity = model.SeverityWarning
 			}
 		}
-		writeWrapped(w, width, "", fmt.Sprintf("%s %s  %s", sectionLabel("Storage layers", severity, color), badge(severity, color), strings.Join(parts, separator)))
-		if verbose {
-			for _, raid := range m.SoftwareRAID {
-				raidSeverity := model.SeverityOK
-				if !strings.EqualFold(raid.State, "active") && !strings.EqualFold(raid.State, "clean") {
-					raidSeverity = model.SeverityCritical
-				}
-				text := fmt.Sprintf("%s %s  %s%s%s%s%s", sectionLabel("RAID", raidSeverity, color), badge(raidSeverity, color), cleanText(raid.Device), separator, cleanText(raid.Level), separator, cleanText(raid.State))
-				if raid.ResyncProgress != "" {
-					text += separator + "rebuild/resync active"
-				}
-				writeWrapped(w, width, "    ", text)
-			}
-			if m.LVM != nil {
-				// The collector decides what an attribute string means; reading it
-				// again here is how the two interpretations drifted apart.
-				lvmSeverity := model.SeverityOK
-				for _, vg := range m.LVM.VolumeGroups {
-					if vg.NeedsReview {
-						lvmSeverity = model.SeverityWarning
+		if !skip(severity) {
+			writeWrapped(w, width, "", fmt.Sprintf("%s %s  %s", sectionLabel("Storage layers", severity, color), badge(severity, color), strings.Join(parts, separator)))
+			if verbose {
+				for _, raid := range m.SoftwareRAID {
+					raidSeverity := model.SeverityOK
+					if !strings.EqualFold(raid.State, "active") && !strings.EqualFold(raid.State, "clean") {
+						raidSeverity = model.SeverityCritical
 					}
-				}
-				for _, lv := range m.LVM.LogicalVolumes {
-					if lv.NeedsReview {
-						lvmSeverity = model.SeverityWarning
+					text := fmt.Sprintf("%s %s  %s%s%s%s%s", sectionLabel("RAID", raidSeverity, color), badge(raidSeverity, color), cleanText(raid.Device), separator, cleanText(raid.Level), separator, cleanText(raid.State))
+					if raid.ResyncProgress != "" {
+						text += separator + "rebuild/resync active"
 					}
+					writeWrapped(w, width, "    ", text)
 				}
-				writeWrapped(w, width, "    ", fmt.Sprintf("%s %s  %d PVs%s%d VGs%s%d LVs", sectionLabel("LVM", lvmSeverity, color), badge(lvmSeverity, color), len(m.LVM.PhysicalVolumes), separator, len(m.LVM.VolumeGroups), separator, len(m.LVM.LogicalVolumes)))
-			}
-			if len(m.MountChecks) > 0 {
-				active := 0
-				for _, mount := range m.MountChecks {
-					if mount.Active {
-						active++
+				if m.LVM != nil {
+					// The collector decides what an attribute string means; reading it
+					// again here is how the two interpretations drifted apart.
+					lvmSeverity := model.SeverityOK
+					for _, vg := range m.LVM.VolumeGroups {
+						if vg.NeedsReview {
+							lvmSeverity = model.SeverityWarning
+						}
 					}
-				}
-				mountSeverity := model.SeverityOK
-				if active < len(m.MountChecks) {
-					mountSeverity = model.SeverityWarning
-				}
-				writeWrapped(w, width, "    ", fmt.Sprintf("%s %s  persistent mounts %d/%d active", sectionLabel("Mounts", mountSeverity, color), badge(mountSeverity, color), active, len(m.MountChecks)))
-				for _, mount := range m.MountChecks {
-					itemSeverity := model.SeverityOK
-					status := "active"
-					if mount.ActiveKnown && !mount.Active {
-						itemSeverity = model.SeverityWarning
-						status = "not active"
-					} else if !mount.ActiveKnown {
-						status = "activity unknown"
+					for _, lv := range m.LVM.LogicalVolumes {
+						if lv.NeedsReview {
+							lvmSeverity = model.SeverityWarning
+						}
 					}
-					detail := fmt.Sprintf("%s%s%s", cleanText(mount.FSType), separator, status)
-					checkLine(w, width, "        ", cleanText(mount.MountPoint), itemSeverity, color, detail)
+					writeWrapped(w, width, "    ", fmt.Sprintf("%s %s  %d PVs%s%d VGs%s%d LVs", sectionLabel("LVM", lvmSeverity, color), badge(lvmSeverity, color), len(m.LVM.PhysicalVolumes), separator, len(m.LVM.VolumeGroups), separator, len(m.LVM.LogicalVolumes)))
+				}
+				if len(m.MountChecks) > 0 {
+					active := 0
+					for _, mount := range m.MountChecks {
+						if mount.Active {
+							active++
+						}
+					}
+					mountSeverity := model.SeverityOK
+					if active < len(m.MountChecks) {
+						mountSeverity = model.SeverityWarning
+					}
+					writeWrapped(w, width, "    ", fmt.Sprintf("%s %s  persistent mounts %d/%d active", sectionLabel("Mounts", mountSeverity, color), badge(mountSeverity, color), active, len(m.MountChecks)))
+					for _, mount := range m.MountChecks {
+						itemSeverity := model.SeverityOK
+						status := "active"
+						if mount.ActiveKnown && !mount.Active {
+							itemSeverity = model.SeverityWarning
+							status = "not active"
+						} else if !mount.ActiveKnown {
+							status = "activity unknown"
+						}
+						detail := fmt.Sprintf("%s%s%s", cleanText(mount.FSType), separator, status)
+						checkLine(w, width, "        ", cleanText(mount.MountPoint), itemSeverity, color, detail)
+					}
 				}
 			}
 		}
@@ -282,40 +291,42 @@ func renderIntegrations(w io.Writer, width int, r model.Report, separator string
 		if attention > 0 {
 			text += fmt.Sprintf("%s%d needing attention", separator, attention)
 		}
-		writeWrapped(w, width, "", text)
-		if verbose {
-			for _, device := range m.DeviceHealth {
-				deviceSeverity := findingSeverity(r.Findings, "device-health-"+device.Device, "device-wear-"+device.Device)
-				var facts []string
-				if device.OverallPassed != nil {
-					if *device.OverallPassed {
-						facts = append(facts, "SMART passed")
-					} else {
-						facts = append(facts, "SMART FAILED")
+		if !skip(severity) {
+			writeWrapped(w, width, "", text)
+			if verbose {
+				for _, device := range m.DeviceHealth {
+					deviceSeverity := findingSeverity(r.Findings, "device-health-"+device.Device, "device-wear-"+device.Device)
+					var facts []string
+					if device.OverallPassed != nil {
+						if *device.OverallPassed {
+							facts = append(facts, "SMART passed")
+						} else {
+							facts = append(facts, "SMART FAILED")
+						}
 					}
+					if device.CriticalWarning != 0 {
+						facts = append(facts, fmt.Sprintf("critical warning 0x%x", device.CriticalWarning))
+					}
+					if device.PendingSectors != 0 {
+						facts = append(facts, fmt.Sprintf("pending sectors %d", device.PendingSectors))
+					}
+					if device.Uncorrectable != 0 {
+						facts = append(facts, fmt.Sprintf("uncorrectable %d", device.Uncorrectable))
+					}
+					if device.MediaErrors != 0 {
+						facts = append(facts, fmt.Sprintf("media errors %d", device.MediaErrors))
+					}
+					if device.ReallocatedSectors != 0 {
+						facts = append(facts, fmt.Sprintf("reallocated %d", device.ReallocatedSectors))
+					}
+					if device.TemperatureC != 0 {
+						facts = append(facts, fmt.Sprintf("%.0f°C", device.TemperatureC))
+					}
+					if len(facts) == 0 {
+						facts = append(facts, "no issues reported")
+					}
+					checkLine(w, width, "    ", cleanText(device.Device), deviceSeverity, color, strings.Join(facts, separator))
 				}
-				if device.CriticalWarning != 0 {
-					facts = append(facts, fmt.Sprintf("critical warning 0x%x", device.CriticalWarning))
-				}
-				if device.PendingSectors != 0 {
-					facts = append(facts, fmt.Sprintf("pending sectors %d", device.PendingSectors))
-				}
-				if device.Uncorrectable != 0 {
-					facts = append(facts, fmt.Sprintf("uncorrectable %d", device.Uncorrectable))
-				}
-				if device.MediaErrors != 0 {
-					facts = append(facts, fmt.Sprintf("media errors %d", device.MediaErrors))
-				}
-				if device.ReallocatedSectors != 0 {
-					facts = append(facts, fmt.Sprintf("reallocated %d", device.ReallocatedSectors))
-				}
-				if device.TemperatureC != 0 {
-					facts = append(facts, fmt.Sprintf("%.0f°C", device.TemperatureC))
-				}
-				if len(facts) == 0 {
-					facts = append(facts, "no issues reported")
-				}
-				checkLine(w, width, "    ", cleanText(device.Device), deviceSeverity, color, strings.Join(facts, separator))
 			}
 		}
 	}
@@ -327,41 +338,43 @@ func renderIntegrations(w io.Writer, width int, r model.Report, separator string
 			routes = fmt.Sprintf("%d routes", len(state.Routes))
 		}
 		dnsSeverity, dnsText := dnsStatus(state, m.Systemd)
-		writeWrapped(w, width, "", fmt.Sprintf("%s %s  %d listening sockets%s%s%s%d connection states%sDNS: %s", sectionLabel("Network state", dnsSeverity, color), badge(dnsSeverity, color), len(state.ListeningSockets), separator, routes, separator, len(state.ConnectionStates), separator, dnsText))
-		if verbose {
-			dnsDetail := dnsText
-			if dnsSeverity == model.SeverityOK && state.DNS != nil && len(state.DNS.Nameservers) > 0 {
-				dnsDetail = "Nameservers: " + strings.Join(state.DNS.Nameservers, separator)
-			}
-			checkLine(w, width, "    ", "DNS configured", dnsSeverity, color, dnsDetail)
-			routesSeverity := model.SeverityInfo
-			routesDetail := "unavailable"
-			if state.RoutesAvailable {
-				routesSeverity = model.SeverityOK
-				routesDetail = fmt.Sprintf("%d route(s)", len(state.Routes))
-			}
-			checkLine(w, width, "    ", "Routes", routesSeverity, color, routesDetail)
-			socketsDetail := fmt.Sprintf("%d socket(s)", len(state.ListeningSockets))
-			if len(state.ListeningSockets) > 0 {
-				ports := make([]string, 0, len(state.ListeningSockets))
-				for i, socket := range state.ListeningSockets {
-					if i >= 8 {
-						break
+		if !skip(dnsSeverity) {
+			writeWrapped(w, width, "", fmt.Sprintf("%s %s  %d listening sockets%s%s%s%d connection states%sDNS: %s", sectionLabel("Network state", dnsSeverity, color), badge(dnsSeverity, color), len(state.ListeningSockets), separator, routes, separator, len(state.ConnectionStates), separator, dnsText))
+			if verbose {
+				dnsDetail := dnsText
+				if dnsSeverity == model.SeverityOK && state.DNS != nil && len(state.DNS.Nameservers) > 0 {
+					dnsDetail = "Nameservers: " + strings.Join(state.DNS.Nameservers, separator)
+				}
+				checkLine(w, width, "    ", "DNS configured", dnsSeverity, color, dnsDetail)
+				routesSeverity := model.SeverityInfo
+				routesDetail := "unavailable"
+				if state.RoutesAvailable {
+					routesSeverity = model.SeverityOK
+					routesDetail = fmt.Sprintf("%d route(s)", len(state.Routes))
+				}
+				checkLine(w, width, "    ", "Routes", routesSeverity, color, routesDetail)
+				socketsDetail := fmt.Sprintf("%d socket(s)", len(state.ListeningSockets))
+				if len(state.ListeningSockets) > 0 {
+					ports := make([]string, 0, len(state.ListeningSockets))
+					for i, socket := range state.ListeningSockets {
+						if i >= 8 {
+							break
+						}
+						ports = append(ports, fmt.Sprintf("%s/%d", cleanText(socket.Protocol), socket.Port))
 					}
-					ports = append(ports, fmt.Sprintf("%s/%d", cleanText(socket.Protocol), socket.Port))
+					socketsDetail += ": " + strings.Join(ports, separator)
 				}
-				socketsDetail += ": " + strings.Join(ports, separator)
-			}
-			checkLine(w, width, "    ", "Listening sockets", model.SeverityOK, color, socketsDetail)
-			connectionsDetail := "none observed"
-			if len(state.ConnectionStates) > 0 {
-				states := make([]string, 0, len(state.ConnectionStates))
-				for _, connection := range state.ConnectionStates {
-					states = append(states, fmt.Sprintf("%s %d", cleanText(connection.State), connection.Count))
+				checkLine(w, width, "    ", "Listening sockets", model.SeverityOK, color, socketsDetail)
+				connectionsDetail := "none observed"
+				if len(state.ConnectionStates) > 0 {
+					states := make([]string, 0, len(state.ConnectionStates))
+					for _, connection := range state.ConnectionStates {
+						states = append(states, fmt.Sprintf("%s %d", cleanText(connection.State), connection.Count))
+					}
+					connectionsDetail = strings.Join(states, separator)
 				}
-				connectionsDetail = strings.Join(states, separator)
+				checkLine(w, width, "    ", "Connection states", model.SeverityOK, color, connectionsDetail)
 			}
-			checkLine(w, width, "    ", "Connection states", model.SeverityOK, color, connectionsDetail)
 		}
 	}
 	note("network-state")
@@ -385,28 +398,32 @@ func renderIntegrations(w io.Writer, width int, r model.Report, separator string
 			}
 			return "failed"
 		}
-		writeWrapped(w, width, "", fmt.Sprintf("%s %s  local: %s%sexternal: %s", sectionLabel("DNS resolution", severity, color), badge(severity, color), summary(resolution.Local), separator, summary(resolution.External)))
-		if verbose {
-			detail := func(result *model.DNSResolutionResult) string {
-				if result == nil {
-					return "no local nameserver configured"
+		if !skip(severity) {
+			writeWrapped(w, width, "", fmt.Sprintf("%s %s  local: %s%sexternal: %s", sectionLabel("DNS resolution", severity, color), badge(severity, color), summary(resolution.Local), separator, summary(resolution.External)))
+			if verbose {
+				detail := func(result *model.DNSResolutionResult) string {
+					if result == nil {
+						return "no local nameserver configured"
+					}
+					if result.Resolved {
+						return fmt.Sprintf("resolved %s via %s in %.0fms", result.Domain, result.Server, result.LatencyMillis)
+					}
+					return fmt.Sprintf("failed to resolve %s via %s: %s", result.Domain, result.Server, result.Error)
 				}
-				if result.Resolved {
-					return fmt.Sprintf("resolved %s via %s in %.0fms", result.Domain, result.Server, result.LatencyMillis)
-				}
-				return fmt.Sprintf("failed to resolve %s via %s: %s", result.Domain, result.Server, result.Error)
+				checkLine(w, width, "    ", "Local resolution", localSeverity, color, detail(resolution.Local))
+				checkLine(w, width, "    ", "External resolution", externalSeverity, color, detail(resolution.External))
 			}
-			checkLine(w, width, "    ", "Local resolution", localSeverity, color, detail(resolution.Local))
-			checkLine(w, width, "    ", "External resolution", externalSeverity, color, detail(resolution.External))
 		}
 	}
 	note("dns-resolution")
 
 	if check := m.GatewayCheck; check != nil && check.Available {
 		severity := findingSeverity(r.Findings, "gateway-unreachable", "gateway-packet-loss")
-		writeWrapped(w, width, "", fmt.Sprintf("%s %s  %s%s%d/%d replies%s%.0f%% loss", sectionLabel("Gateway", severity, color), badge(severity, color), cleanText(check.Gateway), separator, check.Received, check.Sent, separator, check.PacketLossPct))
-		if verbose && check.Received > 0 {
-			checkLine(w, width, "    ", "Latency", model.SeverityOK, color, fmt.Sprintf("%.1fms average", check.AvgLatencyMillis))
+		if !skip(severity) {
+			writeWrapped(w, width, "", fmt.Sprintf("%s %s  %s%s%d/%d replies%s%.0f%% loss", sectionLabel("Gateway", severity, color), badge(severity, color), cleanText(check.Gateway), separator, check.Received, check.Sent, separator, check.PacketLossPct))
+			if verbose && check.Received > 0 {
+				checkLine(w, width, "    ", "Latency", model.SeverityOK, color, fmt.Sprintf("%.1fms average", check.AvgLatencyMillis))
+			}
 		}
 	}
 	note("gateway-ping")
@@ -425,22 +442,24 @@ func renderIntegrations(w io.Writer, width int, r model.Report, separator string
 		// permanent, intentional configuration, so it is quiet by default
 		// and stays available under --verbose. OK and WARN/CRIT rows still
 		// always show, consistent with every other active check.
-		if verbose || severity != model.SeverityInfo {
-			writeWrapped(w, width, "", fmt.Sprintf("%s %s  %s%s%s", sectionLabel("Path MTU", severity, color), badge(severity, color), cleanText(check.Target), separator, result))
-		}
-		if verbose {
-			checkLine(w, width, "    ", "Baseline (small packet)", model.SeverityOK, color, "reachable")
-			mtuSeverity := model.SeverityOK
-			mtuDetail := fmt.Sprintf("%d bytes, the full tested ceiling", check.DiscoveredMTU)
-			switch {
-			case check.DiscoveredMTU == 0:
-				mtuSeverity = severity
-				mtuDetail = fmt.Sprintf("none found; every size from %d down to %d bytes was dropped", check.CeilingMTU, check.FloorMTU)
-			case check.DiscoveredMTU < check.CeilingMTU:
-				mtuSeverity = severity
-				mtuDetail = fmt.Sprintf("%d bytes -- below the %d-byte ceiling, but a working, cleanly discovered size (PMTUD is functioning correctly)", check.DiscoveredMTU, check.CeilingMTU)
+		if !skip(severity) {
+			if verbose || severity != model.SeverityInfo {
+				writeWrapped(w, width, "", fmt.Sprintf("%s %s  %s%s%s", sectionLabel("Path MTU", severity, color), badge(severity, color), cleanText(check.Target), separator, result))
 			}
-			checkLine(w, width, "    ", "Discovered path MTU", mtuSeverity, color, mtuDetail)
+			if verbose {
+				checkLine(w, width, "    ", "Baseline (small packet)", model.SeverityOK, color, "reachable")
+				mtuSeverity := model.SeverityOK
+				mtuDetail := fmt.Sprintf("%d bytes, the full tested ceiling", check.DiscoveredMTU)
+				switch {
+				case check.DiscoveredMTU == 0:
+					mtuSeverity = severity
+					mtuDetail = fmt.Sprintf("none found; every size from %d down to %d bytes was dropped", check.CeilingMTU, check.FloorMTU)
+				case check.DiscoveredMTU < check.CeilingMTU:
+					mtuSeverity = severity
+					mtuDetail = fmt.Sprintf("%d bytes -- below the %d-byte ceiling, but a working, cleanly discovered size (PMTUD is functioning correctly)", check.DiscoveredMTU, check.CeilingMTU)
+				}
+				checkLine(w, width, "    ", "Discovered path MTU", mtuSeverity, color, mtuDetail)
+			}
 		}
 	}
 	note("path-mtu")
@@ -461,71 +480,79 @@ func renderIntegrations(w io.Writer, width int, r model.Report, separator string
 			}
 			return "failed"
 		}
-		writeWrapped(w, width, "", fmt.Sprintf("%s %s  http: %s%shttps: %s", sectionLabel("HTTP checks", severity, color), badge(severity, color), summary(check.HTTP), separator, summary(check.HTTPS)))
-		if verbose {
-			detail := func(result *model.HTTPCheckResult) string {
-				if result == nil {
-					return "not attempted"
+		if !skip(severity) {
+			writeWrapped(w, width, "", fmt.Sprintf("%s %s  http: %s%shttps: %s", sectionLabel("HTTP checks", severity, color), badge(severity, color), summary(check.HTTP), separator, summary(check.HTTPS)))
+			if verbose {
+				detail := func(result *model.HTTPCheckResult) string {
+					if result == nil {
+						return "not attempted"
+					}
+					if result.Succeeded {
+						return fmt.Sprintf("%s -> %d in %.0fms", result.URL, result.StatusCode, result.LatencyMillis)
+					}
+					return fmt.Sprintf("%s failed: %s", result.URL, result.Error)
 				}
-				if result.Succeeded {
-					return fmt.Sprintf("%s -> %d in %.0fms", result.URL, result.StatusCode, result.LatencyMillis)
-				}
-				return fmt.Sprintf("%s failed: %s", result.URL, result.Error)
+				checkLine(w, width, "    ", "HTTP", httpSeverity, color, detail(check.HTTP))
+				checkLine(w, width, "    ", "HTTPS", httpsSeverity, color, detail(check.HTTPS))
 			}
-			checkLine(w, width, "    ", "HTTP", httpSeverity, color, detail(check.HTTP))
-			checkLine(w, width, "    ", "HTTPS", httpsSeverity, color, detail(check.HTTPS))
 		}
 	}
 	note("http-check")
 
 	if check := m.ICMPCheck; check != nil && check.Available {
 		severity := findingSeverity(r.Findings, "icmp-external-unreachable", "icmp-external-packet-loss", "icmp-external-high-latency")
-		writeWrapped(w, width, "", fmt.Sprintf("%s %s  %s%s%d/%d replies%s%.0f%% loss", sectionLabel("External ICMP", severity, color), badge(severity, color), cleanText(check.Target), separator, check.Received, check.Sent, separator, check.PacketLossPct))
-		if verbose && check.Received > 0 {
-			checkLine(w, width, "    ", "Latency", model.SeverityOK, color, fmt.Sprintf("%.1fms average", check.AvgLatencyMillis))
+		if !skip(severity) {
+			writeWrapped(w, width, "", fmt.Sprintf("%s %s  %s%s%d/%d replies%s%.0f%% loss", sectionLabel("External ICMP", severity, color), badge(severity, color), cleanText(check.Target), separator, check.Received, check.Sent, separator, check.PacketLossPct))
+			if verbose && check.Received > 0 {
+				checkLine(w, width, "    ", "Latency", model.SeverityOK, color, fmt.Sprintf("%.1fms average", check.AvgLatencyMillis))
+			}
 		}
 	}
 	note("icmp-check")
 
 	if check := m.IPv6Check; check != nil && check.Available {
 		severity := findingSeverity(r.Findings, "ipv6-unreachable", "ipv6-packet-loss")
-		writeWrapped(w, width, "", fmt.Sprintf("%s %s  %s%s%d/%d replies%s%.0f%% loss", sectionLabel("IPv6", severity, color), badge(severity, color), cleanText(check.Target), separator, check.Received, check.Sent, separator, check.PacketLossPct))
-		if verbose && check.Received > 0 {
-			checkLine(w, width, "    ", "Latency", model.SeverityOK, color, fmt.Sprintf("%.1fms average", check.AvgLatencyMillis))
+		if !skip(severity) {
+			writeWrapped(w, width, "", fmt.Sprintf("%s %s  %s%s%d/%d replies%s%.0f%% loss", sectionLabel("IPv6", severity, color), badge(severity, color), cleanText(check.Target), separator, check.Received, check.Sent, separator, check.PacketLossPct))
+			if verbose && check.Received > 0 {
+				checkLine(w, width, "    ", "Latency", model.SeverityOK, color, fmt.Sprintf("%.1fms average", check.AvgLatencyMillis))
+			}
 		}
 	}
 	note("ipv6-check")
 
 	if df := m.DeletedFiles; df != nil && df.Available {
 		severity := findingSeverity(r.Findings, "deleted-files-open")
-		writeWrapped(w, width, "", fmt.Sprintf("%s %s  %s across %d unique file(s)%s%d process(es) holding", sectionLabel("Deleted files", severity, color), badge(severity, color), size(df.TotalBytes), df.UniqueFiles, separator, df.ProcessesHolding))
-		if verbose {
-			checkLine(w, width, "    ", "Coverage", model.SeverityOK, color, fmt.Sprintf("%d process(es) scanned%s%d skipped (permission)%s%d total reference(s)", df.ProcessesScanned, separator, df.ProcessesSkipped, separator, df.TotalReferences))
-			if df.LargestHolderBytes > 0 {
-				label := df.LargestHolderCommand
-				if label == "" {
-					label = fmt.Sprintf("pid %d", df.LargestHolderPID)
-				}
-				checkLine(w, width, "    ", "Largest holder", severity, color, fmt.Sprintf("%s (pid %d) -- %s across %d unique file(s)", cleanText(label), df.LargestHolderPID, size(df.LargestHolderBytes), df.LargestHolderFileCount))
-			}
-			// Grouped by unique inode, not by fd: a file held open on three
-			// descriptors by one process appears once here with all three
-			// listed as one holder, so the duplication is visible without
-			// being counted three times.
-			for i, f := range df.Files {
-				if i >= 5 {
-					break
-				}
-				holders := make([]string, 0, len(f.Holders))
-				for _, h := range f.Holders {
-					name := h.Command
-					if name == "" {
-						name = fmt.Sprintf("pid %d", h.PID)
+		if !skip(severity) {
+			writeWrapped(w, width, "", fmt.Sprintf("%s %s  %s across %d unique file(s)%s%d process(es) holding", sectionLabel("Deleted files", severity, color), badge(severity, color), size(df.TotalBytes), df.UniqueFiles, separator, df.ProcessesHolding))
+			if verbose {
+				checkLine(w, width, "    ", "Coverage", model.SeverityOK, color, fmt.Sprintf("%d process(es) scanned%s%d skipped (permission)%s%d total reference(s)", df.ProcessesScanned, separator, df.ProcessesSkipped, separator, df.TotalReferences))
+				if df.LargestHolderBytes > 0 {
+					label := df.LargestHolderCommand
+					if label == "" {
+						label = fmt.Sprintf("pid %d", df.LargestHolderPID)
 					}
-					holders = append(holders, fmt.Sprintf("%s (pid %d, fd %s)", cleanText(name), h.PID, strings.Join(h.FDs, ",")))
+					checkLine(w, width, "    ", "Largest holder", severity, color, fmt.Sprintf("%s (pid %d) -- %s across %d unique file(s)", cleanText(label), df.LargestHolderPID, size(df.LargestHolderBytes), df.LargestHolderFileCount))
 				}
-				detail := fmt.Sprintf("%s at %s -- held by %s", size(f.Bytes), cleanText(f.Path), strings.Join(holders, "; "))
-				checkLine(w, width, "    ", fmt.Sprintf("dev %s inode %d", f.Device, f.Inode), severity, color, detail)
+				// Grouped by unique inode, not by fd: a file held open on three
+				// descriptors by one process appears once here with all three
+				// listed as one holder, so the duplication is visible without
+				// being counted three times.
+				for i, f := range df.Files {
+					if i >= 5 {
+						break
+					}
+					holders := make([]string, 0, len(f.Holders))
+					for _, h := range f.Holders {
+						name := h.Command
+						if name == "" {
+							name = fmt.Sprintf("pid %d", h.PID)
+						}
+						holders = append(holders, fmt.Sprintf("%s (pid %d, fd %s)", cleanText(name), h.PID, strings.Join(h.FDs, ",")))
+					}
+					detail := fmt.Sprintf("%s at %s -- held by %s", size(f.Bytes), cleanText(f.Path), strings.Join(holders, "; "))
+					checkLine(w, width, "    ", fmt.Sprintf("dev %s inode %d", f.Device, f.Inode), severity, color, detail)
+				}
 			}
 		}
 	}
@@ -543,14 +570,16 @@ func renderIntegrations(w io.Writer, width int, r model.Report, separator string
 			severity = model.SeverityInfo
 			text += fmt.Sprintf("%scorrectable %d%suncorrectable %d", separator, correctable, separator, uncorrectable)
 		}
-		writeWrapped(w, width, "", fmt.Sprintf("%s %s  %s", sectionLabel("Hardware", severity, color), badge(severity, color), text))
-		if verbose {
-			for _, controller := range hardware.Controllers {
-				severity := model.SeverityOK
-				if controller.CorrectableErrors > 0 || controller.UncorrectableErrors > 0 {
-					severity = model.SeverityInfo
+		if !skip(severity) {
+			writeWrapped(w, width, "", fmt.Sprintf("%s %s  %s", sectionLabel("Hardware", severity, color), badge(severity, color), text))
+			if verbose {
+				for _, controller := range hardware.Controllers {
+					severity := model.SeverityOK
+					if controller.CorrectableErrors > 0 || controller.UncorrectableErrors > 0 {
+						severity = model.SeverityInfo
+					}
+					checkLine(w, width, "    ", cleanText(controller.Name), severity, color, fmt.Sprintf("correctable %d%suncorrectable %d", controller.CorrectableErrors, separator, controller.UncorrectableErrors))
 				}
-				checkLine(w, width, "    ", cleanText(controller.Name), severity, color, fmt.Sprintf("correctable %d%suncorrectable %d", controller.CorrectableErrors, separator, controller.UncorrectableErrors))
 			}
 		}
 	}
@@ -561,32 +590,34 @@ func renderIntegrations(w io.Writer, width int, r model.Report, separator string
 		if len(k.Events) > 0 {
 			severity = model.SeverityInfo
 		}
-		writeWrapped(w, width, "", fmt.Sprintf("%s %s  %d pattern match(es) in kernel log", sectionLabel("Kernel", severity, color), badge(severity, color), len(k.Events)))
-		if verbose {
-			counts := make(map[string]int, len(k.Events))
-			for _, event := range k.Events {
-				counts[event.Kind]++
-			}
-			for _, kind := range kernelPatternKinds {
-				count := counts[kind]
-				delete(counts, kind)
-				lineSeverity := model.SeverityOK
-				detail := "no matches"
-				if count > 0 {
-					lineSeverity = model.SeverityInfo
-					detail = fmt.Sprintf("%d match(es)", count)
+		if !skip(severity) {
+			writeWrapped(w, width, "", fmt.Sprintf("%s %s  %d pattern match(es) in kernel log", sectionLabel("Kernel", severity, color), badge(severity, color), len(k.Events)))
+			if verbose {
+				counts := make(map[string]int, len(k.Events))
+				for _, event := range k.Events {
+					counts[event.Kind]++
 				}
-				checkLine(w, width, "    ", strings.ReplaceAll(kind, "_", " "), lineSeverity, color, detail)
-			}
-			// Any kind the collector reports that this renderer does not yet
-			// know about still needs to be visible rather than silently dropped.
-			unknown := make([]string, 0, len(counts))
-			for kind := range counts {
-				unknown = append(unknown, kind)
-			}
-			sort.Strings(unknown)
-			for _, kind := range unknown {
-				checkLine(w, width, "    ", strings.ReplaceAll(kind, "_", " "), model.SeverityInfo, color, fmt.Sprintf("%d match(es)", counts[kind]))
+				for _, kind := range kernelPatternKinds {
+					count := counts[kind]
+					delete(counts, kind)
+					lineSeverity := model.SeverityOK
+					detail := "no matches"
+					if count > 0 {
+						lineSeverity = model.SeverityInfo
+						detail = fmt.Sprintf("%d match(es)", count)
+					}
+					checkLine(w, width, "    ", strings.ReplaceAll(kind, "_", " "), lineSeverity, color, detail)
+				}
+				// Any kind the collector reports that this renderer does not yet
+				// know about still needs to be visible rather than silently dropped.
+				unknown := make([]string, 0, len(counts))
+				for kind := range counts {
+					unknown = append(unknown, kind)
+				}
+				sort.Strings(unknown)
+				for _, kind := range unknown {
+					checkLine(w, width, "    ", strings.ReplaceAll(kind, "_", " "), model.SeverityInfo, color, fmt.Sprintf("%d match(es)", counts[kind]))
+				}
 			}
 		}
 	}
@@ -597,46 +628,48 @@ func renderIntegrations(w io.Writer, width int, r model.Report, separator string
 		if security.SELinuxDenials != nil && *security.SELinuxDenials > 0 || security.AppArmorDenials != nil && *security.AppArmorDenials > 0 {
 			severity = model.SeverityWarning
 		}
-		writeWrapped(w, width, "", fmt.Sprintf("%s %s  SELinux %s%sAppArmor %s%ssecurity sources checked", sectionLabel("Security", severity, color), badge(severity, color), cleanText(security.SELinux), separator, cleanText(security.AppArmor), separator))
-		if verbose {
-			selinuxSeverity := model.SeverityOK
-			if security.SELinuxDenials != nil && *security.SELinuxDenials > 0 {
-				selinuxSeverity = model.SeverityWarning
-			}
-			selinuxDetail := cleanText(security.SELinux)
-			if security.SELinuxDenials != nil {
-				selinuxDetail += fmt.Sprintf("%s%d denial(s)", separator, *security.SELinuxDenials)
-			}
-			checkLine(w, width, "    ", "SELinux", selinuxSeverity, color, selinuxDetail)
-
-			apparmorSeverity := model.SeverityOK
-			if security.AppArmorDenials != nil && *security.AppArmorDenials > 0 {
-				apparmorSeverity = model.SeverityWarning
-			}
-			apparmorDetail := cleanText(security.AppArmor)
-			if security.AppArmorDenials != nil {
-				apparmorDetail += fmt.Sprintf("%s%d denial(s)", separator, *security.AppArmorDenials)
-			}
-			checkLine(w, width, "    ", "AppArmor", apparmorSeverity, color, apparmorDetail)
-
-			if security.ActiveSessions != nil {
-				checkLine(w, width, "    ", "Active sessions", model.SeverityOK, color, fmt.Sprintf("%d", *security.ActiveSessions))
-			}
-			taintSeverity := model.SeverityOK
-			taintDetail := "clean"
-			if security.KernelTaintMask != 0 {
-				taintSeverity = model.SeverityInfo
-				taintDetail = fmt.Sprintf("mask %d", security.KernelTaintMask)
-				if len(security.KernelTaintModules) > 0 {
-					taintDetail += " (modules " + cleanText(strings.Join(security.KernelTaintModules, ",")) + ")"
+		if !skip(severity) {
+			writeWrapped(w, width, "", fmt.Sprintf("%s %s  SELinux %s%sAppArmor %s%ssecurity sources checked", sectionLabel("Security", severity, color), badge(severity, color), cleanText(security.SELinux), separator, cleanText(security.AppArmor), separator))
+			if verbose {
+				selinuxSeverity := model.SeverityOK
+				if security.SELinuxDenials != nil && *security.SELinuxDenials > 0 {
+					selinuxSeverity = model.SeverityWarning
 				}
+				selinuxDetail := cleanText(security.SELinux)
+				if security.SELinuxDenials != nil {
+					selinuxDetail += fmt.Sprintf("%s%d denial(s)", separator, *security.SELinuxDenials)
+				}
+				checkLine(w, width, "    ", "SELinux", selinuxSeverity, color, selinuxDetail)
+
+				apparmorSeverity := model.SeverityOK
+				if security.AppArmorDenials != nil && *security.AppArmorDenials > 0 {
+					apparmorSeverity = model.SeverityWarning
+				}
+				apparmorDetail := cleanText(security.AppArmor)
+				if security.AppArmorDenials != nil {
+					apparmorDetail += fmt.Sprintf("%s%d denial(s)", separator, *security.AppArmorDenials)
+				}
+				checkLine(w, width, "    ", "AppArmor", apparmorSeverity, color, apparmorDetail)
+
+				if security.ActiveSessions != nil {
+					checkLine(w, width, "    ", "Active sessions", model.SeverityOK, color, fmt.Sprintf("%d", *security.ActiveSessions))
+				}
+				taintSeverity := model.SeverityOK
+				taintDetail := "clean"
+				if security.KernelTaintMask != 0 {
+					taintSeverity = model.SeverityInfo
+					taintDetail = fmt.Sprintf("mask %d", security.KernelTaintMask)
+					if len(security.KernelTaintModules) > 0 {
+						taintDetail += " (modules " + cleanText(strings.Join(security.KernelTaintModules, ",")) + ")"
+					}
+				}
+				checkLine(w, width, "    ", "Kernel taint", taintSeverity, color, taintDetail)
 			}
-			checkLine(w, width, "    ", "Kernel taint", taintSeverity, color, taintDetail)
 		}
 	}
 	note("security")
 
-	if cgroup := m.CgroupV2; cgroup != nil && cgroup.Available {
+	if cgroup := m.CgroupV2; cgroup != nil && cgroup.Available && !skip(model.SeverityOK) {
 		writeWrapped(w, width, "", fmt.Sprintf("%s %s  containerized: %t", sectionLabel("Cgroup v2", model.SeverityOK, color), badge(model.SeverityOK, color), cgroup.Containerized))
 		if verbose {
 			checkLine(w, width, "    ", "Path", model.SeverityOK, color, cleanText(cgroup.Path))
