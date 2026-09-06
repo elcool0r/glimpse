@@ -68,3 +68,38 @@ func TestZombiesIncludeParentIdentity(t *testing.T) {
 		t.Fatalf("unexpected zombies: %#v", got)
 	}
 }
+
+// A process in D state at only one boundary is common and usually transient
+// (a brief disk wait); it must not be reported as stuck.
+func TestStuckInDRequiresBothBoundaries(t *testing.T) {
+	before := []Process{{PID: 20, Name: "reader", State: 'D', StartTimeTicks: 5}}
+	after := []Process{{PID: 20, Name: "reader", State: 'R', StartTimeTicks: 5}}
+	if got := stuckInD(before, after, 10); len(got) != 0 {
+		t.Fatalf("expected no stuck processes for a one-boundary D state, got %#v", got)
+	}
+}
+
+func TestStuckInDReportsProcessBlockedAcrossTheWholeWindow(t *testing.T) {
+	before := []Process{
+		{PID: 1, Name: "supervisor"},
+		{PID: 20, ParentPID: 1, Name: "reader", State: 'D', StartTimeTicks: 5},
+	}
+	after := []Process{
+		{PID: 1, Name: "supervisor"},
+		{PID: 20, ParentPID: 1, Name: "reader", State: 'D', StartTimeTicks: 5},
+	}
+	got := stuckInD(before, after, 10)
+	if len(got) != 1 || got[0].PID != 20 || got[0].ParentPID != 1 || got[0].ParentCommand != "supervisor" || got[0].State != "D" {
+		t.Fatalf("unexpected stuck processes: %#v", got)
+	}
+}
+
+// A PID reused by an unrelated process must not be mistaken for the same
+// process having stayed blocked.
+func TestStuckInDRejectsPIDReuse(t *testing.T) {
+	before := []Process{{PID: 20, Name: "reader", State: 'D', StartTimeTicks: 5}}
+	after := []Process{{PID: 20, Name: "unrelated", State: 'D', StartTimeTicks: 99}}
+	if got := stuckInD(before, after, 10); len(got) != 0 {
+		t.Fatalf("expected reused PID to be rejected, got %#v", got)
+	}
+}

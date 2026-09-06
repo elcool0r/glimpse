@@ -368,10 +368,16 @@ type Thermal struct {
 }
 
 type Processes struct {
-	Total           int       `json:"total"`
-	Running         int       `json:"running"`
-	Blocked         int       `json:"blocked"`
-	Zombies         int       `json:"zombies"`
+	Total   int `json:"total"`
+	Running int `json:"running"`
+	Blocked int `json:"blocked"`
+	Zombies int `json:"zombies"`
+	// StuckProcesses lists processes observed in uninterruptible sleep (D
+	// state) at both the baseline and final sampling boundary -- a single
+	// point-in-time D state is common and usually transient (a brief disk or
+	// NFS wait), so only a process the kernel still had blocked across the
+	// entire sample window is reported here.
+	StuckProcesses  []Process `json:"stuck_processes,omitempty"`
 	ZombieProcesses []Process `json:"zombie_processes,omitempty"`
 	TopCPU          []Process `json:"top_cpu,omitempty"`
 	TopRSS          []Process `json:"top_rss,omitempty"`

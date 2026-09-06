@@ -143,6 +143,74 @@ func TestDNSResolutionBothSucceedIsSilent(t *testing.T) {
 	}
 }
 
+func TestDNSResolutionSlowLocalWarnsThenCriticals(t *testing.T) {
+	report := resolutionReport(&model.DNSResolution{
+		Available: true,
+		Local:     &model.DNSResolutionResult{Server: "192.0.2.53", Domain: "example.com", Resolved: true, LatencyMillis: 1500},
+		External:  &model.DNSResolutionResult{Server: "1.1.1.1", Domain: "example.com", Resolved: true, LatencyMillis: 20},
+	})
+	Report(&report)
+	found := findingByID(report, "dns-resolution-local-slow")
+	if found == nil || found.Severity != model.SeverityWarning {
+		t.Fatalf("expected a warning for 1.5s local DNS latency: %+v", report.Findings)
+	}
+
+	report.Metrics.DNSResolution.Local.LatencyMillis = 4000
+	Report(&report)
+	found = findingByID(report, "dns-resolution-local-slow")
+	if found == nil || found.Severity != model.SeverityCritical {
+		t.Fatalf("expected critical severity for 4s local DNS latency: %+v", report.Findings)
+	}
+}
+
+func TestDNSResolutionSlowExternalIsIndependentOfLocal(t *testing.T) {
+	report := resolutionReport(&model.DNSResolution{
+		Available: true,
+		Local:     &model.DNSResolutionResult{Server: "192.0.2.53", Domain: "example.com", Resolved: true, LatencyMillis: 15},
+		External:  &model.DNSResolutionResult{Server: "1.1.1.1", Domain: "example.com", Resolved: true, LatencyMillis: 3200},
+	})
+	Report(&report)
+	found := findingByID(report, "dns-resolution-external-slow")
+	if found == nil || found.Severity != model.SeverityCritical {
+		t.Fatalf("expected a critical finding for slow external DNS: %+v", report.Findings)
+	}
+	if findingByID(report, "dns-resolution-local-slow") != nil {
+		t.Fatalf("fast local resolution should not also warn: %+v", report.Findings)
+	}
+}
+
+func TestDNSResolutionFastStaysSilent(t *testing.T) {
+	report := resolutionReport(&model.DNSResolution{
+		Available: true,
+		Local:     &model.DNSResolutionResult{Server: "192.0.2.53", Domain: "example.com", Resolved: true, LatencyMillis: 8},
+		External:  &model.DNSResolutionResult{Server: "1.1.1.1", Domain: "example.com", Resolved: true, LatencyMillis: 25},
+	})
+	Report(&report)
+	for _, id := range []string{"dns-resolution-local-slow", "dns-resolution-external-slow"} {
+		if findingByID(report, id) != nil {
+			t.Fatalf("unexpected finding %s for fast resolution", id)
+		}
+	}
+}
+
+// A resolution failure is a stronger, more actionable signal than the same
+// server also being slow; the failure finding should win rather than piling
+// both on for one server.
+func TestDNSResolutionFailurePreemptsLatencyFinding(t *testing.T) {
+	report := resolutionReport(&model.DNSResolution{
+		Available: true,
+		Local:     &model.DNSResolutionResult{Server: "192.0.2.53", Domain: "example.com", Resolved: false, LatencyMillis: 5000},
+		External:  &model.DNSResolutionResult{Server: "1.1.1.1", Domain: "example.com", Resolved: true, LatencyMillis: 20},
+	})
+	Report(&report)
+	if findingByID(report, "dns-resolution-local-failed") == nil {
+		t.Fatalf("expected the failure finding: %+v", report.Findings)
+	}
+	if findingByID(report, "dns-resolution-local-slow") != nil {
+		t.Fatalf("a failed resolution must not also report as merely slow: %+v", report.Findings)
+	}
+}
+
 func TestDNSResolutionNoLocalConfiguredAndExternalFailsIsCritical(t *testing.T) {
 	report := resolutionReport(&model.DNSResolution{
 		Available: true,

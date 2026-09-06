@@ -92,6 +92,9 @@ func Report(report *model.Report) {
 		summary, suggestion := zombieDetails(p)
 		findings = append(findings, finding("zombies", model.SeverityInfo, "process", zombieTitle(p), summary, suggestion, 0))
 	}
+	if p := m.Processes; p != nil && len(p.StuckProcesses) > 0 {
+		findings = append(findings, stuckProcessFinding(p))
+	}
 	if s := m.Systemd; s != nil && len(s.FailedUnits) > 0 {
 		findings = append(findings, finding("failed-units", model.SeverityCritical, "services", "Failed systemd units", fmt.Sprintf("%d failed units: %v", len(s.FailedUnits), s.FailedUnits), "Run systemctl --failed and inspect the affected unit logs.", 25))
 	}
@@ -189,6 +192,30 @@ func zombieDetails(processes *model.Processes) (string, string) {
 		suggestion = fmt.Sprintf("Inspect parent PID %d with ps -fp %d; restart or fix that parent only if it is not expected to reap the child.", first.ParentPID, first.ParentPID)
 	}
 	return fmt.Sprintf("%d zombie process(es): %s%s.", processes.Zombies, strings.Join(items, "; "), more), suggestion
+}
+
+// stuckProcessFinding reports processes the kernel had in uninterruptible
+// sleep (D state) for the entire sampling window -- a process cannot be
+// killed out of D state, and its parent's load contribution keeps rising
+// for as long as it stays there. A brief, one-boundary D state is normal and
+// not reported at all (see stuckInD); this only fires once a process has
+// already been stuck the whole time this report was watching.
+func stuckProcessFinding(processes *model.Processes) model.Finding {
+	items := make([]string, 0, len(processes.StuckProcesses))
+	for _, process := range processes.StuckProcesses {
+		item := fmt.Sprintf("PID %d (%s)", process.PID, process.Command)
+		if process.ParentPID > 0 {
+			item += fmt.Sprintf(", parent PID %d", process.ParentPID)
+		}
+		items = append(items, item)
+	}
+	severity, impact := model.SeverityWarning, 10
+	if len(processes.StuckProcesses) >= 3 {
+		severity, impact = model.SeverityCritical, 18
+	}
+	return finding("process-stuck-uninterruptible", severity, "process", "Process stuck in uninterruptible sleep (D state)",
+		fmt.Sprintf("%d process(es) stayed in D state for the entire sampling window: %s. A process in this state is waiting on the kernel (usually disk or NFS I/O) and cannot be killed until that wait resolves.", len(processes.StuckProcesses), strings.Join(items, "; ")),
+		"Inspect the underlying storage or NFS mount for the affected process; if it never clears, the backing device or server is the more likely fault than the process itself.", impact)
 }
 
 func zombieTitle(processes *model.Processes) string {

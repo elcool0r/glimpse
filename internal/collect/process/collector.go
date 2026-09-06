@@ -80,7 +80,7 @@ func (c Collector) Delta(first, last collect.Data) (collect.Data, error) {
 		rss = append(rss, p)
 	}
 	names := commandNames(after.all)
-	return collect.Data{Processes: &model.Processes{Total: after.Processes, Running: after.Running, Blocked: after.Blocked, Zombies: after.Zombies, ZombieProcesses: zombies(after.all, limit), TopCPU: processes(byCPU, names), TopRSS: processes(rss, names), CPUSampled: samplePtr}}, nil
+	return collect.Data{Processes: &model.Processes{Total: after.Processes, Running: after.Running, Blocked: after.Blocked, Zombies: after.Zombies, StuckProcesses: stuckInD(before.all, after.all, limit), ZombieProcesses: zombies(after.all, limit), TopCPU: processes(byCPU, names), TopRSS: processes(rss, names), CPUSampled: samplePtr}}, nil
 }
 
 func (c Collector) limit() int {
@@ -134,6 +134,41 @@ func processes(in []Process, names map[int]string) []model.Process {
 		out = append(out, model.Process{PID: p.PID, ParentPID: p.ParentPID, Command: p.Name, ParentCommand: names[p.ParentPID], CPUFraction: p.CPUFraction, CPUSampled: &available, RSSBytes: p.RSSBytes, State: string(p.State)})
 	}
 	return out
+}
+
+// stuckInD reports processes the kernel had in uninterruptible sleep (D
+// state) at both sampling boundaries -- the same PID and start time, so a
+// dead PID reused by an unrelated process is not mistaken for one stuck the
+// whole time. A single boundary's D state is ordinary and often gone a
+// moment later (a brief disk or NFS wait); surviving the entire sample
+// window is the signal that a process is actually stuck rather than merely
+// caught mid-syscall.
+func stuckInD(before, after []Process, limit int) []model.Process {
+	baseline := make(map[int]Process, len(before))
+	for _, p := range before {
+		if p.State == 'D' {
+			baseline[p.PID] = p
+		}
+	}
+	stuck := make([]Process, 0)
+	for _, p := range after {
+		if p.State != 'D' {
+			continue
+		}
+		if prior, ok := baseline[p.PID]; ok && prior.StartTimeTicks == p.StartTimeTicks {
+			stuck = append(stuck, p)
+		}
+	}
+	sort.Slice(stuck, func(i, j int) bool { return stuck[i].PID < stuck[j].PID })
+	if len(stuck) > limit {
+		stuck = stuck[:limit]
+	}
+	parentNames := commandNames(after)
+	result := make([]model.Process, 0, len(stuck))
+	for _, process := range stuck {
+		result = append(result, model.Process{PID: process.PID, ParentPID: process.ParentPID, Command: process.Name, ParentCommand: parentNames[process.ParentPID], RSSBytes: process.RSSBytes, State: string(process.State)})
+	}
+	return result
 }
 
 func zombies(in []Process, limit int) []model.Process {

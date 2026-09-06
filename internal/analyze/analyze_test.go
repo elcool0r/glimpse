@@ -134,6 +134,34 @@ func TestZombieFindingNamesProcessAndParent(t *testing.T) {
 	t.Fatalf("expected zombie finding: %#v", report.Findings)
 }
 
+func TestStuckProcessFindingNamesProcessAndParent(t *testing.T) {
+	report := model.Report{Metrics: model.Metrics{CPU: &model.CPU{}, Processes: &model.Processes{StuckProcesses: []model.Process{{PID: 91, ParentPID: 12, Command: "tail", State: "D"}}}}}
+	Report(&report)
+	found := findingByID(report, "process-stuck-uninterruptible")
+	if found == nil || !contains(found.Summary, "PID 91 (tail), parent PID 12") || found.Severity != model.SeverityWarning {
+		t.Fatalf("expected a warning naming the stuck process: %#v", report.Findings)
+	}
+}
+
+func TestStuckProcessFindingEscalatesWithMultipleProcesses(t *testing.T) {
+	report := model.Report{Metrics: model.Metrics{CPU: &model.CPU{}, Processes: &model.Processes{StuckProcesses: []model.Process{
+		{PID: 1, Command: "a", State: "D"}, {PID: 2, Command: "b", State: "D"}, {PID: 3, Command: "c", State: "D"},
+	}}}}
+	Report(&report)
+	found := findingByID(report, "process-stuck-uninterruptible")
+	if found == nil || found.Severity != model.SeverityCritical {
+		t.Fatalf("expected critical severity for 3+ stuck processes: %#v", report.Findings)
+	}
+}
+
+func TestNoStuckProcessesProducesNoFinding(t *testing.T) {
+	report := model.Report{Metrics: model.Metrics{CPU: &model.CPU{}, Processes: &model.Processes{Blocked: 1}}}
+	Report(&report)
+	if hasFinding(report, "process-stuck-uninterruptible") {
+		t.Fatalf("a momentary blocked count without an identified stuck process must not fire: %#v", report.Findings)
+	}
+}
+
 func TestPackageManagerRebootFindingIsRecommended(t *testing.T) {
 	required := true
 	report := model.Report{Metrics: model.Metrics{Security: &model.Security{RebootRequired: &required, RebootFromPackages: true}}}

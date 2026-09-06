@@ -194,7 +194,44 @@ func dnsResolutionFindings(resolution *model.DNSResolution) []model.Finding {
 			fmt.Sprintf("Resolving %s against %s failed, though the local nameserver resolves it. If this is not an intentionally firewalled host, outbound DNS to the public internet is broken.", resolution.External.Domain, resolution.External.Server),
 			"Confirm whether outbound DNS to public resolvers is intentionally restricted; if not, inspect the network path and firewall rules for UDP/TCP 53 to public resolvers.", 15)}
 	}
-	return nil
+	return dnsLatencyFindings(resolution)
+}
+
+// dnsLatencyWarningMillis and dnsLatencyCriticalMillis catch "DNS works but
+// applications pause for seconds" -- resolution that succeeds but is slow
+// enough to be felt, distinct from the resolution-failed findings above,
+// which never look at latency. A resolver on the same LAN or a healthy
+// anycast service normally answers in single-digit to low-double-digit
+// milliseconds, so even the warning threshold is well above ordinary
+// variance.
+const (
+	dnsLatencyWarningMillis  = 1000.0
+	dnsLatencyCriticalMillis = 3000.0
+)
+
+func dnsLatencyFindings(resolution *model.DNSResolution) []model.Finding {
+	var findings []model.Finding
+	for _, named := range []struct {
+		id     string
+		label  string
+		result *model.DNSResolutionResult
+	}{
+		{"dns-resolution-local-slow", "local", resolution.Local},
+		{"dns-resolution-external-slow", "external", resolution.External},
+	} {
+		result := named.result
+		if result == nil || !result.Resolved || result.LatencyMillis < dnsLatencyWarningMillis {
+			continue
+		}
+		severity, impact := model.SeverityWarning, 6
+		if result.LatencyMillis >= dnsLatencyCriticalMillis {
+			severity, impact = model.SeverityCritical, 12
+		}
+		findings = append(findings, finding(named.id, severity, "network", fmt.Sprintf("Slow %s DNS resolution", named.label),
+			fmt.Sprintf("Resolving %s against %s succeeded but took %.0f ms.", result.Domain, result.Server, result.LatencyMillis),
+			"Inspect the resolver's load, network path latency, and whether a faster resolver is available; applications will pause for this long on every uncached lookup.", impact))
+	}
+	return findings
 }
 
 // gatewayFindings judges the active gateway probe. No reply at all means
