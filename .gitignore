@@ -21,6 +21,7 @@ coverage.html
 # Local scratch
 Claude outputs/
 CODE-REVIEW.md
+COVERAGE.md
 
 AGENTS.md
 CLAUDE.md
