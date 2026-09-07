@@ -34,10 +34,10 @@ type timelineEvent struct {
 // order (oldest first, latest last, the way a log or scrollback reads), so
 // a critical finding arrives with the story leading up to it instead of
 // only its own isolated snapshot. It always prints the section header once
-// invoked (by a critical finding or
-// --events), even when nothing qualifies: a silently empty section would be
-// indistinguishable from --events doing nothing at all.
-func renderTimeline(w io.Writer, width int, r model.Report, color bool) {
+// invoked (by a critical finding or --events), even when nothing qualifies:
+// a silently empty section would be indistinguishable from --events doing
+// nothing at all. all disables the maxTimelineEvents cap (--events-all).
+func renderTimeline(w io.Writer, width int, r model.Report, color, all bool) {
 	events := collectTimelineEvents(r)
 	// Oldest first, latest last: this reads top-to-bottom the way a log or
 	// scrollback does, with "now" nearest the prompt.
@@ -51,14 +51,13 @@ func renderTimeline(w io.Writer, width int, r model.Report, color bool) {
 		writeWrapped(w, width, "", "No kernel, container, service, package, login, or sudo events with a known time were recorded today.")
 		return
 	}
-	omitted := 0
-	if len(events) > maxTimelineEvents {
+	if !all && len(events) > maxTimelineEvents {
 		// The events being cut are the oldest ones (index 0 onward), since
 		// the most recent must survive the cap; say so before the list
 		// rather than after, since it now describes what came before it.
-		omitted = len(events) - maxTimelineEvents
+		omitted := len(events) - maxTimelineEvents
 		events = events[omitted:]
-		writeWrapped(w, width, "", fmt.Sprintf("(%d more event(s) earlier today)", omitted))
+		writeWrapped(w, width, "", fmt.Sprintf("(%d more event(s) earlier today; pass --events-all to see them)", omitted))
 	}
 	for _, e := range events {
 		writeWrapped(w, width, "", fmt.Sprintf("%s  %s  %s", metadata(e.at.Local().Format("15:04"), color), metadata("["+e.source+"]", color), cleanText(e.label)))

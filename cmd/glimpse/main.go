@@ -56,8 +56,8 @@ import (
 // generator (and its test) work from the same flag set instead of a second,
 // easily-forgotten list.
 type cliFlags struct {
-	duration                                                                                                      *time.Duration
-	noContainers, jsonOutput, noColor, verbose, quiet, events, disableExternalChecks, showVersion, bashCompletion *bool
+	duration                                                                                                                 *time.Duration
+	noContainers, jsonOutput, noColor, verbose, quiet, events, eventsAll, disableExternalChecks, showVersion, bashCompletion *bool
 }
 
 func registerFlags(fs *flag.FlagSet) *cliFlags {
@@ -69,6 +69,7 @@ func registerFlags(fs *flag.FlagSet) *cliFlags {
 		verbose:               fs.Bool("verbose", false, "show every check performed, not just problems"),
 		quiet:                 fs.Bool("quiet", false, "only show checks that are not OK (INFO, WARN, CRIT, or UNKNOWN)"),
 		events:                fs.Bool("events", false, "always show today's recent-events timeline (normally shown only when a critical finding is present)"),
+		eventsAll:             fs.Bool("events-all", false, "show every recent event instead of the most recent 20; implies --events"),
 		disableExternalChecks: fs.Bool("disable-external-checks", false, "disable active checks that send real network traffic (DNS resolution, gateway/external/IPv6 ICMP, path MTU probe, HTTP/HTTPS GET); on by default"),
 		showVersion:           fs.Bool("version", false, "print version"),
 		bashCompletion:        fs.Bool("bash-completion", false, "print Bash completion script; use as: source <(glimpse --bash-completion)"),
@@ -113,7 +114,7 @@ func main() {
 	defer cancel()
 	report := app.Run(ctx, app.Config{Duration: *f.duration, SampleInterval: time.Second, Full: true, IncludeContainers: containerEnabled, Progress: progress}, collectors)
 	analyze.Report(&report)
-	code := writeReport(os.Stdout, os.Stderr, report, *f.jsonOutput, *f.verbose, render.Options{Color: !*f.noColor && os.Getenv("NO_COLOR") == "" && tty, Verbose: *f.verbose, Width: platform.TerminalWidth(os.Stdout), ASCII: !tty, Quiet: *f.quiet, Events: *f.events})
+	code := writeReport(os.Stdout, os.Stderr, report, *f.jsonOutput, *f.verbose, render.Options{Color: !*f.noColor && os.Getenv("NO_COLOR") == "" && tty, Verbose: *f.verbose, Width: platform.TerminalWidth(os.Stdout), ASCII: !tty, Quiet: *f.quiet, Events: *f.events, EventsAll: *f.eventsAll})
 	if ctx.Err() != nil {
 		code = 3
 	}

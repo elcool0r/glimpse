@@ -144,7 +144,9 @@ them are on by default; `--disable-external-checks` turns them off.
 
 Shown automatically alongside a critical finding, or always with `--events`.
 It answers "what happened today, and roughly when" -- a chronological,
-source-tagged list, not a second copy of the health verdict.
+source-tagged list, not a second copy of the health verdict. The list is
+capped to the most recent 20 events; `--events-all` (which implies
+`--events`) shows every one instead.
 
 Only two kinds of fact appear here:
 

@@ -31,6 +31,9 @@ type Options struct {
 	// since it exists to give a critical its story, not to narrate a
 	// healthy run.
 	Events bool
+	// EventsAll shows every timeline event instead of capping it at
+	// maxTimelineEvents. It implies Events.
+	EventsAll bool
 }
 
 func Write(w io.Writer, r model.Report, o Options) {
@@ -261,8 +264,8 @@ func Write(w io.Writer, r model.Report, o Options) {
 		}
 	}
 	renderIntegrations(w, width, r, separator, o.Color, o.Verbose, o.Quiet)
-	if o.Events || r.Score.Status == model.SeverityCritical {
-		renderTimeline(w, width, r, o.Color)
+	if o.Events || o.EventsAll || r.Score.Status == model.SeverityCritical {
+		renderTimeline(w, width, r, o.Color, o.EventsAll)
 	}
 	findings := actionableFindings(r.Findings)
 	if o.Verbose {

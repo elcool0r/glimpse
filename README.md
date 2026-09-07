@@ -76,6 +76,7 @@ glimpse --json                       # machine-readable output
 glimpse --verbose                    # show every check performed, not just problems
 glimpse --quiet                      # only show checks that are not OK
 glimpse --events                     # always show today's recent-events timeline
+glimpse --events-all                 # show every recent event, not just the latest 20
 glimpse --disable-external-checks    # passive collection only, no network traffic sent
 glimpse --no-containers              # skip Docker/Podman inspection
 ```
@@ -87,6 +88,7 @@ glimpse --no-containers              # skip Docker/Podman inspection
 | `--verbose` | Show every check performed and its full detail, not just problems |
 | `--quiet` | Only show checks that are not OK (INFO, WARN, CRIT, or UNKNOWN) |
 | `--events` | Always show today's recent-events timeline (normally shown only alongside a critical finding) |
+| `--events-all` | Show every recent event instead of capping it at 20; implies `--events` |
 | `--no-color` | Disable ANSI colors (also respects `NO_COLOR`) |
 | `--no-containers` | Disable Docker/Podman inspection |
 | `--disable-external-checks` | Disable the active DNS/gateway/MTU/HTTP checks that send real network traffic |

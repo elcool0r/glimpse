@@ -137,6 +137,48 @@ func TestTimelineCapKeepsTheMostRecentEvents(t *testing.T) {
 	}
 }
 
+// --events-all disables the cap entirely: every event shows and there is
+// no "N more" note, unlike the default-capped view.
+func TestTimelineAllShowsEveryEventWithoutTheCapNote(t *testing.T) {
+	now := localNoonToday(t)
+	var kernelEvents []model.LogEvent
+	for i := 0; i < maxTimelineEvents+5; i++ {
+		kernelEvents = append(kernelEvents, model.LogEvent{Kind: "oom", Message: fmt.Sprintf("event-%d", i), AgeSeconds: ageSeconds(time.Duration(maxTimelineEvents+5-i) * time.Minute)})
+	}
+	report := model.Report{
+		Host:        model.Host{Hostname: "host"},
+		GeneratedAt: now,
+		Score:       model.Score{Status: model.SeverityCritical},
+		Metrics:     model.Metrics{Kernel: &model.Kernel{Available: true, Events: kernelEvents}},
+	}
+	var out strings.Builder
+	Write(&out, report, Options{ASCII: true, EventsAll: true})
+	text := out.String()
+	if strings.Contains(text, "more event(s)") {
+		t.Fatalf("expected no omitted-count note with --events-all:\n%s", text)
+	}
+	for _, want := range []string{"event-0", fmt.Sprintf("event-%d", maxTimelineEvents+4)} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("expected %q to appear with --events-all:\n%s", want, text)
+		}
+	}
+}
+
+// --events-all must force the timeline to show even on an otherwise
+// healthy report, the same as --events does.
+func TestTimelineAllImpliesShownOnHealthyReport(t *testing.T) {
+	report := model.Report{
+		Host:    model.Host{Hostname: "host"},
+		Score:   model.Score{Status: model.SeverityOK},
+		Metrics: model.Metrics{Kernel: &model.Kernel{Available: true, Events: []model.LogEvent{{Kind: "oom", Message: "x", AgeSeconds: ageSeconds(time.Minute)}}}},
+	}
+	var out strings.Builder
+	Write(&out, report, Options{ASCII: true, EventsAll: true})
+	if !strings.Contains(out.String(), "Recent events") {
+		t.Fatalf("expected --events-all to force the timeline on a healthy report:\n%s", out.String())
+	}
+}
+
 // An event from before local midnight is outside the "today" window and
 // must not appear, even though it is still within, say, the kernel scan's
 // own 24h collection window.
