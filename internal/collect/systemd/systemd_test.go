@@ -5,6 +5,7 @@ import (
 	"errors"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/elcool0r/glimpse/internal/collect"
 	"github.com/elcool0r/glimpse/internal/model"
@@ -57,6 +58,71 @@ func TestParseRestartsIgnoresOrphanedValue(t *testing.T) {
 	got := parseRestarts("NRestarts=5\n\nId=real.service\nNRestarts=1\n")
 	if len(got) != 1 || got["real.service"] != 1 {
 		t.Fatalf("got %#v, want only real.service=1", got)
+	}
+}
+
+func TestParseActiveEnterTimestamps(t *testing.T) {
+	when := time.Date(2026, 1, 6, 8, 12, 45, 0, time.Local)
+	input := "Id=nginx.service\nActiveEnterTimestamp=" + when.Format(activeEnterLayout) + " UTC\n\n" +
+		"Id=never-started.service\nActiveEnterTimestamp=\n\n"
+	got := parseActiveEnterTimestamps(input)
+	if len(got) != 1 {
+		t.Fatalf("got %#v, want exactly one parsed timestamp", got)
+	}
+	if !got["nginx.service"].Equal(when) {
+		t.Fatalf("got %v, want %v", got["nginx.service"], when)
+	}
+}
+
+// A restart counter or timestamp belongs to the block it appears in; a
+// stray value before any Id= line must not be attributed to anything.
+func TestParseActiveEnterTimestampsIgnoresOrphanedValue(t *testing.T) {
+	got := parseActiveEnterTimestamps("ActiveEnterTimestamp=Tue 2026-01-06 08:12:45 UTC\n\nId=real.service\n")
+	if len(got) != 0 {
+		t.Fatalf("got %#v, want none", got)
+	}
+}
+
+func TestRecentUnitStartsFiltersToTheLookbackWindow(t *testing.T) {
+	now := time.Date(2026, 1, 6, 12, 0, 0, 0, time.UTC)
+	activeEnter := map[string]time.Time{
+		"today.service":     now.Add(-2 * time.Hour),
+		"yesterday.service": now.Add(-25 * time.Hour),
+		"future.service":    now.Add(time.Hour), // defensive: a clock step during collection
+	}
+	got := recentUnitStarts(activeEnter, now)
+	if len(got) != 1 || got[0].Unit != "today.service" {
+		t.Fatalf("got %#v, want only today.service", got)
+	}
+}
+
+func TestRecentUnitStartsOrdersNewestFirst(t *testing.T) {
+	now := time.Date(2026, 1, 6, 12, 0, 0, 0, time.UTC)
+	got := recentUnitStarts(map[string]time.Time{
+		"older": now.Add(-2 * time.Hour),
+		"newer": now.Add(-10 * time.Minute),
+	}, now)
+	if len(got) != 2 || got[0].Unit != "newer" || got[1].Unit != "older" {
+		t.Fatalf("got %#v, want newer before older", got)
+	}
+}
+
+// The real-world bug: a restart that happened before glimpse ran (so
+// RestartsDelta during this sample is zero) must still be visible via the
+// unit's own ActiveEnterTimestamp, not silently dropped.
+func TestCollectPopulatesRecentStartsFromActiveEnterTimestamp(t *testing.T) {
+	recent := time.Now().Add(-5 * time.Minute)
+	c := &Collector{
+		lookPath: func(string) (string, error) { return "/bin/systemctl", nil },
+		run: fakeSystemctl(t, "", "systemd-resolved.service loaded active running DNS\n",
+			"Id=systemd-resolved.service\nNRestarts=1\nActiveEnterTimestamp="+recent.Format(activeEnterLayout)+" UTC\n\n"),
+	}
+	data, err := c.Collect(context.Background())
+	if err != nil {
+		t.Fatalf("Collect returned error: %v", err)
+	}
+	if len(data.Systemd.RecentStarts) != 1 || data.Systemd.RecentStarts[0].Unit != "systemd-resolved.service" {
+		t.Fatalf("expected a recent start for systemd-resolved.service: %+v", data.Systemd.RecentStarts)
 	}
 }
 

@@ -405,12 +405,26 @@ type Systemd struct {
 	// Restart=always crash-looping never appears in FailedUnits, since
 	// systemd keeps restarting it; this is how that case still surfaces.
 	RestartingUnits []SystemdUnitRestart `json:"restarting_units,omitempty"`
+	// RecentStarts lists services that entered the active state within the
+	// last 24h, from systemd's own ActiveEnterTimestamp. Unlike
+	// RestartingUnits, this is not scoped to the sampling window -- a
+	// restart from ten minutes before glimpse ran still appears here with
+	// its real time, which RestartingUnits (a live delta observed only
+	// during this specific run) cannot see at all.
+	RecentStarts []SystemdUnitStart `json:"recent_starts,omitempty"`
 }
 
 // SystemdUnitRestart is one unit that restarted during the sample.
 type SystemdUnitRestart struct {
 	Unit          string `json:"unit"`
 	RestartsDelta uint64 `json:"restarts_delta"`
+}
+
+// SystemdUnitStart is one unit's most recent transition into the active
+// state, from systemd's ActiveEnterTimestamp.
+type SystemdUnitStart struct {
+	Unit string    `json:"unit"`
+	At   time.Time `json:"at"`
 }
 
 type Kernel struct {

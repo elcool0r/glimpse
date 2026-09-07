@@ -176,6 +176,55 @@ func TestTimelineIncludesLiveContainerAndSystemdFacts(t *testing.T) {
 	}
 }
 
+// The real-world bug report: a service restarted a few minutes before
+// glimpse ran has no RestartsDelta during this specific sample, but its
+// ActiveEnterTimestamp still places it on the timeline with a real time.
+func TestTimelineUsesRecentStartsForServicesRestartedBeforeTheSample(t *testing.T) {
+	now := localNoonToday(t)
+	report := model.Report{
+		GeneratedAt: now,
+		Metrics: model.Metrics{
+			Systemd: &model.Systemd{Available: true, RecentStarts: []model.SystemdUnitStart{
+				{Unit: "systemd-resolved.service", At: now.Add(-5 * time.Minute)},
+			}},
+		},
+	}
+	events := collectTimelineEvents(report)
+	if len(events) != 1 || !strings.Contains(events[0].label, "systemd-resolved.service (re)started") {
+		t.Fatalf("expected the precisely-timed restart, got %#v", events)
+	}
+	if !events[0].at.Equal(now.Add(-5 * time.Minute)) {
+		t.Fatalf("expected the real restart time, got %v", events[0].at)
+	}
+}
+
+// When both a precise timestamp and a live restart count are known for the
+// same unit, the count is folded into the precisely-timed entry instead of
+// producing two separate, redundant lines.
+func TestTimelineMergesRecentStartWithLiveRestartCount(t *testing.T) {
+	now := localNoonToday(t)
+	report := model.Report{
+		GeneratedAt: now,
+		Metrics: model.Metrics{
+			Systemd: &model.Systemd{
+				Available:       true,
+				RecentStarts:    []model.SystemdUnitStart{{Unit: "crashloop.service", At: now.Add(-time.Minute)}},
+				RestartingUnits: []model.SystemdUnitRestart{{Unit: "crashloop.service", RestartsDelta: 4}},
+			},
+		},
+	}
+	events := collectTimelineEvents(report)
+	if len(events) != 1 {
+		t.Fatalf("expected exactly one merged entry, got %#v", events)
+	}
+	if !strings.Contains(events[0].label, "crashloop.service") || !strings.Contains(events[0].label, "4 time(s)") {
+		t.Fatalf("expected the merged entry to name both the unit and the count: %q", events[0].label)
+	}
+	if !events[0].at.Equal(now.Add(-time.Minute)) {
+		t.Fatalf("expected the merged entry to use the precise time, not \"now\": %v", events[0].at)
+	}
+}
+
 func TestTimelineCapsEventCountWithOmittedNote(t *testing.T) {
 	now := time.Now()
 	var kernelEvents []model.LogEvent

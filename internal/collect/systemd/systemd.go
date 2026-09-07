@@ -78,6 +78,7 @@ func (c *Collector) Collect(parent context.Context) (collect.Data, error) {
 
 	var diagnostics []model.CollectionStatus
 	restarts := map[string]uint64{}
+	var recentStarts []model.SystemdUnitStart
 	listCtx, cancel := context.WithTimeout(parent, timeout)
 	listOutput, listErr := run(listCtx, path, "list-units", "--type=service", "--all", "--no-legend", "--plain", "--no-pager")
 	cancel()
@@ -93,7 +94,7 @@ func (c *Collector) Collect(parent context.Context) (collect.Data, error) {
 		}
 		if len(names) > 0 {
 			args := append([]string{"show"}, names...)
-			args = append(args, "--property=Id,NRestarts", "--no-pager")
+			args = append(args, "--property=Id,NRestarts,ActiveEnterTimestamp", "--no-pager")
 			showCtx, cancel := context.WithTimeout(parent, timeout)
 			showOutput, showErr := run(showCtx, path, args...)
 			cancel()
@@ -104,15 +105,36 @@ func (c *Collector) Collect(parent context.Context) (collect.Data, error) {
 				diagnostics = append(diagnostics, model.CollectionStatus{Status: "unavailable", Detail: "show: " + showErr.Error()})
 			default:
 				restarts = parseRestarts(string(showOutput))
+				recentStarts = recentUnitStarts(parseActiveEnterTimestamps(string(showOutput)), time.Now())
 			}
 		}
 	}
 
 	return collect.Data{
-		Systemd:     &model.Systemd{Available: true, FailedUnits: ParseFailedUnits(string(failedOutput))},
+		Systemd:     &model.Systemd{Available: true, FailedUnits: ParseFailedUnits(string(failedOutput)), RecentStarts: recentStarts},
 		Snapshot:    snapshot{restarts: restarts},
 		Diagnostics: diagnostics,
 	}, nil
+}
+
+// recentUnitStartsWindow bounds RecentStarts to a reasonable lookback --
+// most units on a host last started at boot, days or weeks ago, and are not
+// interesting; this matches the kernel log scanner's own 24h bound.
+const recentUnitStartsWindow = 24 * time.Hour
+
+// recentUnitStarts filters to units that entered the active state within the
+// lookback window, discarding anything older (or, defensively, timestamps
+// that appear to be in the future -- a clock step during collection).
+func recentUnitStarts(activeEnter map[string]time.Time, now time.Time) []model.SystemdUnitStart {
+	var starts []model.SystemdUnitStart
+	for unit, at := range activeEnter {
+		if at.After(now) || now.Sub(at) > recentUnitStartsWindow {
+			continue
+		}
+		starts = append(starts, model.SystemdUnitStart{Unit: unit, At: at})
+	}
+	sort.Slice(starts, func(i, j int) bool { return starts[i].At.After(starts[j].At) })
+	return starts
 }
 
 // Delta compares each unit's restart counter between the two boundaries.
@@ -148,6 +170,51 @@ func (c *Collector) Delta(first, last collect.Data) (collect.Data, error) {
 	})
 	last.Systemd.RestartingUnits = restarting
 	return last, nil
+}
+
+// activeEnterLayout matches systemctl show's timestamp format for a property
+// like ActiveEnterTimestamp, e.g. "Sat 2024-01-06 08:12:45 UTC". Only the
+// first three fields (weekday, date, time) are parsed; the trailing zone
+// abbreviation is ignored and the numeric fields are parsed in the local
+// zone instead, since Go cannot reliably resolve an arbitrary zone
+// abbreviation as printed, but systemd already formats these in the host's
+// local time -- the same zone glimpse's own process uses.
+const activeEnterLayout = "Mon 2006-01-02 15:04:05"
+
+// parseActiveEnterTimestamps reads `systemctl show <units...>
+// --property=Id,...,ActiveEnterTimestamp` output the same way parseRestarts
+// does. A unit that has never been active reports an empty value, which is
+// skipped rather than treated as an error.
+func parseActiveEnterTimestamps(output string) map[string]time.Time {
+	result := make(map[string]time.Time)
+	var currentID string
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			currentID = ""
+			continue
+		}
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		switch key {
+		case "Id":
+			currentID = value
+		case "ActiveEnterTimestamp":
+			if currentID == "" || value == "" {
+				continue
+			}
+			fields := strings.Fields(value)
+			if len(fields) < 3 {
+				continue
+			}
+			if t, err := time.ParseInLocation(activeEnterLayout, strings.Join(fields[:3], " "), time.Local); err == nil {
+				result[currentID] = t
+			}
+		}
+	}
+	return result
 }
 
 func runCommand(ctx context.Context, name string, args ...string) ([]byte, error) {

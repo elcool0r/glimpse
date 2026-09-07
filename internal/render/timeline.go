@@ -135,8 +135,31 @@ func collectTimelineEvents(r model.Report) []timelineEvent {
 		for _, unit := range s.FailedUnits {
 			add(now, fmt.Sprintf("%s failed", cleanText(unit)))
 		}
+		// RestartsDelta only sees a restart that happens to fall inside
+		// glimpse's own few-second sample -- a unit restarted a minute
+		// before glimpse ran would show nothing there. RecentStarts, from
+		// systemd's own ActiveEnterTimestamp, has the real time regardless
+		// of when glimpse happened to run, so it takes priority; the delta
+		// count is folded into that line when both are known, and only
+		// used on its own as a fallback if the timestamp wasn't available.
+		restartCounts := make(map[string]uint64, len(s.RestartingUnits))
 		for _, unit := range s.RestartingUnits {
-			add(now, fmt.Sprintf("%s restarted %d time(s) during the sample", cleanText(unit.Unit), unit.RestartsDelta))
+			restartCounts[unit.Unit] = unit.RestartsDelta
+		}
+		reported := make(map[string]bool, len(s.RecentStarts))
+		for _, start := range s.RecentStarts {
+			label := fmt.Sprintf("%s (re)started", cleanText(start.Unit))
+			if delta, ok := restartCounts[start.Unit]; ok {
+				label = fmt.Sprintf("%s restarted (%d time(s) during this sample)", cleanText(start.Unit), delta)
+			}
+			add(start.At, label)
+			reported[start.Unit] = true
+		}
+		for unit, delta := range restartCounts {
+			if reported[unit] {
+				continue
+			}
+			add(now, fmt.Sprintf("%s restarted %d time(s) during the sample", cleanText(unit), delta))
 		}
 	}
 
