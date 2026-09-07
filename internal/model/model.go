@@ -45,39 +45,64 @@ type Host struct {
 // /proc/pressure. Counters are deltas for the sampling window unless
 // documented as a current gauge.
 type Metrics struct {
-	CPU           *CPU               `json:"cpu,omitempty"`
-	Memory        *Memory            `json:"memory,omitempty"`
-	Pressure      *Pressure          `json:"pressure,omitempty"`
-	Filesystems   []Filesystem       `json:"filesystems,omitempty"`
-	Network       []Network          `json:"network,omitempty"`
-	Thermal       []Thermal          `json:"thermal,omitempty"`
-	Processes     *Processes         `json:"processes,omitempty"`
-	Systemd       *Systemd           `json:"systemd,omitempty"`
-	Kernel        *Kernel            `json:"kernel,omitempty"`
-	Disks         []Disk             `json:"disks,omitempty"`
-	TCP           *TCP               `json:"tcp,omitempty"`
-	Conntrack     *Conntrack         `json:"conntrack,omitempty"`
-	DeviceHealth  []DeviceHealth     `json:"device_health,omitempty"`
-	TimeSync      *TimeSync          `json:"time_sync,omitempty"`
-	Resources     *Resources         `json:"resources,omitempty"`
-	Privileges    *Privileges        `json:"privileges,omitempty"`
-	CgroupV2      *CgroupV2          `json:"cgroup_v2,omitempty"`
-	Containers    []ContainerRuntime `json:"containers,omitempty"`
-	ZFSPools      []ZFSPool          `json:"zfs_pools,omitempty"`
-	SoftwareRAID  []SoftwareRAID     `json:"software_raid,omitempty"`
-	LVM           *LVM               `json:"lvm,omitempty"`
-	MountChecks   []MountCheck       `json:"mount_checks,omitempty"`
-	Security      *Security          `json:"security,omitempty"`
-	NetworkState  *NetworkState      `json:"network_state,omitempty"`
-	DNSResolution *DNSResolution     `json:"dns_resolution,omitempty"`
-	GatewayCheck  *GatewayCheck      `json:"gateway_check,omitempty"`
-	PathMTUCheck  *PathMTUCheck      `json:"path_mtu_check,omitempty"`
-	HTTPCheck     *HTTPCheck         `json:"http_check,omitempty"`
-	ICMPCheck     *ICMPCheck         `json:"icmp_check,omitempty"`
-	IPv6Check     *IPv6Check         `json:"ipv6_check,omitempty"`
-	DeletedFiles  *DeletedFiles      `json:"deleted_files,omitempty"`
-	Hardware      *HardwareErrors    `json:"hardware_errors,omitempty"`
-	Trends        []Trend            `json:"trends,omitempty"`
+	CPU             *CPU               `json:"cpu,omitempty"`
+	Memory          *Memory            `json:"memory,omitempty"`
+	Pressure        *Pressure          `json:"pressure,omitempty"`
+	Filesystems     []Filesystem       `json:"filesystems,omitempty"`
+	Network         []Network          `json:"network,omitempty"`
+	Thermal         []Thermal          `json:"thermal,omitempty"`
+	Processes       *Processes         `json:"processes,omitempty"`
+	Systemd         *Systemd           `json:"systemd,omitempty"`
+	Kernel          *Kernel            `json:"kernel,omitempty"`
+	Disks           []Disk             `json:"disks,omitempty"`
+	TCP             *TCP               `json:"tcp,omitempty"`
+	Conntrack       *Conntrack         `json:"conntrack,omitempty"`
+	DeviceHealth    []DeviceHealth     `json:"device_health,omitempty"`
+	TimeSync        *TimeSync          `json:"time_sync,omitempty"`
+	Resources       *Resources         `json:"resources,omitempty"`
+	Privileges      *Privileges        `json:"privileges,omitempty"`
+	CgroupV2        *CgroupV2          `json:"cgroup_v2,omitempty"`
+	Containers      []ContainerRuntime `json:"containers,omitempty"`
+	ZFSPools        []ZFSPool          `json:"zfs_pools,omitempty"`
+	SoftwareRAID    []SoftwareRAID     `json:"software_raid,omitempty"`
+	LVM             *LVM               `json:"lvm,omitempty"`
+	MountChecks     []MountCheck       `json:"mount_checks,omitempty"`
+	Security        *Security          `json:"security,omitempty"`
+	NetworkState    *NetworkState      `json:"network_state,omitempty"`
+	DNSResolution   *DNSResolution     `json:"dns_resolution,omitempty"`
+	GatewayCheck    *GatewayCheck      `json:"gateway_check,omitempty"`
+	PathMTUCheck    *PathMTUCheck      `json:"path_mtu_check,omitempty"`
+	HTTPCheck       *HTTPCheck         `json:"http_check,omitempty"`
+	ICMPCheck       *ICMPCheck         `json:"icmp_check,omitempty"`
+	IPv6Check       *IPv6Check         `json:"ipv6_check,omitempty"`
+	DeletedFiles    *DeletedFiles      `json:"deleted_files,omitempty"`
+	Hardware        *HardwareErrors    `json:"hardware_errors,omitempty"`
+	Trends          []Trend            `json:"trends,omitempty"`
+	PackageActivity []PackageActivity  `json:"package_activity,omitempty"`
+	Logins          []LoginEvent       `json:"logins,omitempty"`
+}
+
+// PackageActivity is one bounded, timestamped package-manager transaction --
+// an apt/dpkg run, or a yum transaction -- not one entry per package, so a
+// 40-package upgrade run does not become 40 log lines. Manager is "apt" or
+// "yum".
+type PackageActivity struct {
+	At      time.Time `json:"at"`
+	Manager string    `json:"manager"`
+	Summary string    `json:"summary"`
+}
+
+// LoginEvent is one successful interactive SSH authentication. It is scoped
+// to logins specifically: a scripted `ssh host command` invocation produces
+// the identical sshd log line as a real interactive session and cannot be
+// distinguished from it at this level, but a session that immediately
+// requests the sftp subsystem (covering both sftp and modern scp, which
+// defaults to the SFTP protocol) is excluded on a best-effort basis.
+type LoginEvent struct {
+	At     time.Time `json:"at"`
+	User   string    `json:"user"`
+	Source string    `json:"source,omitempty"`
+	Method string    `json:"method,omitempty"`
 }
 
 type CPU struct {

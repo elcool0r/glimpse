@@ -705,7 +705,8 @@ func renderIntegrations(w io.Writer, width int, r model.Report, separator string
 var kernelPatternKinds = []string{
 	"oom", "cgroup_oom", "kernel_panic", "kernel_oops", "blocked_task",
 	"nvme_error", "io_error", "filesystem_corruption", "filesystem_error",
-	"hardware_error", "zfs_error", "thermal_throttling",
+	"filesystem_readonly_remount", "hardware_error", "zfs_error", "thermal_throttling",
+	"netdev_watchdog", "segfault", "link_down", "link_up", "disk_full",
 }
 
 // dnsStatus judges the resolver configuration the same way the analyzer does:

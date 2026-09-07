@@ -44,7 +44,7 @@ styling.
 | Process sampling (`/proc`) | Top CPU and resident-RAM (RSS) processes are available with `--verbose`; duplicate PIDs are removed between lists | None from ranking alone | None |
 | Zombie processes (`/proc`) | Count and identities are informational; parent details are verbose | None | None |
 | Failed systemd units (`systemctl --failed`) | None | None | Any failed unit |
-| Kernel event scan (current boot / bounded recent journal) | Records carry their age. An event older than one hour is reported one severity lower, so an overnight incident does not read as urgently at noon as it did at 03:00 | Explicit kernel warning patterns, or an older critical pattern | OOM/cgroup OOM, hardware error, filesystem corruption, kernel panic, or kernel oops recorded within the last hour |
+| Kernel event scan (current boot / bounded recent journal) | Records carry their age. An event older than one hour is reported one severity lower, so an overnight incident does not read as urgently at noon as it did at 03:00. Three scans run: the main kernel-ring-buffer scan at warning-and-above priority (oom, panic, oops, hardware error, filesystem corruption/error, nvme/io error, NETDEV WATCHDOG, a filesystem remounted read-only, thermal throttling, zfs error, a blocked task); a second, `--grep`-targeted kernel-ring-buffer scan for two lower-priority patterns that would otherwise be crowded out (a process segfault; a physical NIC's own "Link is Up/Down" message -- software interfaces such as veth, bridges, tap devices, and WireGuard do not emit this message, so no separate detection is needed to exclude them); and a third, non-kernel journal-wide scan for "No space left on device", which is logged by the application that hit it, not the kernel, giving a real timestamp for a filesystem that was full earlier even if it is not full now. A link coming back up is reported as informational with no score impact -- it is the recovery half of a down/up pair, not a fault | Explicit kernel warning patterns, or an older critical pattern | OOM/cgroup OOM, hardware error, filesystem corruption or read-only remount, "No space left on device", kernel panic, or kernel oops recorded within the last hour |
 | Time synchronization (`timedatectl` or `chronyc`) | Service and measured offset | Unsynchronized, or absolute offset ≥1,000 ms | Absolute offset ≥5,000 ms |
 | Resource limits (`/proc/sys`, `/proc/sys/fs`, conntrack) | Current/max values are available in verbose output. The task count from `/proc/loadavg` counts threads and is compared against the lower of `threads-max` and `pid_max`, not against `pid_max` alone. Inotify limits are reported as capacity facts; the kernel exposes no global watch count, so there is no usage rule for them | File descriptors, tasks, or conntrack ≥90% used | ≥98% used |
 | Connection tracking drops (`/proc/net/stat/nf_conntrack`) | Per-CPU drop, early-drop, and failed-insert counters are summed and sampled over the window. Columns are read by header name, so a kernel that adds or removes one does not shift the others. This is independent of table utilization: a burst can drop packets while the steady-state count still looks calm | Any drop, early drop, or failed insert during the sample | None |
@@ -139,6 +139,36 @@ them are on by default; `--disable-external-checks` turns them off.
 | Check / source | Informational result | Warning default | Critical / error default |
 | --- | --- | --- | --- |
 | Deleted-but-open files (`internal/collect/deletedfiles`) | A bounded scan of `/proc/*/fd` for descriptors still open on unlinked files -- the "disk is full but nothing looks large" symptom. Space is counted once per unique `(device, inode)`, never per fd, PID, path, or size: the same deleted file held open on several file descriptors (a common journald/podman pattern) contributes its size once, while distinct files that happen to share a size or a display name are still counted separately. Reports allocated space (`st_blocks * 512`) rather than logical size when available, so a sparse file is not overstated. Only sees processes this user can inspect; processes scanned vs. skipped is shown explicitly rather than under-reporting silently. Individual files under 1 MiB are counted toward the total but not listed. Anything living on tmpfs/shmem (`statfs` type check) is excluded entirely, not just by name: `memfd_create()` objects -- for example the .NET runtime's JIT "doublemapper" -- appear identically to a deleted regular file, "(deleted)" suffix included, but are RAM-backed with a virtual/logical size, not real disk usage | Total held-open bytes ≥200 MiB, naming the largest holder (the process retaining the most *unique* space, not the most references) and the single largest file | Total held-open bytes ≥2 GiB |
+
+## Recent events timeline
+
+Shown automatically alongside a critical finding, or always with `--events`.
+It answers "what happened today, and roughly when" -- a chronological,
+source-tagged list, not a second copy of the health verdict.
+
+Only two kinds of fact appear here:
+
+- **A real historical timestamp.** Kernel/journal events, package-manager
+  transactions, and SSH logins all carry (or can derive) the actual moment
+  they happened, independent of when glimpse itself happened to run.
+- **A live fact with no historical record of when it started.** A
+  currently-failed systemd unit, or a container this sample found
+  unhealthy/OOM-killed/restarted, is stamped "now" -- true for the instant
+  this report ran, not a claim about exactly when the fault began.
+
+Deliberately excluded: ongoing state (a filesystem at 95%, a degraded RAID
+array) has no discrete moment this report can point to, so inventing a
+timestamp would be worse than leaving it in the normal metric row and
+Details instead. Only today (local midnight through now) is shown.
+
+| Source | What it covers | Notes |
+| --- | --- | --- |
+| `kernel` | Every kernel event scan pattern (see above) | Real timestamp from the journal record's own age |
+| a container runtime name (e.g. `docker`, `podman`) | OOM-killed, unhealthy, restarted, or exited-despite-restart-policy containers; container log lines matching the same concrete failure signatures the analyzer treats as actionable | State facts are stamped "now"; log-line facts carry a real timestamp |
+| `systemd` | Failed units (stamped "now"); unit (re)starts, from systemd's own `ActiveEnterTimestamp` (a real timestamp, independent of glimpse's own sampling window -- a restart from ten minutes before glimpse ran still appears, which a live restart-counter delta cannot see) | The live restart count observed during this specific sample is folded into the precisely-timed line when both are known |
+| `apt` | One entry per apt transaction from `/var/log/apt/history.log`, summarized ("3 packages upgraded"), never one entry per package | Debian/Ubuntu only |
+| `yum` | One entry per distinct-minute group of lines in the classic `/var/log/yum.log` | RHEL/CentOS 7 and earlier; a modern dnf-only host with no `yum.log` is not covered -- dnf's own history lives in a SQLite database this project does not take a dependency on to read |
+| `ssh` | Successful interactive logins (user, source address, and method) from the authpriv journal | A session that immediately requests the sftp subsystem is excluded on a best-effort basis (covers `sftp` and, since OpenSSH 9.0, `scp`'s default SFTP-protocol mode); a non-interactive `ssh host command` invocation cannot be distinguished from a real login at this log level and may still appear |
 
 ## Severity and coverage
 

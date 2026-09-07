@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -35,6 +36,10 @@ const (
 	// record authentication outcomes. Priority cannot be used instead: these
 	// records are informational, not warnings.
 	authprivFacility = "SYSLOG_FACILITY=10"
+	// loginEventsWindow matches the timeline's own "today" scope, unlike the
+	// 1h journalWindow above (which bounds the noisier failed-auth *count*
+	// so its ratio has a well-defined denominator).
+	loginEventsWindow = "24h"
 )
 
 type Collector struct {
@@ -153,6 +158,7 @@ func (c *Collector) Collect(ctx context.Context) (collect.Data, error) {
 	}
 	isRoot := os.Geteuid() == 0
 	var reduced []string
+	var logins []model.LoginEvent
 	if path, err := lookup("journalctl"); err == nil {
 		s.JournalWindow = journalWindow
 		// Authentication outcomes come from the authpriv facility; scanning an
@@ -168,6 +174,17 @@ func (c *Collector) Collect(ctx context.Context) (collect.Data, error) {
 			return collect.Data{}, ctx.Err()
 		} else {
 			diagnostics = append(diagnostics, model.CollectionStatus{Status: "unavailable", Detail: "authentication journal: " + runErr.Error()})
+		}
+		// A separate, wider-window scan (short-unix, so each login keeps its
+		// real time) for successful interactive logins -- the 1h/--output=cat
+		// scan above only needs to count failures, not place them on a
+		// timeline.
+		if raw, runErr := boundedCommand(ctx, timeout, run, path, "--since=-"+loginEventsWindow, "--no-pager", "--output=short-unix", "--lines="+journalMaxRecords, authprivFacility); runErr == nil {
+			logins = ParseLoginEvents(string(raw))
+		} else if ctx.Err() != nil {
+			return collect.Data{}, ctx.Err()
+		} else {
+			diagnostics = append(diagnostics, model.CollectionStatus{Status: "unavailable", Detail: "login journal: " + runErr.Error()})
 		}
 		// SELinux AVC and AppArmor denials are emitted by the kernel.
 		if raw, runErr := boundedCommand(ctx, timeout, run, path, "--since=-"+journalWindow, "-k", "--no-pager", "--output=cat", "--lines="+journalMaxRecords); runErr == nil {
@@ -219,7 +236,7 @@ func (c *Collector) Collect(ctx context.Context) (collect.Data, error) {
 	}
 	s.Available = observed
 	privileges := &model.Privileges{IsRoot: isRoot, ReducedCoverage: reduced}
-	return collect.Data{Security: s, Privileges: privileges, Diagnostics: diagnostics}, nil
+	return collect.Data{Security: s, Privileges: privileges, Diagnostics: diagnostics, Logins: logins}, nil
 }
 
 func boundedCommand(parent context.Context, timeout time.Duration, run func(context.Context, string, ...string) ([]byte, error), path string, args ...string) ([]byte, error) {
@@ -236,6 +253,70 @@ func runCommand(ctx context.Context, name string, args ...string) ([]byte, error
 }
 
 func uintPtr(v uint64) *uint64 { return &v }
+
+var (
+	acceptedLoginPattern  = regexp.MustCompile(`^Accepted (publickey|password|keyboard-interactive/pam) for (?:invalid user )?(\S+) from (\S+) port \d+`)
+	sftpSubsystemPattern  = regexp.MustCompile(`subsystem request for sftp`)
+	sshdIdentifierPattern = regexp.MustCompile(`^sshd\[(\d+)\]$`)
+)
+
+// ParseLoginEvents extracts successful interactive SSH logins from a
+// journalctl short-unix scan of the authpriv facility. A session that
+// immediately requests the sftp subsystem is excluded on a best-effort
+// basis: it covers sftp itself and, since OpenSSH 9.0, scp's default
+// SFTP-protocol mode, correlated by the sshd worker PID both lines share.
+// It cannot distinguish a real interactive login from a non-interactive
+// `ssh host command` invocation, since sshd logs an identical "Accepted"
+// line for both -- that is a limitation of the log source, not this parser.
+func ParseLoginEvents(output string) []model.LoginEvent {
+	type candidate struct {
+		at                   time.Time
+		method, user, source string
+	}
+	candidatesByPID := make(map[string]candidate)
+	sftpPIDs := make(map[string]bool)
+	for _, raw := range strings.Split(output, "\n") {
+		line := strings.TrimSpace(raw)
+		stamp, rest, ok := strings.Cut(line, " ")
+		if !ok {
+			continue
+		}
+		seconds, err := strconv.ParseFloat(stamp, 64)
+		if err != nil || seconds <= 0 {
+			continue
+		}
+		// rest: "<hostname> sshd[pid]: <message>"
+		_, rest, ok = strings.Cut(rest, " ")
+		if !ok {
+			continue
+		}
+		identifier, message, ok := strings.Cut(rest, ": ")
+		if !ok {
+			continue
+		}
+		pidMatch := sshdIdentifierPattern.FindStringSubmatch(identifier)
+		if pidMatch == nil {
+			continue
+		}
+		pid := pidMatch[1]
+		if sftpSubsystemPattern.MatchString(message) {
+			sftpPIDs[pid] = true
+			continue
+		}
+		if m := acceptedLoginPattern.FindStringSubmatch(message); m != nil {
+			candidatesByPID[pid] = candidate{at: time.Unix(int64(seconds), 0), method: m[1], user: m[2], source: m[3]}
+		}
+	}
+	var logins []model.LoginEvent
+	for pid, c := range candidatesByPID {
+		if sftpPIDs[pid] {
+			continue
+		}
+		logins = append(logins, model.LoginEvent{At: c.at, User: c.user, Source: c.source, Method: c.method})
+	}
+	sort.Slice(logins, func(i, j int) bool { return logins[i].At.Before(logins[j].At) })
+	return logins
+}
 
 // ParseJournalSecurity classifies high-signal auth and MAC denial messages.
 func ParseJournalSecurity(output string) (failedAuth, selinuxDenials, apparmorDenials uint64) {

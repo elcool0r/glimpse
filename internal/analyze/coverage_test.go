@@ -171,23 +171,41 @@ func TestTimeOffsetWarnsThenCriticals(t *testing.T) {
 	}
 }
 
+// A link coming back up is the recovery half of a link_down/link_up pair,
+// not a fault; it must stay informational and cost nothing, even when it
+// just happened (fresh enough that age-based step-down wouldn't apply).
+func TestKernelLinkUpStaysInformational(t *testing.T) {
+	report := model.Report{Metrics: model.Metrics{CPU: &model.CPU{}, Kernel: &model.Kernel{Available: true,
+		Events: []model.LogEvent{{Kind: "link_up", Message: "enp7s0: NIC Link is Up 1000 Mbps"}}}}}
+	Report(&report)
+	found := findingByID(report, "kernel-link_up")
+	if found == nil || found.Severity != model.SeverityInfo || found.ScoreImpact != 0 {
+		t.Fatalf("expected link_up to stay informational with no score impact: %+v", report.Findings)
+	}
+}
+
 // Each of these kernel-log pattern kinds is classified by the kernel
 // collector already (see internal/collect/kernel); this pins the
 // analyze-level severity every kind resolves to, not just the "oom" case.
 func TestKernelEventKindsResolveExpectedSeverity(t *testing.T) {
 	cases := map[string]model.Severity{
-		"oom":                   model.SeverityCritical,
-		"cgroup_oom":            model.SeverityCritical,
-		"kernel_panic":          model.SeverityCritical,
-		"kernel_oops":           model.SeverityCritical,
-		"hardware_error":        model.SeverityCritical,
-		"filesystem_corruption": model.SeverityCritical,
-		"filesystem_error":      model.SeverityWarning,
-		"io_error":              model.SeverityWarning,
-		"nvme_error":            model.SeverityWarning,
-		"blocked_task":          model.SeverityWarning,
-		"thermal_throttling":    model.SeverityWarning,
-		"zfs_error":             model.SeverityWarning,
+		"oom":                         model.SeverityCritical,
+		"cgroup_oom":                  model.SeverityCritical,
+		"kernel_panic":                model.SeverityCritical,
+		"kernel_oops":                 model.SeverityCritical,
+		"hardware_error":              model.SeverityCritical,
+		"filesystem_corruption":       model.SeverityCritical,
+		"filesystem_error":            model.SeverityWarning,
+		"io_error":                    model.SeverityWarning,
+		"nvme_error":                  model.SeverityWarning,
+		"blocked_task":                model.SeverityWarning,
+		"thermal_throttling":          model.SeverityWarning,
+		"zfs_error":                   model.SeverityWarning,
+		"filesystem_readonly_remount": model.SeverityCritical,
+		"disk_full":                   model.SeverityCritical,
+		"netdev_watchdog":             model.SeverityWarning,
+		"segfault":                    model.SeverityWarning,
+		"link_down":                   model.SeverityWarning,
 	}
 	for kind, want := range cases {
 		report := model.Report{Metrics: model.Metrics{CPU: &model.CPU{}, Kernel: &model.Kernel{Available: true,

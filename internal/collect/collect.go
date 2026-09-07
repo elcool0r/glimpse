@@ -16,40 +16,42 @@ type Data struct {
 	// Snapshot is collector-private observation state. It is deliberately not
 	// serialized; DeltaCollector implementations use it to derive sampled
 	// counters from the two collection boundaries.
-	Snapshot      any
-	CPU           *model.CPU
-	Memory        *model.Memory
-	Pressure      *model.Pressure
-	Filesystems   []model.Filesystem
-	Network       []model.Network
-	Thermal       []model.Thermal
-	Processes     *model.Processes
-	Systemd       *model.Systemd
-	Kernel        *model.Kernel
-	Disks         []model.Disk
-	TCP           *model.TCP
-	Conntrack     *model.Conntrack
-	DeviceHealth  []model.DeviceHealth
-	TimeSync      *model.TimeSync
-	Resources     *model.Resources
-	Privileges    *model.Privileges
-	CgroupV2      *model.CgroupV2
-	Containers    []model.ContainerRuntime
-	ZFSPools      []model.ZFSPool
-	SoftwareRAID  []model.SoftwareRAID
-	LVM           *model.LVM
-	MountChecks   []model.MountCheck
-	Security      *model.Security
-	NetworkState  *model.NetworkState
-	DNSResolution *model.DNSResolution
-	GatewayCheck  *model.GatewayCheck
-	PathMTUCheck  *model.PathMTUCheck
-	HTTPCheck     *model.HTTPCheck
-	ICMPCheck     *model.ICMPCheck
-	IPv6Check     *model.IPv6Check
-	DeletedFiles  *model.DeletedFiles
-	Hardware      *model.HardwareErrors
-	Trends        []model.Trend
+	Snapshot        any
+	CPU             *model.CPU
+	Memory          *model.Memory
+	Pressure        *model.Pressure
+	Filesystems     []model.Filesystem
+	Network         []model.Network
+	Thermal         []model.Thermal
+	Processes       *model.Processes
+	Systemd         *model.Systemd
+	Kernel          *model.Kernel
+	Disks           []model.Disk
+	TCP             *model.TCP
+	Conntrack       *model.Conntrack
+	DeviceHealth    []model.DeviceHealth
+	TimeSync        *model.TimeSync
+	Resources       *model.Resources
+	Privileges      *model.Privileges
+	CgroupV2        *model.CgroupV2
+	Containers      []model.ContainerRuntime
+	ZFSPools        []model.ZFSPool
+	SoftwareRAID    []model.SoftwareRAID
+	LVM             *model.LVM
+	MountChecks     []model.MountCheck
+	Security        *model.Security
+	NetworkState    *model.NetworkState
+	DNSResolution   *model.DNSResolution
+	GatewayCheck    *model.GatewayCheck
+	PathMTUCheck    *model.PathMTUCheck
+	HTTPCheck       *model.HTTPCheck
+	ICMPCheck       *model.ICMPCheck
+	IPv6Check       *model.IPv6Check
+	DeletedFiles    *model.DeletedFiles
+	Hardware        *model.HardwareErrors
+	Trends          []model.Trend
+	PackageActivity []model.PackageActivity
+	Logins          []model.LoginEvent
 }
 
 // Collector reads one coherent observation. Sampling invokes Collect at the

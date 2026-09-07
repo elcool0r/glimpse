@@ -579,6 +579,16 @@ func resourceFindings(resources *model.Resources) []model.Finding {
 // covers the current boot up to 24 hours, so without an age an incident from
 // overnight reads exactly as urgently as one happening now.
 func kernelFinding(event model.LogEvent) model.Finding {
+	// A link coming back up is the recovery half of a link_down/link_up
+	// pair, not a fault on its own -- reporting it as a Warning would
+	// penalize a host for a NIC that already fixed itself.
+	if event.Kind == "link_up" {
+		summary := event.Message
+		if event.AgeSeconds != nil {
+			summary = fmt.Sprintf("%s (recorded %s ago)", summary, humanDuration(time.Duration(*event.AgeSeconds)*time.Second))
+		}
+		return finding("kernel-"+event.Kind, model.SeverityInfo, "kernel", "Kernel event: "+event.Kind, summary, "No action needed; this reports when the link came back up.", 0)
+	}
 	severity, impact := model.SeverityWarning, 12
 	if criticalKernelEvent(event.Kind) {
 		severity, impact = model.SeverityCritical, 25
@@ -629,7 +639,7 @@ func taskCeiling(resources *model.Resources) uint64 {
 
 func criticalKernelEvent(kind string) bool {
 	switch kind {
-	case "oom", "cgroup_oom", "hardware_error", "filesystem_corruption", "kernel_panic", "kernel_oops":
+	case "oom", "cgroup_oom", "hardware_error", "filesystem_corruption", "kernel_panic", "kernel_oops", "filesystem_readonly_remount", "disk_full":
 		return true
 	default:
 		return false

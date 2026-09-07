@@ -1,6 +1,8 @@
 // Package kernel performs a deliberately bounded scan for a few high-signal
-// kernel failure patterns. It never treats a generic "error" log line as a
-// health event.
+// kernel failure patterns, plus a small number of application-logged
+// incidents (like ENOSPC) that share the same "one classified, timestamped
+// event" shape. It never treats a generic "error" log line as a health
+// event.
 package kernel
 
 import (
@@ -18,6 +20,10 @@ import (
 const (
 	commandTimeout = 4 * time.Second
 	maxLines       = 200
+	// grepMaxLines bounds the two targeted --grep scans, which are already
+	// narrowed server-side by journalctl and so need much less headroom
+	// than the broad priority-based scan.
+	grepMaxLines = 50
 )
 
 type Collector struct {
@@ -46,24 +52,123 @@ func (c *Collector) Collect(parent context.Context) (collect.Data, error) {
 	if timeout <= 0 {
 		timeout = commandTimeout
 	}
-	ctx, cancel := context.WithTimeout(parent, timeout)
-	defer cancel()
 	run := c.run
 	if run == nil {
 		run = runCommand
 	}
-	// Boot scope prevents old incidents from appearing current; the time bound
-	// also handles unusually long-lived hosts. -n bounds journal records.
-	// short-unix retains the record timestamp, which is what lets analysis
-	// distinguish an incident happening now from one recorded overnight.
-	output, err := run(ctx, path, "--boot=0", "--since=-24h", "-k", "--priority=warning", "--no-pager", "--output=short-unix", "--lines=200")
-	if err != nil {
+	now := time.Now()
+	var diagnostics []model.CollectionStatus
+	var events []model.LogEvent
+	seen := make(map[string]struct{})
+
+	// Primary scan: broad kernel-ring-buffer coverage at warning-and-above
+	// priority. This is where oom/panic/oops/hardware/filesystem/nvme/io
+	// errors are found; the priority filter is what keeps 200 lines from
+	// being consumed by routine kernel chatter before reaching them.
+	if output, runErr := runBounded(parent, run, timeout, path, "--boot=0", "--since=-24h", "-k", "--priority=warning", "--no-pager", "--output=short-unix", "--lines="+strconv.Itoa(maxLines)); runErr != nil {
 		if parent.Err() != nil {
 			return collect.Data{}, parent.Err()
 		}
-		return collect.Data{Kernel: &model.Kernel{Available: false}, Diagnostics: []model.CollectionStatus{{Status: "unavailable", Detail: err.Error()}}}, nil
+		return collect.Data{Kernel: &model.Kernel{Available: false}, Diagnostics: []model.CollectionStatus{{Status: "unavailable", Detail: runErr.Error()}}}, nil
+	} else {
+		events = appendNewEvents(events, seen, ParseEvents(string(output), now))
 	}
-	return collect.Data{Kernel: &model.Kernel{Available: true, Events: ParseEvents(string(output), time.Now())}}, nil
+
+	// Secondary scan: kernel-ring-buffer lines below warning priority that
+	// are still worth surfacing (a segfault, or a NIC's own link-state
+	// message). journalctl's own --grep narrows this server-side, so it
+	// stays bounded without needing to widen the priority filter above and
+	// risk routine info-level chatter crowding out the real signal.
+	if output, runErr := runBounded(parent, run, timeout, path, "--boot=0", "--since=-24h", "-k", "--grep=segfault at|NIC Link is (Up|Down)", "--no-pager", "--output=short-unix", "--lines="+strconv.Itoa(grepMaxLines)); runErr != nil {
+		if parent.Err() != nil {
+			return collect.Data{}, parent.Err()
+		}
+		diagnostics = append(diagnostics, model.CollectionStatus{Status: "unavailable", Detail: "grep(kernel): " + runErr.Error()})
+	} else {
+		events = appendNewEvents(events, seen, filterVirtualLinkEvents(ParseEvents(string(output), now)))
+	}
+
+	// Tertiary scan: ENOSPC is reported by the application that hit it, not
+	// the kernel, so this is the one scan here that is not -k restricted.
+	if output, runErr := runBounded(parent, run, timeout, path, "--since=-24h", "--grep=No space left on device", "--no-pager", "--output=short-unix", "--lines="+strconv.Itoa(grepMaxLines)); runErr != nil {
+		if parent.Err() != nil {
+			return collect.Data{}, parent.Err()
+		}
+		diagnostics = append(diagnostics, model.CollectionStatus{Status: "unavailable", Detail: "grep(enospc): " + runErr.Error()})
+	} else {
+		events = appendNewEvents(events, seen, ParseEvents(string(output), now))
+	}
+
+	return collect.Data{Kernel: &model.Kernel{Available: true, Events: events}, Diagnostics: diagnostics}, nil
+}
+
+func runBounded(parent context.Context, run func(context.Context, string, ...string) ([]byte, error), timeout time.Duration, path string, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+	return run(ctx, path, args...)
+}
+
+// appendNewEvents merges another scan's events, deduplicating by kind (the
+// same key ParseEvents itself dedups within one scan) across the whole
+// collection, so the same incident spotted by two different scans is not
+// reported twice.
+func appendNewEvents(events []model.LogEvent, seen map[string]struct{}, found []model.LogEvent) []model.LogEvent {
+	for _, event := range found {
+		key := event.Kind
+		if key == "oom" || key == "cgroup_oom" {
+			key = "oom"
+		}
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		events = append(events, event)
+	}
+	return events
+}
+
+// virtualInterfacePrefixes names software-created interfaces (container
+// networking, VMs, VPNs, bridges) that filterVirtualLinkEvents excludes as a
+// defensive backstop. In practice a virtual interface never emits the "NIC
+// Link is Up/Down" message in the first place -- that phrasing comes from
+// physical Ethernet/Wi-Fi drivers reporting real PHY state, which veth,
+// bridge, tap and wireguard devices have no equivalent of -- so this rarely
+// needs to reject anything; it exists for the driver that does something
+// unexpected rather than as the primary filter.
+var virtualInterfacePrefixes = []string{
+	"veth", "docker", "br-", "virbr", "tap", "vnet", "cni", "flannel", "wg", "tun", "cali", "podman",
+}
+
+// filterVirtualLinkEvents drops link_up/link_down events whose message names
+// a software-created interface. Every other kind passes through unchanged.
+func filterVirtualLinkEvents(events []model.LogEvent) []model.LogEvent {
+	kept := make([]model.LogEvent, 0, len(events))
+	for _, event := range events {
+		if (event.Kind == "link_up" || event.Kind == "link_down") && isVirtualInterfaceMessage(event.Message) {
+			continue
+		}
+		kept = append(kept, event)
+	}
+	return kept
+}
+
+func isVirtualInterfaceMessage(message string) bool {
+	lower := strings.ToLower(message)
+	for _, prefix := range virtualInterfacePrefixes {
+		if idx := strings.Index(lower, prefix); idx >= 0 {
+			// Require the prefix to start a "word" (previous rune is not a
+			// letter/digit) so it matches an interface name token rather
+			// than an unrelated substring occurring in driver text.
+			if idx == 0 || !isAlnum(lower[idx-1]) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isAlnum(b byte) bool {
+	return b >= 'a' && b <= 'z' || b >= '0' && b <= '9'
 }
 
 func runCommand(ctx context.Context, name string, args ...string) ([]byte, error) {
@@ -152,16 +257,28 @@ func eventKind(line string) string {
 		return "nvme_error"
 	case strings.Contains(lower, "i/o error") || strings.Contains(lower, "buffer i/o error") || strings.Contains(lower, "blk_update_request"):
 		return "io_error"
+	case strings.Contains(lower, "remounting filesystem read-only") || strings.Contains(lower, "re-mounting filesystem read-only") || strings.Contains(lower, "remounting filesystem read only"):
+		return "filesystem_readonly_remount"
 	case strings.Contains(lower, "xfs") && strings.Contains(lower, "corruption"):
 		return "filesystem_corruption"
 	case strings.Contains(lower, "ext4-fs error") || strings.Contains(lower, "btrfs error"):
 		return "filesystem_error"
 	case strings.Contains(lower, "machine check") || strings.Contains(lower, "hardware error"):
 		return "hardware_error"
+	case strings.Contains(lower, "netdev watchdog"):
+		return "netdev_watchdog"
 	case strings.Contains(lower, "zfs") && (strings.Contains(lower, "error") || strings.Contains(lower, "fault") || strings.Contains(lower, "degrad")):
 		return "zfs_error"
 	case strings.Contains(lower, "thermal") && (strings.Contains(lower, "throttl") || strings.Contains(lower, "critical")):
 		return "thermal_throttling"
+	case strings.Contains(lower, "segfault at"):
+		return "segfault"
+	case strings.Contains(lower, "nic link is down") || strings.Contains(lower, "link is down"):
+		return "link_down"
+	case strings.Contains(lower, "nic link is up") || strings.Contains(lower, "link is up"):
+		return "link_up"
+	case strings.Contains(lower, "no space left on device"):
+		return "disk_full"
 	default:
 		return ""
 	}

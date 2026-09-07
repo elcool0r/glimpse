@@ -127,7 +127,7 @@ func TestJournalQueriesAreFilteredAndWindowed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(queries) != 2 {
+	if len(queries) != 3 {
 		t.Fatalf("queries=%q", queries)
 	}
 	auth := strings.Join(queries[0], " ")
@@ -137,7 +137,11 @@ func TestJournalQueriesAreFilteredAndWindowed(t *testing.T) {
 	if !strings.Contains(auth, "--since=-"+journalWindow) {
 		t.Fatalf("authentication query has no bounded window: %q", auth)
 	}
-	denials := strings.Join(queries[1], " ")
+	logins := strings.Join(queries[1], " ")
+	if !strings.Contains(logins, authprivFacility) || !strings.Contains(logins, "--since=-"+loginEventsWindow) {
+		t.Fatalf("login query is not a bounded, wider-window auth read: %q", logins)
+	}
+	denials := strings.Join(queries[2], " ")
 	if !strings.Contains(denials, "-k") || !strings.Contains(denials, "--since=-"+journalWindow) {
 		t.Fatalf("denial query is not a bounded kernel read: %q", denials)
 	}
@@ -165,6 +169,49 @@ func TestFailedJournalQueryIsReportedAsMissingCoverage(t *testing.T) {
 	}
 	if len(data.Diagnostics) < 2 {
 		t.Fatalf("denied journal reported as success: %+v", data.Diagnostics)
+	}
+}
+
+func TestParseLoginEventsExtractsUserSourceAndMethod(t *testing.T) {
+	input := "1700000000 danger-server sshd[12345]: Accepted publickey for daniel from 203.0.113.5 port 51000 ssh2: ED25519 SHA256:abc\n" +
+		"1700000100 danger-server sshd[12399]: Accepted password for bob from 198.51.100.7 port 51001 ssh2\n" +
+		"1700000300 danger-server sshd[12500]: Failed password for invalid user admin from 1.2.3.4 port 51010 ssh2\n"
+	got := ParseLoginEvents(input)
+	if len(got) != 2 {
+		t.Fatalf("expected 2 logins, got %#v", got)
+	}
+	if got[0].User != "daniel" || got[0].Source != "203.0.113.5" || got[0].Method != "publickey" {
+		t.Fatalf("unexpected first login: %+v", got[0])
+	}
+	if got[1].User != "bob" || got[1].Method != "password" {
+		t.Fatalf("unexpected second login: %+v", got[1])
+	}
+	if !got[0].At.Before(got[1].At) {
+		t.Fatalf("expected chronological order: %+v", got)
+	}
+}
+
+// scp defaults to the SFTP protocol since OpenSSH 9.0, and plain sftp use is
+// indistinguishable from it at this log level; both are file transfers, not
+// interactive logins, and are excluded via the sshd worker PID they share
+// with the "Accepted" line.
+func TestParseLoginEventsExcludesSFTPSessions(t *testing.T) {
+	input := "1700000200 danger-server sshd[12420]: Accepted publickey for carol from 192.0.2.9 port 51002 ssh2: ED25519 SHA256:def\n" +
+		"1700000201 danger-server sshd[12420]: subsystem request for sftp\n"
+	got := ParseLoginEvents(input)
+	if len(got) != 0 {
+		t.Fatalf("expected the sftp session excluded, got %#v", got)
+	}
+}
+
+// A PID appearing only in an unrelated line (no Accepted line at all) must
+// not fabricate a login, and lines missing the sshd[pid] identifier entirely
+// must be ignored rather than misattributed.
+func TestParseLoginEventsIgnoresNonLoginLines(t *testing.T) {
+	input := "1700000000 danger-server sudo: daniel : COMMAND=/usr/bin/systemctl restart nginx\n" +
+		"1700000100 danger-server sshd[1]: Connection closed by 203.0.113.5\n"
+	if got := ParseLoginEvents(input); len(got) != 0 {
+		t.Fatalf("expected no logins, got %#v", got)
 	}
 }
 

@@ -80,7 +80,7 @@ func TestTimelineExplainsWhenNoEventsQualify(t *testing.T) {
 	if !strings.Contains(out.String(), "Recent events (today)") {
 		t.Fatalf("expected the timeline header even with no qualifying events:\n%s", out.String())
 	}
-	if !strings.Contains(out.String(), "No kernel, container, or service events with a known time were recorded today.") {
+	if !strings.Contains(out.String(), "No kernel, container, service, package, or login events") {
 		t.Fatalf("expected an explicit empty-state message:\n%s", out.String())
 	}
 }
@@ -222,6 +222,55 @@ func TestTimelineMergesRecentStartWithLiveRestartCount(t *testing.T) {
 	}
 	if !events[0].at.Equal(now.Add(-time.Minute)) {
 		t.Fatalf("expected the merged entry to use the precise time, not \"now\": %v", events[0].at)
+	}
+}
+
+func TestTimelineIncludesPackageActivityWithSource(t *testing.T) {
+	now := localNoonToday(t)
+	report := model.Report{
+		GeneratedAt: now,
+		Metrics: model.Metrics{PackageActivity: []model.PackageActivity{
+			{At: now.Add(-2 * time.Hour), Manager: "apt", Summary: "3 packages upgraded"},
+		}},
+	}
+	events := collectTimelineEvents(report)
+	if len(events) != 1 || events[0].source != "apt" || events[0].label != "3 packages upgraded" {
+		t.Fatalf("unexpected events: %#v", events)
+	}
+}
+
+func TestTimelineIncludesLoginsWithDetail(t *testing.T) {
+	now := localNoonToday(t)
+	report := model.Report{
+		GeneratedAt: now,
+		Metrics: model.Metrics{Logins: []model.LoginEvent{
+			{At: now.Add(-time.Hour), User: "daniel", Source: "203.0.113.5", Method: "publickey"},
+		}},
+	}
+	events := collectTimelineEvents(report)
+	if len(events) != 1 || events[0].source != "ssh" {
+		t.Fatalf("expected an ssh-sourced login event: %#v", events)
+	}
+	if !strings.Contains(events[0].label, "daniel") || !strings.Contains(events[0].label, "203.0.113.5") || !strings.Contains(events[0].label, "publickey") {
+		t.Fatalf("login label missing detail: %q", events[0].label)
+	}
+}
+
+// The source tag lets a reader know which log to open next without guessing.
+func TestRenderedTimelineShowsSourceTag(t *testing.T) {
+	now := localNoonToday(t)
+	report := model.Report{
+		Host:        model.Host{Hostname: "host"},
+		GeneratedAt: now,
+		Score:       model.Score{Status: model.SeverityCritical},
+		Metrics: model.Metrics{Kernel: &model.Kernel{Available: true, Events: []model.LogEvent{
+			{Kind: "oom", Message: "Out of memory", AgeSeconds: ageSeconds(time.Minute)},
+		}}},
+	}
+	var out strings.Builder
+	Write(&out, report, Options{ASCII: true})
+	if !strings.Contains(out.String(), "[kernel]") {
+		t.Fatalf("expected a [kernel] source tag:\n%s", out.String())
 	}
 }
 

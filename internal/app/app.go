@@ -391,6 +391,12 @@ func apply(metrics *model.Metrics, data collect.Data) {
 	if data.Trends != nil {
 		metrics.Trends = data.Trends
 	}
+	if data.PackageActivity != nil {
+		metrics.PackageActivity = data.PackageActivity
+	}
+	if data.Logins != nil {
+		metrics.Logins = data.Logins
+	}
 }
 
 func compactStatuses(statuses []model.CollectionStatus) []model.CollectionStatus {

@@ -20,10 +20,13 @@ const maxTimelineEvents = 20
 // currently 95% full, a degraded RAID array) deliberately has no place here
 // -- this report cannot say when that condition started, and guessing would
 // be worse than leaving it out; that state is already reported properly
-// elsewhere (the metric row and Details).
+// elsewhere (the metric row and Details). source names where the fact came
+// from (kernel, systemd, a container runtime, apt/yum, ssh), so a reader
+// knows which log to open to dig further without guessing.
 type timelineEvent struct {
-	at    time.Time
-	label string
+	at     time.Time
+	label  string
+	source string
 }
 
 // renderTimeline prints today's notable events -- kernel/hardware faults,
@@ -42,7 +45,7 @@ func renderTimeline(w io.Writer, width int, r model.Report, color bool) {
 		// A silently empty section here is indistinguishable from the flag
 		// doing nothing; say plainly that nothing qualified rather than just
 		// omitting the section, especially since --events was asked for.
-		writeWrapped(w, width, "", "No kernel, container, or service events with a known time were recorded today.")
+		writeWrapped(w, width, "", "No kernel, container, service, package, or login events with a known time were recorded today.")
 		return
 	}
 	omitted := 0
@@ -51,7 +54,7 @@ func renderTimeline(w io.Writer, width int, r model.Report, color bool) {
 		events = events[:maxTimelineEvents]
 	}
 	for _, e := range events {
-		writeWrapped(w, width, "", fmt.Sprintf("%s  %s", metadata(e.at.Local().Format("15:04"), color), cleanText(e.label)))
+		writeWrapped(w, width, "", fmt.Sprintf("%s  %s  %s", metadata(e.at.Local().Format("15:04"), color), metadata("["+e.source+"]", color), cleanText(e.label)))
 	}
 	if omitted > 0 {
 		writeWrapped(w, width, "", fmt.Sprintf("(%d more event(s) earlier today)", omitted))
@@ -61,10 +64,10 @@ func renderTimeline(w io.Writer, width int, r model.Report, color bool) {
 // collectTimelineEvents gathers events from data this report already
 // collected. Two kinds of source exist:
 //
-//   - A real historical timestamp: kernel journal entries and container log
-//     lines both carry an age at collection time, so their actual
-//     wall-clock moment can be recovered. Anything without an age cannot be
-//     placed on the timeline and is left out (it still appears elsewhere).
+//   - A real historical timestamp: kernel journal entries, container log
+//     lines, package-manager transactions, and SSH logins all carry (or can
+//     derive) a real moment. Anything without one cannot be placed on the
+//     timeline and is left out (it still appears elsewhere).
 //   - A live fact with no historical record of when it started: a
 //     currently-failed systemd unit, a container this sample found
 //     unhealthy or OOM-killed. These are stamped "now" -- true for the
@@ -82,22 +85,22 @@ func collectTimelineEvents(r model.Report) []timelineEvent {
 	midnight := time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, local.Location())
 
 	var events []timelineEvent
-	add := func(at time.Time, label string) {
+	add := func(at time.Time, source, label string) {
 		if at.Before(midnight) {
 			return
 		}
-		events = append(events, timelineEvent{at: at, label: label})
+		events = append(events, timelineEvent{at: at, label: label, source: source})
 	}
-	addAged := func(age *float64, label string) {
+	addAged := func(age *float64, source, label string) {
 		if age == nil {
 			return
 		}
-		add(now.Add(-time.Duration(*age*float64(time.Second))), label)
+		add(now.Add(-time.Duration(*age*float64(time.Second))), source, label)
 	}
 
 	if k := r.Metrics.Kernel; k != nil {
 		for _, event := range k.Events {
-			addAged(event.AgeSeconds, cleanText(event.Message))
+			addAged(event.AgeSeconds, "kernel", cleanText(event.Message))
 		}
 	}
 
@@ -107,17 +110,18 @@ func collectTimelineEvents(r model.Report) []timelineEvent {
 			if name == "" {
 				name = c.ID
 			}
+			source := runtime.Runtime
 			switch {
 			case c.OOMKilled:
-				add(now, fmt.Sprintf("container %s was OOM-killed", name))
+				add(now, source, fmt.Sprintf("container %s was OOM-killed", name))
 			case c.Healthy != nil && !*c.Healthy:
-				add(now, fmt.Sprintf("container %s is unhealthy", name))
+				add(now, source, fmt.Sprintf("container %s is unhealthy", name))
 			}
 			if c.RestartCount > 0 {
-				add(now, fmt.Sprintf("container %s restarted (%d time(s) during the sample)", name, c.RestartCount))
+				add(now, source, fmt.Sprintf("container %s restarted (%d time(s) during the sample)", name, c.RestartCount))
 			}
 			if strings.EqualFold(c.State, "exited") && c.HasRestartPolicy {
-				add(now, fmt.Sprintf("container %s exited despite its restart policy", name))
+				add(now, source, fmt.Sprintf("container %s exited despite its restart policy", name))
 			}
 			// Only the same concrete failure signatures the analyzer treats
 			// as actionable belong on a timeline of significant events;
@@ -126,14 +130,14 @@ func collectTimelineEvents(r model.Report) []timelineEvent {
 				if !timelineSpecificLogKind(event.Kind) {
 					continue
 				}
-				addAged(event.AgeSeconds, fmt.Sprintf("container %s: %s", name, cleanText(event.Message)))
+				addAged(event.AgeSeconds, source, fmt.Sprintf("container %s: %s", name, cleanText(event.Message)))
 			}
 		}
 	}
 
 	if s := r.Metrics.Systemd; s != nil {
 		for _, unit := range s.FailedUnits {
-			add(now, fmt.Sprintf("%s failed", cleanText(unit)))
+			add(now, "systemd", fmt.Sprintf("%s failed", cleanText(unit)))
 		}
 		// RestartsDelta only sees a restart that happens to fall inside
 		// glimpse's own few-second sample -- a unit restarted a minute
@@ -152,15 +156,33 @@ func collectTimelineEvents(r model.Report) []timelineEvent {
 			if delta, ok := restartCounts[start.Unit]; ok {
 				label = fmt.Sprintf("%s restarted (%d time(s) during this sample)", cleanText(start.Unit), delta)
 			}
-			add(start.At, label)
+			add(start.At, "systemd", label)
 			reported[start.Unit] = true
 		}
 		for unit, delta := range restartCounts {
 			if reported[unit] {
 				continue
 			}
-			add(now, fmt.Sprintf("%s restarted %d time(s) during the sample", cleanText(unit), delta))
+			add(now, "systemd", fmt.Sprintf("%s restarted %d time(s) during the sample", cleanText(unit), delta))
 		}
+	}
+
+	for _, activity := range r.Metrics.PackageActivity {
+		if activity.Summary == "" {
+			continue
+		}
+		add(activity.At, activity.Manager, activity.Summary)
+	}
+
+	for _, login := range r.Metrics.Logins {
+		label := fmt.Sprintf("login: %s", cleanText(login.User))
+		if login.Source != "" {
+			label += " from " + cleanText(login.Source)
+		}
+		if login.Method != "" {
+			label += " (" + cleanText(login.Method) + ")"
+		}
+		add(login.At, "ssh", label)
 	}
 
 	return events
