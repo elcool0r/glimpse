@@ -49,12 +49,16 @@ func renderIntegrations(w io.Writer, width int, r model.Report, separator string
 				restarts++
 			}
 		}
+		// Findings own the health verdict. Counts remain useful context, but
+		// must not turn intentional exited containers or generic log wording
+		// into a warning independently of the analyzer.
 		severity := model.SeverityOK
-		if unhealthy > 0 || restarting > 0 || logIssues > 0 || exited > 0 || restarts > 0 {
-			severity = model.SeverityWarning
-		}
-		if oomKilled > 0 {
-			severity = model.SeverityCritical
+		for _, c := range runtime.Containers {
+			name := c.Name
+			if name == "" {
+				name = c.ID
+			}
+			severity = maxSeverity(severity, findingSeverityByPrefix(r.Findings, "containers", "container-"+runtime.Runtime+"-"+name+"-"))
 		}
 		text := fmt.Sprintf("%s %s  %s%s%d running", sectionLabel("Containers", severity, color), badge(severity, color), cleanText(runtime.Runtime), separator, running)
 		if runtime.LogsChecked > 0 {
@@ -171,30 +175,13 @@ func renderIntegrations(w io.Writer, width int, r model.Report, separator string
 		if raidBad > 0 {
 			severity = model.SeverityCritical
 		}
-		lvmNeedsReview := false
-		if m.LVM != nil {
-			for _, vg := range m.LVM.VolumeGroups {
-				if vg.NeedsReview {
-					lvmNeedsReview = true
-				}
-			}
-			for _, lv := range m.LVM.LogicalVolumes {
-				if lv.NeedsReview {
-					lvmNeedsReview = true
-				}
-			}
-		}
 		parts := []string{}
 		if raidCount > 0 {
 			parts = append(parts, fmt.Sprintf("RAID %d checked", raidCount))
 		}
 		if m.LVM != nil {
 			parts = append(parts, fmt.Sprintf("LVM %d PV/%d VG/%d LV", len(m.LVM.PhysicalVolumes), len(m.LVM.VolumeGroups), len(m.LVM.LogicalVolumes)))
-			if lvmNeedsReview && severityRank(model.SeverityWarning) > severityRank(severity) {
-				severity = model.SeverityWarning
-			}
 		}
-		mountsInactive := 0
 		if len(m.MountChecks) > 0 {
 			active, known := 0, 0
 			for _, mount := range m.MountChecks {
@@ -205,16 +192,13 @@ func renderIntegrations(w io.Writer, width int, r model.Report, separator string
 					active++
 				}
 			}
-			mountsInactive = known - active
 			if known == 0 {
 				parts = append(parts, fmt.Sprintf("mounts %d listed", len(m.MountChecks)))
 			} else {
 				parts = append(parts, fmt.Sprintf("mounts %d/%d active", active, len(m.MountChecks)))
 			}
-			if mountsInactive > 0 && severityRank(model.SeverityWarning) > severityRank(severity) {
-				severity = model.SeverityWarning
-			}
 		}
+		severity = sectionSeverity(r.Findings, "storage")
 		if !skip(severity) {
 			writeWrapped(w, width, "", fmt.Sprintf("%s %s  %s", sectionLabel("Storage layers", severity, color), badge(severity, color), strings.Join(parts, separator)))
 			if verbose {
@@ -252,16 +236,12 @@ func renderIntegrations(w io.Writer, width int, r model.Report, separator string
 							active++
 						}
 					}
-					mountSeverity := model.SeverityOK
-					if active < len(m.MountChecks) {
-						mountSeverity = model.SeverityWarning
-					}
+					mountSeverity := sectionSeverity(r.Findings, "storage")
 					writeWrapped(w, width, "    ", fmt.Sprintf("%s %s  persistent mounts %d/%d active", sectionLabel("Mounts", mountSeverity, color), badge(mountSeverity, color), active, len(m.MountChecks)))
 					for _, mount := range m.MountChecks {
-						itemSeverity := model.SeverityOK
+						itemSeverity := findingSeverity(r.Findings, "mount-missing-"+mount.MountPoint)
 						status := "active"
 						if mount.ActiveKnown && !mount.Active {
-							itemSeverity = model.SeverityWarning
 							status = "not active"
 						} else if !mount.ActiveKnown {
 							status = "activity unknown"
@@ -284,8 +264,8 @@ func renderIntegrations(w io.Writer, width int, r model.Report, separator string
 			if device.OverallPassed != nil && !*device.OverallPassed || device.CriticalWarning != 0 ||
 				device.PendingSectors != 0 || device.Uncorrectable != 0 || device.MediaErrors != 0 {
 				attention++
-				severity = model.SeverityCritical
 			}
+			severity = maxSeverity(severity, findingSeverity(r.Findings, "device-health-"+device.Device, "device-wear-"+device.Device))
 		}
 		text := fmt.Sprintf("%s %s  %d device(s) checked", sectionLabel("Devices", severity, color), badge(severity, color), len(m.DeviceHealth))
 		if attention > 0 {
@@ -465,8 +445,8 @@ func renderIntegrations(w io.Writer, width int, r model.Report, separator string
 	note("path-mtu")
 
 	if check := m.HTTPCheck; check != nil && check.Available {
-		httpSeverity := findingSeverity(r.Findings, "http-check-failed", "http-check-http-failed")
-		httpsSeverity := findingSeverity(r.Findings, "http-check-failed", "https-check-failed")
+		httpSeverity := findingSeverity(r.Findings, "http-check-failed", "http-check-http-failed", "http-check-proxy-used")
+		httpsSeverity := findingSeverity(r.Findings, "http-check-failed", "https-check-failed", "http-check-proxy-used")
 		severity := httpSeverity
 		if severityRank(httpsSeverity) > severityRank(severity) {
 			severity = httpsSeverity
@@ -481,14 +461,22 @@ func renderIntegrations(w io.Writer, width int, r model.Report, separator string
 			return "failed"
 		}
 		if !skip(severity) {
-			writeWrapped(w, width, "", fmt.Sprintf("%s %s  http: %s%shttps: %s", sectionLabel("HTTP checks", severity, color), badge(severity, color), summary(check.HTTP), separator, summary(check.HTTPS)))
+			proxyText := ""
+			if check.HTTP != nil && check.HTTP.ProxyUsed || check.HTTPS != nil && check.HTTPS.ProxyUsed {
+				proxyText = separator + "proxy used"
+			}
+			writeWrapped(w, width, "", fmt.Sprintf("%s %s  http: %s%shttps: %s%s", sectionLabel("HTTP checks", severity, color), badge(severity, color), summary(check.HTTP), separator, summary(check.HTTPS), proxyText))
 			if verbose {
 				detail := func(result *model.HTTPCheckResult) string {
 					if result == nil {
 						return "not attempted"
 					}
 					if result.Succeeded {
-						return fmt.Sprintf("%s -> %d in %.0fms", result.URL, result.StatusCode, result.LatencyMillis)
+						detail := fmt.Sprintf("%s -> %d in %.0fms", result.URL, result.StatusCode, result.LatencyMillis)
+						if result.ProxyUsed {
+							detail += separator + "proxy used"
+						}
+						return detail
 					}
 					return fmt.Sprintf("%s failed: %s", result.URL, result.Error)
 				}
@@ -586,10 +574,7 @@ func renderIntegrations(w io.Writer, width int, r model.Report, separator string
 	note("hardware-errors")
 
 	if k := m.Kernel; k != nil && k.Available {
-		severity := model.SeverityOK
-		if len(k.Events) > 0 {
-			severity = model.SeverityInfo
-		}
+		severity := sectionSeverity(r.Findings, "kernel")
 		if !skip(severity) {
 			writeWrapped(w, width, "", fmt.Sprintf("%s %s  %d pattern match(es) in kernel log", sectionLabel("Kernel", severity, color), badge(severity, color), len(k.Events)))
 			if verbose {
@@ -600,10 +585,9 @@ func renderIntegrations(w io.Writer, width int, r model.Report, separator string
 				for _, kind := range kernelPatternKinds {
 					count := counts[kind]
 					delete(counts, kind)
-					lineSeverity := model.SeverityOK
+					lineSeverity := findingSeverity(r.Findings, "kernel-"+kind)
 					detail := "no matches"
 					if count > 0 {
-						lineSeverity = model.SeverityInfo
 						detail = fmt.Sprintf("%d match(es)", count)
 					}
 					checkLine(w, width, "    ", strings.ReplaceAll(kind, "_", " "), lineSeverity, color, detail)
@@ -616,7 +600,7 @@ func renderIntegrations(w io.Writer, width int, r model.Report, separator string
 				}
 				sort.Strings(unknown)
 				for _, kind := range unknown {
-					checkLine(w, width, "    ", strings.ReplaceAll(kind, "_", " "), model.SeverityInfo, color, fmt.Sprintf("%d match(es)", counts[kind]))
+					checkLine(w, width, "    ", strings.ReplaceAll(kind, "_", " "), findingSeverity(r.Findings, "kernel-"+kind), color, fmt.Sprintf("%d match(es)", counts[kind]))
 				}
 			}
 		}
@@ -624,27 +608,18 @@ func renderIntegrations(w io.Writer, width int, r model.Report, separator string
 	note("kernel")
 
 	if security := m.Security; security != nil && security.Available {
-		severity := model.SeverityOK
-		if security.SELinuxDenials != nil && *security.SELinuxDenials > 0 || security.AppArmorDenials != nil && *security.AppArmorDenials > 0 {
-			severity = model.SeverityWarning
-		}
+		severity := sectionSeverity(r.Findings, "security")
 		if !skip(severity) {
 			writeWrapped(w, width, "", fmt.Sprintf("%s %s  SELinux %s%sAppArmor %s%ssecurity sources checked", sectionLabel("Security", severity, color), badge(severity, color), cleanText(security.SELinux), separator, cleanText(security.AppArmor), separator))
 			if verbose {
-				selinuxSeverity := model.SeverityOK
-				if security.SELinuxDenials != nil && *security.SELinuxDenials > 0 {
-					selinuxSeverity = model.SeverityWarning
-				}
+				selinuxSeverity := maxSeverity(findingSeverity(r.Findings, "security-selinux-denials"), findingSeverity(r.Findings, "security-selinux-permissive"))
 				selinuxDetail := cleanText(security.SELinux)
 				if security.SELinuxDenials != nil {
 					selinuxDetail += fmt.Sprintf("%s%d denial(s)", separator, *security.SELinuxDenials)
 				}
 				checkLine(w, width, "    ", "SELinux", selinuxSeverity, color, selinuxDetail)
 
-				apparmorSeverity := model.SeverityOK
-				if security.AppArmorDenials != nil && *security.AppArmorDenials > 0 {
-					apparmorSeverity = model.SeverityWarning
-				}
+				apparmorSeverity := findingSeverity(r.Findings, "security-apparmor-denials")
 				apparmorDetail := cleanText(security.AppArmor)
 				if security.AppArmorDenials != nil {
 					apparmorDetail += fmt.Sprintf("%s%d denial(s)", separator, *security.AppArmorDenials)
@@ -664,31 +639,34 @@ func renderIntegrations(w io.Writer, width int, r model.Report, separator string
 					}
 				}
 				checkLine(w, width, "    ", "Kernel taint", taintSeverity, color, taintDetail)
+			} else if security.KernelTaintMask != 0 {
+				taintDetail := fmt.Sprintf("mask %d", security.KernelTaintMask)
+				if len(security.KernelTaintModules) > 0 {
+					taintDetail += " (modules " + cleanText(strings.Join(security.KernelTaintModules, ",")) + ")"
+				}
+				checkLine(w, width, "    ", "Kernel taint", model.SeverityInfo, color, taintDetail)
 			}
 		}
 	}
 	note("security")
 
-	if cgroup := m.CgroupV2; cgroup != nil && cgroup.Available && !skip(model.SeverityOK) {
-		writeWrapped(w, width, "", fmt.Sprintf("%s %s  containerized: %t", sectionLabel("Cgroup v2", model.SeverityOK, color), badge(model.SeverityOK, color), cgroup.Containerized))
+	if cgroup := m.CgroupV2; cgroup != nil && cgroup.Available {
+		severity := sectionSeverity(r.Findings, "cgroup")
+		if skip(severity) {
+			return
+		}
+		writeWrapped(w, width, "", fmt.Sprintf("%s %s  containerized: %t", sectionLabel("Cgroup v2", severity, color), badge(severity, color), cgroup.Containerized))
 		if verbose {
 			checkLine(w, width, "    ", "Path", model.SeverityOK, color, cleanText(cgroup.Path))
 			if cgroup.MemoryMaxBytes != nil && *cgroup.MemoryMaxBytes > 0 {
 				fraction := float64(cgroup.MemoryCurrentBytes) * 100 / float64(*cgroup.MemoryMaxBytes)
-				memSeverity := model.SeverityOK
-				if fraction >= 95 {
-					memSeverity = model.SeverityWarning
-				}
+				memSeverity := findingSeverity(r.Findings, "cgroup-memory-limit")
 				checkLine(w, width, "    ", "Memory limit", memSeverity, color, fmt.Sprintf("%.0f%% used", fraction))
 			} else {
 				checkLine(w, width, "    ", "Memory limit", model.SeverityOK, color, "none set")
 			}
 			if cgroup.PIDsMax != nil && *cgroup.PIDsMax > 0 {
-				fraction := float64(cgroup.PIDsCurrent) * 100 / float64(*cgroup.PIDsMax)
-				pidSeverity := model.SeverityOK
-				if fraction >= 95 {
-					pidSeverity = model.SeverityWarning
-				}
+				pidSeverity := findingSeverity(r.Findings, "cgroup-pids-limit")
 				checkLine(w, width, "    ", "PID limit", pidSeverity, color, fmt.Sprintf("%d/%d", cgroup.PIDsCurrent, *cgroup.PIDsMax))
 			} else {
 				checkLine(w, width, "    ", "PID limit", model.SeverityOK, color, "none set")

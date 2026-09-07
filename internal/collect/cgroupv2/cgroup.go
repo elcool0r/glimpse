@@ -148,7 +148,14 @@ func counterDelta(before, after uint64) uint64 {
 	return after - before
 }
 func isContainerized(path string) bool {
-	if strings.Contains(path, "docker") || strings.Contains(path, "kubepods") || strings.Contains(path, "libpod") || strings.Contains(path, "containerd") {
+	path = strings.ToLower(path)
+	if strings.Contains(path, "docker") || strings.Contains(path, "kubepods") || strings.Contains(path, "libpod") || strings.Contains(path, "containerd") || strings.Contains(path, "lxc") {
+		return true
+	}
+	// systemd-nspawn units live below machine.slice as machine-<name>.scope.
+	// Restrict this match to that exact hierarchy so an unrelated user-created
+	// scope named machine-* is not described as a container.
+	if strings.Contains(path, "/machine.slice/machine-") && strings.HasSuffix(path, ".scope") {
 		return true
 	}
 	_, d := os.Stat("/.dockerenv")

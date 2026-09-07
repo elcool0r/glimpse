@@ -30,3 +30,18 @@ func TestCounterDelta(t *testing.T) {
 		t.Fatal("bad delta")
 	}
 }
+
+func TestIsContainerizedRecognizesLXCAndSystemdNspawn(t *testing.T) {
+	for _, path := range []string{
+		"/lxc.payload.web",
+		"/lxc/web",
+		"/machine.slice/machine-build.scope",
+	} {
+		if !isContainerized(path) {
+			t.Fatalf("%q was not recognized as containerized", path)
+		}
+	}
+	if isContainerized("/user.slice/user-1000.slice/session-2.scope") {
+		t.Fatal("ordinary user scope must not be classified as containerized")
+	}
+}

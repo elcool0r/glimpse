@@ -2,6 +2,8 @@ package networkstate
 
 import (
 	"reflect"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/elcool0r/glimpse/internal/model"
@@ -13,6 +15,30 @@ func TestParseListeningSockets(t *testing.T) {
 	want := []model.ListeningSocket{{Protocol: "tcp", Address: "127.0.0.1", Port: 53}, {Protocol: "udp", Address: "::", Port: 5353}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("got %#v want %#v", got, want)
+	}
+}
+
+func TestBoundedInventoriesReportReducedCoverage(t *testing.T) {
+	var sockets strings.Builder
+	for i := 0; i <= maxSockets; i++ {
+		sockets.WriteString("tcp LISTEN 0 4096 127.0.0.1:")
+		sockets.WriteString(strconv.Itoa(10000 + i))
+		sockets.WriteString(" 0.0.0.0:*\n")
+	}
+	listeners, listenersLimited := parseListeningSocketsBounded(sockets.String())
+	if len(listeners) != maxSockets || !listenersLimited {
+		t.Fatalf("listeners=%d limited=%v", len(listeners), listenersLimited)
+	}
+
+	var routes strings.Builder
+	for i := 0; i <= maxRoutes; i++ {
+		routes.WriteString("192.0.2.")
+		routes.WriteString(strconv.Itoa(i))
+		routes.WriteString("/32 dev eth0\n")
+	}
+	parsedRoutes, routesLimited := parseRoutesBounded(routes.String())
+	if len(parsedRoutes) != maxRoutes || !routesLimited {
+		t.Fatalf("routes=%d limited=%v", len(parsedRoutes), routesLimited)
 	}
 }
 

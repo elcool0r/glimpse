@@ -57,6 +57,73 @@ func TestReadSnapshotKeepsPhysicalDisksAndDropsVirtualLayers(t *testing.T) {
 	}
 }
 
+func TestReadSnapshotDropsPartitionsWithoutSysfsTopology(t *testing.T) {
+	root := t.TempDir()
+	procRoot := filepath.Join(root, "proc")
+	sysRoot := filepath.Join(root, "sys")
+	if err := os.MkdirAll(procRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	const stats = "8 0 sda 1 0 1 1 1 0 1 1 0 1 1\n8 1 sda1 1 0 1 1 1 0 1 1 0 1 1\n259 0 nvme0n1 1 0 1 1 1 0 1 1 0 1 1\n259 1 nvme0n1p1 1 0 1 1 1 0 1 1 0 1 1\n"
+	if err := os.WriteFile(filepath.Join(procRoot, "diskstats"), []byte(stats), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := ReadSnapshot(context.Background(), procRoot, sysRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := names(snapshot.Devices); strings.Join(got, ",") != "nvme0n1,sda" {
+		t.Fatalf("devices = %v, want whole disks only", got)
+	}
+}
+
+func TestPhysicalDeviceNameRejectsPrefixesAndPartitions(t *testing.T) {
+	for _, name := range []string{"sda1", "nvme0n1p1", "mmcblk0p1", "xvda1", "not-a-disk"} {
+		if physicalDeviceName(name) {
+			t.Fatalf("physicalDeviceName(%q) = true, want false", name)
+		}
+	}
+	for _, name := range []string{"sda", "vda", "xvda", "nvme0n1", "mmcblk0"} {
+		if !physicalDeviceName(name) {
+			t.Fatalf("physicalDeviceName(%q) = false, want true", name)
+		}
+	}
+}
+
+func TestReadSnapshotDropsPartitionFromDeviceTopology(t *testing.T) {
+	root := t.TempDir()
+	procRoot := filepath.Join(root, "proc")
+	sysRoot := filepath.Join(root, "sys")
+	if err := os.MkdirAll(filepath.Join(procRoot), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(procRoot, "diskstats"), []byte("8 1 sda1 1 0 1 1 1 0 1 1 0 1 1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	partition := filepath.Join(sysRoot, "dev", "block", "8:1", "partition")
+	if err := os.MkdirAll(filepath.Dir(partition), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(partition, []byte("1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := ReadSnapshot(context.Background(), procRoot, sysRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snapshot.Devices) != 0 {
+		t.Fatalf("devices = %#v, want partition excluded", snapshot.Devices)
+	}
+}
+
+func names(devices []Device) []string {
+	result := make([]string, len(devices))
+	for i, device := range devices {
+		result[i] = device.Name
+	}
+	return result
+}
+
 func TestParseDiskStatsRejectsMalformed(t *testing.T) {
 	if _, err := ParseDiskStats(strings.NewReader("8 0 sda 1 2\n")); err == nil {
 		t.Fatal("expected malformed input error")

@@ -101,6 +101,7 @@ func (c *Collector) Collect(ctx context.Context) (collect.Data, error) {
 	if err != nil {
 		return collect.Data{Diagnostics: []model.CollectionStatus{{Status: "unavailable", Detail: "proc: " + err.Error()}}}, nil
 	}
+	processesEligible := countEligibleProcesses(entries)
 
 	files := make(map[inodeKey]*model.DeletedFile)
 	holderSlot := make(map[inodeKey]map[int]int) // inodeKey -> pid -> index into that file's Holders
@@ -159,7 +160,7 @@ func (c *Collector) Collect(ctx context.Context) (collect.Data, error) {
 
 			file, seen := files[key]
 			if !seen {
-				bytes := allocatedBytes(stat, info.Size())
+				bytes := allocatedBytes(stat)
 				file = &model.DeletedFile{
 					Device: formatDevice(uint64(stat.Dev)),
 					Inode:  stat.Ino,
@@ -202,10 +203,24 @@ func (c *Collector) Collect(ctx context.Context) (collect.Data, error) {
 	return collect.Data{DeletedFiles: &model.DeletedFiles{
 		Available: true, TotalBytes: total, Files: reported,
 		UniqueFiles: len(files), ProcessesHolding: len(holdingPIDs), TotalReferences: references,
-		ProcessesScanned: scanned, ProcessesSkipped: skipped,
-		LargestHolderPID: holderPID, LargestHolderCommand: holderCommand,
+		ProcessesScanned: scanned, ProcessesSkipped: skipped, ProcessesEligible: processesEligible,
+		ProcessScanLimited: processesEligible > maxProcesses,
+		LargestHolderPID:   holderPID, LargestHolderCommand: holderCommand,
 		LargestHolderBytes: holderBytes, LargestHolderFileCount: holderFileCount,
 	}}, nil
+}
+
+func countEligibleProcesses(entries []os.DirEntry) int {
+	eligible := 0
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		if _, err := strconv.Atoi(entry.Name()); err == nil {
+			eligible++
+		}
+	}
+	return eligible
 }
 
 // largestHolder sums, per process, the bytes of each unique file it holds
@@ -239,20 +254,11 @@ func largestHolder(order []inodeKey, files map[inodeKey]*model.DeletedFile) (pid
 	return pid, commands[pid], bytes, counts[pid]
 }
 
-// allocatedBytes prefers actual allocated filesystem space (st_blocks * 512)
-// over logical size: a sparse file's st_size can vastly overstate how much
-// disk it actually occupies. It falls back to the logical size only when
-// blocks are unavailable (stat.Blocks is zero for a genuinely empty/fully
-// sparse file too, in which case the two agree at zero or the fallback is
-// harmless).
-func allocatedBytes(stat *syscall.Stat_t, logicalSize int64) uint64 {
-	if stat.Blocks > 0 {
-		return uint64(stat.Blocks) * 512
-	}
-	if logicalSize > 0 {
-		return uint64(logicalSize)
-	}
-	return 0
+// allocatedBytes reports actual allocated filesystem space. st_blocks uses
+// 512-byte units on Linux, and a valid zero value means a fully sparse or
+// empty file consumes no disk blocks even when its logical size is enormous.
+func allocatedBytes(stat *syscall.Stat_t) uint64 {
+	return uint64(stat.Blocks) * 512
 }
 
 // formatDevice renders a raw dev_t as the familiar "major:minor" form (as

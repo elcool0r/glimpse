@@ -59,6 +59,17 @@ func TestRequireLongOptions(t *testing.T) {
 	}
 }
 
+func TestNoProxyFlagDefaultsFalseAndCanBeEnabled(t *testing.T) {
+	fs := flag.NewFlagSet("glimpse", flag.ContinueOnError)
+	f := registerFlags(fs)
+	if *f.noProxy {
+		t.Fatal("--no-proxy default must preserve environment proxy support")
+	}
+	if err := fs.Parse([]string{"--no-proxy"}); err != nil || !*f.noProxy {
+		t.Fatalf("--no-proxy was not parsed: value=%t err=%v", *f.noProxy, err)
+	}
+}
+
 type brokenWriter struct{}
 
 func (brokenWriter) Write([]byte) (int, error) { return 0, io.ErrClosedPipe }

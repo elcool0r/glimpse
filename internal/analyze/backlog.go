@@ -190,9 +190,9 @@ func dnsResolutionFindings(resolution *model.DNSResolution) []model.Finding {
 			fmt.Sprintf("Resolving %s against the configured nameserver (%s) failed, but the same query succeeded against %s.", resolution.Local.Domain, resolution.Local.Server, resolution.External.Server),
 			"Inspect the local DNS server or forwarder; clients depending on it cannot resolve names.", 15)}
 	case externalAttempted && !externalOK:
-		return []model.Finding{finding("dns-resolution-external-failed", model.SeverityCritical, "network", "External DNS server unreachable",
-			fmt.Sprintf("Resolving %s against %s failed, though the local nameserver resolves it. If this is not an intentionally firewalled host, outbound DNS to the public internet is broken.", resolution.External.Domain, resolution.External.Server),
-			"Confirm whether outbound DNS to public resolvers is intentionally restricted; if not, inspect the network path and firewall rules for UDP/TCP 53 to public resolvers.", 15)}
+		return []model.Finding{finding("dns-resolution-external-failed", model.SeverityInfo, "network", "External DNS server unreachable",
+			fmt.Sprintf("Resolving %s against %s failed, though the configured nameserver resolves it. This tests direct DNS access to that external resolver only.", resolution.External.Domain, resolution.External.Server),
+			"Confirm whether direct DNS to this resolver is intentionally restricted; if not, inspect the network path and firewall rules for UDP/TCP 53.", 0)}
 	}
 	return dnsLatencyFindings(resolution)
 }
@@ -311,23 +311,29 @@ func httpCheckFindings(check *model.HTTPCheck) []model.Finding {
 	if check == nil || !check.Available {
 		return nil
 	}
+	var findings []model.Finding
+	if check.HTTP != nil && check.HTTP.ProxyUsed || check.HTTPS != nil && check.HTTPS.ProxyUsed {
+		findings = append(findings, finding("http-check-proxy-used", model.SeverityInfo, "network", "HTTP checks used an environment proxy",
+			"At least one HTTP connectivity probe used the proxy selected by HTTP_PROXY, HTTPS_PROXY, or NO_PROXY.",
+			"No action needed; run with --no-proxy to test direct HTTP connectivity instead.", 0))
+	}
 	httpFailed := check.HTTP != nil && !check.HTTP.Succeeded
 	httpsFailed := check.HTTPS != nil && !check.HTTPS.Succeeded
 	switch {
 	case httpFailed && httpsFailed:
-		return []model.Finding{finding("http-check-failed", model.SeverityCritical, "network", "Outbound HTTP and HTTPS requests are both failing",
+		findings = append(findings, finding("http-check-failed", model.SeverityWarning, "network", "HTTP and HTTPS requests are both failing",
 			fmt.Sprintf("A GET to %s failed (%s) and a GET to %s failed (%s).", check.HTTP.URL, check.HTTP.Error, check.HTTPS.URL, check.HTTPS.Error),
-			"Confirm whether outbound web access is intentionally restricted (firewall, proxy, air-gapped network); if not, this host has no working outbound web access at all.", 15)}
+			"Confirm proxy policy and reachability, or inspect firewall and routing policy for direct checks.", 8))
 	case httpsFailed:
-		return []model.Finding{finding("https-check-failed", model.SeverityWarning, "network", "Outbound HTTPS request failed while HTTP succeeded",
+		findings = append(findings, finding("https-check-failed", model.SeverityWarning, "network", "HTTPS request failed while HTTP succeeded",
 			fmt.Sprintf("A GET to %s failed: %s", check.HTTPS.URL, check.HTTPS.Error),
-			"Inspect TLS interception, certificate trust, or firewalling of port 443 specifically.", 8)}
+			"Inspect TLS interception, certificate trust, or firewalling of port 443 specifically.", 8))
 	case httpFailed:
-		return []model.Finding{finding("http-check-http-failed", model.SeverityWarning, "network", "Outbound HTTP request failed while HTTPS succeeded",
+		findings = append(findings, finding("http-check-http-failed", model.SeverityWarning, "network", "HTTP request failed while HTTPS succeeded",
 			fmt.Sprintf("A GET to %s failed: %s", check.HTTP.URL, check.HTTP.Error),
-			"This is unusual since HTTPS succeeded; inspect port 80 filtering specifically.", 8)}
+			"This is unusual since HTTPS succeeded; inspect port 80 filtering specifically.", 8))
 	}
-	return nil
+	return findings
 }
 
 // externalLatencyWarningMillis and externalLatencyCriticalMillis are looser
@@ -351,9 +357,9 @@ func icmpCheckFindings(check *model.ICMPCheck) []model.Finding {
 		return nil
 	}
 	if check.Received == 0 {
-		return []model.Finding{finding("icmp-external-unreachable", model.SeverityCritical, "network", "External network is not reachable via ICMP",
-			fmt.Sprintf("All %d ICMP echo requests to %s went unanswered, even though this is independent of the default gateway check.", check.Sent, check.Target),
-			"Inspect outbound ICMP filtering, the upstream network path, and whether this host has working internet access at all.", 20)}
+		return []model.Finding{finding("icmp-external-unreachable", model.SeverityInfo, "network", "External ICMP probe received no replies",
+			fmt.Sprintf("All %d ICMP echo requests to %s went unanswered. This tests ICMP reachability to that target only.", check.Sent, check.Target),
+			"Confirm whether ICMP is intentionally filtered; correlate with DNS or HTTP checks before diagnosing broader connectivity.", 0)}
 	}
 	var findings []model.Finding
 	if check.PacketLossPct >= 50 {
@@ -382,9 +388,9 @@ func ipv6CheckFindings(check *model.IPv6Check) []model.Finding {
 		return nil
 	}
 	if check.Received == 0 {
-		return []model.Finding{finding("ipv6-unreachable", model.SeverityCritical, "network", "IPv6 is configured but unreachable",
+		return []model.Finding{finding("ipv6-unreachable", model.SeverityWarning, "network", "IPv6 ICMP probe received no replies",
 			fmt.Sprintf("This host has a global IPv6 address, but all %d ICMPv6 echo requests to %s went unanswered.", check.Sent, check.Target),
-			"Inspect IPv6 firewall rules, the upstream IPv6 path, and router/prefix advertisements.", 15)}
+			"Inspect IPv6 firewall rules, the upstream IPv6 path, and router/prefix advertisements; confirm with an application-level IPv6 check if IPv6 service reachability matters.", 8)}
 	}
 	if check.PacketLossPct >= 50 {
 		return []model.Finding{finding("ipv6-packet-loss", model.SeverityWarning, "network", "IPv6 packets are being dropped",

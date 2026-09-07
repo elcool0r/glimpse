@@ -133,7 +133,7 @@ func Report(report *model.Report) {
 	findings = append(findings, backlogFindings(report)...)
 	sort.Slice(findings, func(i, j int) bool { return rank(findings[i].Severity) > rank(findings[j].Severity) })
 	report.Findings = findings
-	if insufficientCoverage(report) && !hasHealthFailure(findings) {
+	if insufficientCoverage(report) {
 		report.Score = model.Score{Value: 0, Status: model.SeverityUnknown, Label: "INSUFFICIENT DATA"}
 		return
 	}
@@ -252,8 +252,8 @@ func cgroupFindings(cgroup *model.CgroupV2, pressure *model.Pressure) []model.Fi
 	if cgroup.PIDsMax != nil && *cgroup.PIDsMax > 0 && fraction(cgroup.PIDsCurrent, *cgroup.PIDsMax) >= .95 {
 		findings = append(findings, finding("cgroup-pids-limit", model.SeverityWarning, "cgroup", "Cgroup PID limit nearly exhausted", fmt.Sprintf("The current cgroup uses %d of %d allowed PIDs.", cgroup.PIDsCurrent, *cgroup.PIDsMax), "Inspect process growth and raise the cgroup PID limit only if demand is expected.", 10))
 	}
-	if cgroup.Containerized && cgroup.MemoryMaxBytes != nil && *cgroup.MemoryMaxBytes > 0 && fraction(cgroup.MemoryCurrentBytes, *cgroup.MemoryMaxBytes) >= .95 && (cgroup.MemoryOOMDelta > 0 || cgroup.MemoryOOMKillDelta > 0 || pressure != nil && pressure.Memory.SomeAvg10 >= 1) {
-		findings = append(findings, finding("cgroup-memory-limit", model.SeverityWarning, "cgroup", "Container memory limit under pressure", fmt.Sprintf("The current cgroup uses %.1f%% of its %s memory limit with corroborating memory pressure.", fraction(cgroup.MemoryCurrentBytes, *cgroup.MemoryMaxBytes)*100, bytes(*cgroup.MemoryMaxBytes)), "Inspect the container memory limit and workload memory demand.", 12))
+	if cgroup.MemoryMaxBytes != nil && *cgroup.MemoryMaxBytes > 0 && fraction(cgroup.MemoryCurrentBytes, *cgroup.MemoryMaxBytes) >= .95 && (cgroup.MemoryOOMDelta > 0 || cgroup.MemoryOOMKillDelta > 0 || pressure != nil && pressure.Memory.SomeAvg10 >= 1) {
+		findings = append(findings, finding("cgroup-memory-limit", model.SeverityWarning, "cgroup", "Cgroup memory limit under pressure", fmt.Sprintf("The current cgroup uses %.1f%% of its %s memory limit with corroborating memory pressure.", fraction(cgroup.MemoryCurrentBytes, *cgroup.MemoryMaxBytes)*100, bytes(*cgroup.MemoryMaxBytes)), "Inspect the cgroup memory limit and workload memory demand.", 12))
 	}
 	return findings
 }
@@ -766,14 +766,6 @@ func usableMetrics(m model.Metrics) bool {
 }
 
 func usableCPU(cpu *model.CPU) bool { return cpu != nil && (cpu.Sampled == nil || *cpu.Sampled) }
-func hasHealthFailure(findings []model.Finding) bool {
-	for _, f := range findings {
-		if rank(f.Severity) >= rank(model.SeverityWarning) {
-			return true
-		}
-	}
-	return false
-}
 
 // insufficientCoverage reports whether the report lacks the observations a
 // verdict needs. An interrupted run qualifies; a boundary that ran out of its

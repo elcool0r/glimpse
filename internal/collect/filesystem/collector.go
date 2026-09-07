@@ -17,7 +17,7 @@ func (Collector) Name() string { return "filesystems" }
 func (Collector) Static() {}
 
 func (c Collector) Collect(ctx context.Context) (collect.Data, error) {
-	usages, err := Collect(ctx, c.ProcRoot)
+	usages, excluded, err := CollectWithExclusions(ctx, c.ProcRoot)
 	filesystems := make([]model.Filesystem, 0, len(usages))
 	for _, usage := range usages {
 		filesystems = append(filesystems, model.Filesystem{
@@ -27,5 +27,9 @@ func (c Collector) Collect(ctx context.Context) (collect.Data, error) {
 			InodesFree: usage.FreeInodes, ReadOnly: usage.ReadOnly,
 		})
 	}
-	return collect.Data{Filesystems: filesystems}, err
+	data := collect.Data{Filesystems: filesystems}
+	if detail := ExclusionDiagnostic(excluded); detail != "" {
+		data.Diagnostics = []model.CollectionStatus{{Status: "unavailable", Detail: detail}}
+	}
+	return data, err
 }

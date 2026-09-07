@@ -10,12 +10,12 @@ func icmpReport(check *model.ICMPCheck) model.Report {
 	return model.Report{Metrics: model.Metrics{CPU: &model.CPU{}, ICMPCheck: check}}
 }
 
-func TestICMPExternalNoReplyIsCritical(t *testing.T) {
+func TestICMPExternalNoReplyIsInformational(t *testing.T) {
 	report := icmpReport(&model.ICMPCheck{Available: true, Target: "1.1.1.1", Sent: 3, Received: 0, PacketLossPct: 100})
 	Report(&report)
 	found := findingByID(report, "icmp-external-unreachable")
-	if found == nil || found.Severity != model.SeverityCritical {
-		t.Fatalf("expected a critical finding when ICMP is fully blocked: %+v", report.Findings)
+	if found == nil || found.Severity != model.SeverityInfo {
+		t.Fatalf("expected an informational finding when ICMP is fully blocked: %+v", report.Findings)
 	}
 }
 
@@ -56,12 +56,12 @@ func ipv6Report(check *model.IPv6Check) model.Report {
 	return model.Report{Metrics: model.Metrics{CPU: &model.CPU{}, IPv6Check: check}}
 }
 
-func TestIPv6UnreachableIsCritical(t *testing.T) {
+func TestIPv6UnreachableIsWarning(t *testing.T) {
 	report := ipv6Report(&model.IPv6Check{Available: true, Target: "2606:4700:4700::1111", Sent: 3, Received: 0, PacketLossPct: 100})
 	Report(&report)
 	found := findingByID(report, "ipv6-unreachable")
-	if found == nil || found.Severity != model.SeverityCritical {
-		t.Fatalf("expected a critical finding when IPv6 is configured but unreachable: %+v", report.Findings)
+	if found == nil || found.Severity != model.SeverityWarning {
+		t.Fatalf("expected a warning finding when IPv6 ICMP is fully blocked: %+v", report.Findings)
 	}
 }
 

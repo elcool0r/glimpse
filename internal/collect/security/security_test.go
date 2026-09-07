@@ -182,6 +182,14 @@ func TestJournalQueriesAreFilteredAndWindowed(t *testing.T) {
 	}
 }
 
+func TestJournalTimeoutDiagnosticExplainsMissingCoverage(t *testing.T) {
+	detail := journalQueryDiagnostic("authentication journal", "failed-authentication counts for the last hour", defaultCommandTimeout, context.DeadlineExceeded)
+	want := "authentication journal query timed out after 10s; failed-authentication counts for the last hour were not collected"
+	if detail != want {
+		t.Fatalf("detail = %q, want %q", detail, want)
+	}
+}
+
 func TestFailedJournalQueryIsReportedAsMissingCoverage(t *testing.T) {
 	c := New()
 	c.readFile = func(string) ([]byte, error) { return nil, os.ErrNotExist }

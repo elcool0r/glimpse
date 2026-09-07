@@ -62,6 +62,49 @@ func TestPotentiallyBlockingFilesystemsAreNeverProbed(t *testing.T) {
 	}
 }
 
+func TestPotentiallyBlockingFilesystemExclusionsAreReported(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "self"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	input := "1 0 0:1 / /remote-a rw - nfs remote:/a rw\n2 0 0:2 / /remote-b rw - nfs remote:/b rw\n3 0 0:3 / /fuse rw - fuse.sshfs host:/data rw\n4 0 0:4 / /local rw - ext4 /dev/sda rw\n"
+	if err := os.WriteFile(filepath.Join(root, "self", "mountinfo"), []byte(input), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, excluded, err := collectWithStatfsWithExclusions(context.Background(), root, func(_ string, st *syscall.Statfs_t) error {
+		st.Bsize, st.Blocks, st.Bfree = 4096, 100, 50
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := excluded, []Exclusion{{Type: "fuse.sshfs", Count: 1}, {Type: "nfs", Count: 2}}; len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("exclusions=%#v, want %#v", got, want)
+	}
+	const wantDetail = "filesystem coverage reduced: skipped 3 potentially blocking mount(s) (fuse.sshfs=1, nfs=2)"
+	if got := ExclusionDiagnostic(excluded); got != wantDetail {
+		t.Fatalf("diagnostic=%q, want %q", got, wantDetail)
+	}
+}
+
+func TestCollectorPublishesExclusionsAsCoverageDiagnostics(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "self"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	input := "1 0 0:1 / /remote rw - nfs remote:/data rw\n"
+	if err := os.WriteFile(filepath.Join(root, "self", "mountinfo"), []byte(input), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	data, err := (Collector{ProcRoot: root}).Collect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data.Diagnostics) != 1 || data.Diagnostics[0].Status != "unavailable" || data.Diagnostics[0].Detail != "filesystem coverage reduced: skipped 1 potentially blocking mount(s) (nfs=1)" {
+		t.Fatalf("diagnostics=%#v", data.Diagnostics)
+	}
+}
+
 // Capacity is measured against space a normal process can use, which is what
 // df reports. Dividing by total capacity counts the root reserve as free, so a
 // default ext4 read several points more optimistic than df and the "nearly

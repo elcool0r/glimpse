@@ -12,6 +12,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/elcool0r/glimpse/internal/collect"
@@ -26,25 +27,20 @@ const (
 	timeout = 5 * time.Second
 )
 
-// client forces IPv4 connections. Without this, a dual-stack host that
-// blocks only IPv4 egress (the common way to test this with plain iptables,
-// which does not touch IPv6 at all) would silently succeed over IPv6
-// instead, hiding exactly the fault this check exists to catch. IPv6
-// reachability has its own dedicated check (internal/collect/ipv6check).
-var client = &http.Client{
-	Transport: &http.Transport{
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return (&net.Dialer{}).DialContext(ctx, "tcp4", addr)
-		},
-	},
-}
-
 type Collector struct {
-	get func(ctx context.Context, url string) (status int, latency time.Duration, err error)
+	get   func(ctx context.Context, url string) (status int, latency time.Duration, err error)
+	proxy func(*http.Request) (*url.URL, error)
 }
 
-func New() *Collector {
-	return &Collector{get: doGet}
+// New honors HTTP_PROXY, HTTPS_PROXY, and NO_PROXY by default. Passing true
+// disables proxy discovery for this collector only, preserving direct IPv4
+// probing for users who explicitly request --no-proxy.
+func New(disableProxy ...bool) *Collector {
+	proxy := http.ProxyFromEnvironment
+	if len(disableProxy) > 0 && disableProxy[0] {
+		proxy = func(*http.Request) (*url.URL, error) { return nil, nil }
+	}
+	return &Collector{proxy: proxy}
 }
 
 func (c *Collector) Name() string { return "http-check" }
@@ -56,14 +52,16 @@ func (c *Collector) Static() {}
 func (c *Collector) Collect(parent context.Context) (collect.Data, error) {
 	get := c.get
 	if get == nil {
-		get = doGet
+		get = c.doGet
 	}
 	check := &model.HTTPCheck{Available: true}
 	check.HTTP = probe(parent, get, "http://"+target+"/")
+	check.HTTP.ProxyUsed = c.proxyUsed(parent, check.HTTP.URL)
 	if parent.Err() != nil {
 		return collect.Data{}, parent.Err()
 	}
 	check.HTTPS = probe(parent, get, "https://"+target+"/")
+	check.HTTPS.ProxyUsed = c.proxyUsed(parent, check.HTTPS.URL)
 	if parent.Err() != nil {
 		return collect.Data{}, parent.Err()
 	}
@@ -88,13 +86,21 @@ func probe(parent context.Context, get func(context.Context, string) (int, time.
 // doGet performs one GET. Success means a complete HTTP response was
 // received, whatever its status code -- this tests reachability, not
 // whether the target's own content is correct.
-func doGet(ctx context.Context, url string) (int, time.Duration, error) {
+func (c *Collector) doGet(ctx context.Context, url string) (int, time.Duration, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return 0, 0, err
 	}
 	req.Header.Set("User-Agent", "glimpse-health-check/1")
+	proxyURL, err := c.proxyFor(req)
+	if err != nil {
+		return 0, 0, err
+	}
 	start := time.Now()
+	client := directClient()
+	if proxyURL != nil {
+		client = proxyClient(c.proxyFor)
+	}
 	resp, err := client.Do(req)
 	latency := time.Since(start)
 	if err != nil {
@@ -103,4 +109,32 @@ func doGet(ctx context.Context, url string) (int, time.Duration, error) {
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
 	return resp.StatusCode, latency, nil
+}
+
+func (c *Collector) proxyUsed(ctx context.Context, rawURL string) bool {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return false
+	}
+	proxyURL, err := c.proxyFor(req)
+	return err == nil && proxyURL != nil
+}
+
+func (c *Collector) proxyFor(req *http.Request) (*url.URL, error) {
+	if c.proxy == nil {
+		return http.ProxyFromEnvironment(req)
+	}
+	return c.proxy(req)
+}
+
+// directClient forces IPv4 only for direct probes. A proxy may legitimately
+// be IPv6-only, so proxied connections retain the transport's normal dialing.
+func directClient() *http.Client {
+	return &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "tcp4", addr)
+	}}}
+}
+
+func proxyClient(proxy func(*http.Request) (*url.URL, error)) *http.Client {
+	return &http.Client{Transport: &http.Transport{Proxy: proxy}}
 }

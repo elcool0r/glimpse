@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/elcool0r/glimpse/internal/collect"
@@ -65,6 +64,7 @@ func Run(ctx context.Context, config Config, collectors []collect.Collector) mod
 	intermediate, sampledStatus := sampleTrends(ctx, config, collectors, samplingStarted)
 	emitProgress(config, Progress{Phase: "final", Elapsed: time.Since(started), Duration: config.Duration, Collectors: len(collectors)})
 	last, lastStatus := collectBoundary(ctx, collectors, boundary, collectEvery)
+	samplingEnded := time.Now()
 	metrics, deltaStatus := merge(collectors, first, last)
 	metrics.Trends = buildTrends(collectors, append(append([][]collect.Data{first}, intermediate...), last))
 	statuses := append(firstStatus, sampledStatus...)
@@ -79,9 +79,13 @@ func Run(ctx context.Context, config Config, collectors []collect.Collector) mod
 	}
 	statuses = compactStatuses(statuses)
 	report := model.Report{
-		SchemaVersion:         model.SchemaVersion,
-		GeneratedAt:           time.Now().UTC(),
-		SampleDurationSeconds: time.Since(started).Seconds(),
+		SchemaVersion: model.SchemaVersion,
+		GeneratedAt:   time.Now().UTC(),
+		// Counter deltas start at the baseline boundary, not when application
+		// setup began. In particular, optional collectors can make baseline
+		// collection expensive, and including that cost would overstate the
+		// interval used to derive sampled metrics.
+		SampleDurationSeconds: samplingEnded.Sub(samplingStarted).Seconds(),
 		Host:                  platform.Host(), Metrics: metrics, Findings: make([]model.Finding, 0), Collection: statuses,
 	}
 	report.Score = model.Score{Value: 100, Status: model.SeverityOK, Label: "EXCELLENT"}
@@ -192,26 +196,29 @@ func sampleTrends(ctx context.Context, config Config, collectors []collect.Colle
 // needless repeated reads or optional command execution for static checks.
 func collectTrendAll(ctx context.Context, collectors []collect.Collector) ([]collect.Data, []model.CollectionStatus) {
 	data := make([]collect.Data, len(collectors))
-	var status []model.CollectionStatus
-	var wg sync.WaitGroup
-	var mu sync.Mutex
+	status := make([]model.CollectionStatus, len(collectors))
+	running := make([]bool, len(collectors))
+	results := make(chan collectionResult, len(collectors))
+	remaining := 0
 	for i, collector := range collectors {
 		if _, ok := collector.(collect.TrendCollector); !ok {
 			continue
 		}
-		wg.Add(1)
+		running[i] = true
+		remaining++
 		go func(i int, collector collect.Collector) {
-			defer wg.Done()
-			result, err := collector.Collect(ctx)
-			data[i] = result
-			resultStatus := collectionStatus(collector.Name(), result, err)
-			mu.Lock()
-			status = append(status, resultStatus)
-			mu.Unlock()
+			data, err := collector.Collect(ctx)
+			results <- collectionResult{index: i, data: data, err: err}
 		}(i, collector)
 	}
-	wg.Wait()
-	return data, status
+	data, status = awaitCollection(ctx, collectors, data, status, running, remaining, results)
+	result := status[:0]
+	for i, collector := range collectors {
+		if _, ok := collector.(collect.TrendCollector); ok {
+			result = append(result, status[i])
+		}
+	}
+	return data, result
 }
 
 func buildTrends(collectors []collect.Collector, samples [][]collect.Data) []model.Trend {
@@ -236,21 +243,22 @@ func collectAll(ctx context.Context, collectors []collect.Collector, mode bounda
 	data := make([]collect.Data, len(collectors))
 	status := make([]model.CollectionStatus, len(collectors))
 	skipped := make([]bool, len(collectors))
-	var wg sync.WaitGroup
+	results := make(chan collectionResult, len(collectors))
+	running := make([]bool, len(collectors))
+	remaining := 0
 	for i, collector := range collectors {
 		if mode == skipStatic && staticCollector(collector) {
 			skipped[i] = true
 			continue
 		}
-		wg.Add(1)
+		running[i] = true
+		remaining++
 		go func(i int, collector collect.Collector) {
-			defer wg.Done()
-			result, err := collector.Collect(ctx)
-			data[i] = result
-			status[i] = collectionStatus(collector.Name(), result, err)
+			data, err := collector.Collect(ctx)
+			results <- collectionResult{index: i, data: data, err: err}
 		}(i, collector)
 	}
-	wg.Wait()
+	data, status = awaitCollection(ctx, collectors, data, status, running, remaining, results)
 	result := status[:0]
 	for i, s := range status {
 		if !skipped[i] {
@@ -258,6 +266,51 @@ func collectAll(ctx context.Context, collectors []collect.Collector, mode bounda
 		}
 	}
 	return data, result
+}
+
+// collectionResult is deliberately passed through a buffered channel. A
+// collector that ignores cancellation must not keep the coordinator waiting,
+// and it must be able to finish later without writing into the returned data.
+type collectionResult struct {
+	index int
+	data  collect.Data
+	err   error
+}
+
+func awaitCollection(ctx context.Context, collectors []collect.Collector, data []collect.Data, status []model.CollectionStatus, running []bool, remaining int, results <-chan collectionResult) ([]collect.Data, []model.CollectionStatus) {
+	apply := func(result collectionResult) {
+		if !running[result.index] {
+			return
+		}
+		data[result.index] = result.data
+		status[result.index] = collectionStatus(collectors[result.index].Name(), result.data, result.err)
+		running[result.index] = false
+		remaining--
+	}
+	for remaining > 0 {
+		select {
+		case result := <-results:
+			apply(result)
+		case <-ctx.Done():
+			// Preserve results that raced with cancellation, then report every
+			// still-running collector as partial coverage. Never wait for a
+			// non-cooperative collector or let it modify the returned slices.
+			for {
+				select {
+				case result := <-results:
+					apply(result)
+				default:
+					for i, active := range running {
+						if active {
+							status[i] = model.CollectionStatus{Collector: collectors[i].Name(), Status: "error", Detail: ctx.Err().Error()}
+						}
+					}
+					return data, status
+				}
+			}
+		}
+	}
+	return data, status
 }
 
 func merge(collectors []collect.Collector, first, last []collect.Data) (model.Metrics, []model.CollectionStatus) {

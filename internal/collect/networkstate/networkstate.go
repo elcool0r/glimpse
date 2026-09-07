@@ -69,7 +69,7 @@ func (c *Collector) Collect(parent context.Context) (collect.Data, error) {
 		diagnostics = append(diagnostics, model.CollectionStatus{Status: "unavailable", Detail: "ss: " + err.Error()})
 	} else {
 		if raw, err := runWithTimeout(parent, timeout, run, path, "-H", "-lntu"); err == nil {
-			state.ListeningSockets = ParseListeningSockets(string(raw))
+			state.ListeningSockets, state.ListeningSocketsLimited = parseListeningSocketsBounded(string(raw))
 			state.Available = true
 		} else if parent.Err() != nil {
 			return collect.Data{}, parent.Err()
@@ -91,7 +91,7 @@ func (c *Collector) Collect(parent context.Context) (collect.Data, error) {
 	// must not cost the default-route check.
 	if ip, err := lookup("ip"); err == nil {
 		if raw, err := runWithTimeout(parent, timeout, run, ip, "-o", "route", "show"); err == nil {
-			state.Routes = ParseRoutes(string(raw))
+			state.Routes, state.RoutesLimited = parseRoutesBounded(string(raw))
 			state.RoutesAvailable = true
 			state.Available = true
 		} else if parent.Err() != nil {
@@ -108,11 +108,20 @@ func (c *Collector) Collect(parent context.Context) (collect.Data, error) {
 }
 
 func ParseListeningSockets(raw string) []model.ListeningSocket {
+	out, _ := parseListeningSocketsBounded(raw)
+	return out
+}
+
+// parseListeningSocketsBounded returns whether a valid, distinct listener was
+// omitted because the report inventory reached its fixed cap. Duplicates do
+// not count as reduced coverage.
+func parseListeningSocketsBounded(raw string) ([]model.ListeningSocket, bool) {
 	seen := make(map[string]struct{})
 	out := make([]model.ListeningSocket, 0)
+	limited := false
 	for _, line := range strings.Split(raw, "\n") {
 		fields := strings.Fields(line)
-		if len(fields) < 5 || len(out) >= maxSockets {
+		if len(fields) < 5 {
 			continue
 		}
 		protocol := strings.ToLower(fields[0])
@@ -127,6 +136,10 @@ func ParseListeningSockets(raw string) []model.ListeningSocket {
 		if _, exists := seen[key]; exists {
 			continue
 		}
+		if len(out) >= maxSockets {
+			limited = true
+			continue
+		}
 		seen[key] = struct{}{}
 		out = append(out, model.ListeningSocket{Protocol: protocol, Address: address, Port: port})
 	}
@@ -139,7 +152,7 @@ func ParseListeningSockets(raw string) []model.ListeningSocket {
 		}
 		return out[i].Address < out[j].Address
 	})
-	return out
+	return out, limited
 }
 
 func ParseConnectionStates(raw string) []model.ConnectionState {
@@ -167,10 +180,22 @@ func ParseConnectionStates(raw string) []model.ConnectionState {
 }
 
 func ParseRoutes(raw string) []model.Route {
+	out, _ := parseRoutesBounded(raw)
+	return out
+}
+
+// parseRoutesBounded returns whether valid route lines were omitted because
+// the report inventory reached its fixed cap.
+func parseRoutesBounded(raw string) ([]model.Route, bool) {
 	out := make([]model.Route, 0)
+	limited := false
 	for _, line := range strings.Split(raw, "\n") {
 		fields := strings.Fields(line)
-		if len(fields) == 0 || len(out) >= maxRoutes {
+		if len(fields) == 0 {
+			continue
+		}
+		if len(out) >= maxRoutes {
+			limited = true
 			continue
 		}
 		route := model.Route{Destination: fields[0]}
@@ -191,7 +216,7 @@ func ParseRoutes(raw string) []model.Route {
 		}
 		out = append(out, route)
 	}
-	return out
+	return out, limited
 }
 
 func splitEndpoint(endpoint string) (string, uint16, bool) {

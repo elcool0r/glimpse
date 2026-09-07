@@ -62,7 +62,7 @@ func httpCheckReport(check *model.HTTPCheck) model.Report {
 	return model.Report{Metrics: model.Metrics{CPU: &model.CPU{}, HTTPCheck: check}}
 }
 
-func TestHTTPCheckBothFailIsCritical(t *testing.T) {
+func TestHTTPCheckBothFailIsWarning(t *testing.T) {
 	report := httpCheckReport(&model.HTTPCheck{
 		Available: true,
 		HTTP:      &model.HTTPCheckResult{URL: "http://example.com/", Succeeded: false, Error: "timeout"},
@@ -73,8 +73,8 @@ func TestHTTPCheckBothFailIsCritical(t *testing.T) {
 	if found == nil {
 		t.Fatalf("no finding when both requests failed: %+v", report.Findings)
 	}
-	if found.Severity != model.SeverityCritical {
-		t.Fatalf("severity = %s, want critical", found.Severity)
+	if found.Severity != model.SeverityWarning {
+		t.Fatalf("severity = %s, want warning", found.Severity)
 	}
 }
 
@@ -108,5 +108,18 @@ func TestHTTPCheckBothSucceedStaysSilent(t *testing.T) {
 		if findingByID(report, id) != nil {
 			t.Fatalf("unexpected finding %s when both succeeded", id)
 		}
+	}
+}
+
+func TestHTTPCheckProxyUseIsInformational(t *testing.T) {
+	report := httpCheckReport(&model.HTTPCheck{
+		Available: true,
+		HTTP:      &model.HTTPCheckResult{URL: "http://example.com/", Succeeded: true, ProxyUsed: true},
+		HTTPS:     &model.HTTPCheckResult{URL: "https://example.com/", Succeeded: true},
+	})
+	Report(&report)
+	found := findingByID(report, "http-check-proxy-used")
+	if found == nil || found.Severity != model.SeverityInfo {
+		t.Fatalf("expected informational proxy finding: %+v", report.Findings)
 	}
 }

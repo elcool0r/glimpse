@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"testing"
 )
@@ -233,10 +234,7 @@ func TestCollectSparseFileReportsAllocatedNotLogical(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Collect returned error: %v", err)
 	}
-	if len(data.DeletedFiles.Files) != 1 {
-		t.Fatalf("expected the sparse file to be reported, got %+v", data.DeletedFiles.Files)
-	}
-	got := data.DeletedFiles.Files[0].Bytes
+	got := data.DeletedFiles.TotalBytes
 	if got >= logicalSize {
 		// Sparse-file support (a Truncate() past the current end-of-file
 		// allocating no blocks for the hole) is a property of the
@@ -246,6 +244,9 @@ func TestCollectSparseFileReportsAllocatedNotLogical(t *testing.T) {
 		// having a Blocks field to prefer; this only skips the end-to-end
 		// assertion when the host filesystem does not cooperate.
 		t.Skipf("host filesystem allocated the full %d bytes for a truncated file (no sparse support observed); cannot exercise the allocated-vs-logical distinction here", logicalSize)
+	}
+	if got != 0 || len(data.DeletedFiles.Files) != 0 {
+		t.Fatalf("sparse file consumed %d bytes and reported %+v; want no allocated disk space", got, data.DeletedFiles.Files)
 	}
 }
 
@@ -329,6 +330,27 @@ func TestCollectReportsUnavailableWithoutProcRoot(t *testing.T) {
 	}
 }
 
+func TestCollectReportsBoundedProcessCoverage(t *testing.T) {
+	root := t.TempDir()
+	for pid := 1; pid <= maxProcesses+1; pid++ {
+		if err := os.Mkdir(filepath.Join(root, strconv.Itoa(pid)), 0o755); err != nil {
+			t.Fatalf("mkdir process %d: %v", pid, err)
+		}
+	}
+	c := &Collector{procRoot: root, statfs: notTmpfsStatfs}
+	data, err := c.Collect(context.Background())
+	if err != nil {
+		t.Fatalf("Collect returned error: %v", err)
+	}
+	got := data.DeletedFiles
+	if got.ProcessesEligible != maxProcesses+1 || !got.ProcessScanLimited {
+		t.Fatalf("coverage=%+v", got)
+	}
+	if got.ProcessesScanned+got.ProcessesSkipped != maxProcesses {
+		t.Fatalf("scanned=%d skipped=%d, want bounded total %d", got.ProcessesScanned, got.ProcessesSkipped, maxProcesses)
+	}
+}
+
 func TestLargestHolderAttributesUniqueFilesNotReferences(t *testing.T) {
 	root := t.TempDir()
 	// pid 1: one 300 MiB file held on three fds (should count once).
@@ -366,13 +388,13 @@ func TestLargestHolderAttributesUniqueFilesNotReferences(t *testing.T) {
 // preference: TestCollectSparseFileReportsAllocatedNotLogical exercises the
 // same logic end to end but can only observe it on a filesystem that
 // actually supports sparse files.
-func TestAllocatedBytesPrefersBlocksOverLogicalSize(t *testing.T) {
+func TestAllocatedBytesUsesBlocksWithoutLogicalFallback(t *testing.T) {
 	sparse := &syscall.Stat_t{Blocks: 0}
-	if got := allocatedBytes(sparse, 200<<20); got != 200<<20 {
-		t.Fatalf("with zero blocks, want the logical size as a fallback: got %d", got)
+	if got := allocatedBytes(sparse); got != 0 {
+		t.Fatalf("with zero blocks, want zero allocated bytes: got %d", got)
 	}
 	allocated := &syscall.Stat_t{Blocks: 8} // 8 * 512 = 4096 bytes allocated
-	if got := allocatedBytes(allocated, 200<<20); got != 4096 {
+	if got := allocatedBytes(allocated); got != 4096 {
 		t.Fatalf("allocatedBytes = %d, want 4096 (st_blocks*512), not the 200 MiB logical size", got)
 	}
 }

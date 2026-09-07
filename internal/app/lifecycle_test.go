@@ -32,6 +32,25 @@ func (steadyCollector) Collect(context.Context) (collect.Data, error) {
 	return collect.Data{Memory: &model.Memory{TotalBytes: 1 << 30, AvailableBytes: 1 << 29, AvailableFraction: .5}}, nil
 }
 
+type blockingCollector struct{ release <-chan struct{} }
+
+func (blockingCollector) Name() string { return "blocking" }
+func (c blockingCollector) Collect(context.Context) (collect.Data, error) {
+	<-c.release
+	return collect.Data{}, nil
+}
+
+type slowDeltaCollector struct{ delay time.Duration }
+
+func (slowDeltaCollector) Name() string { return "slow-delta" }
+func (c slowDeltaCollector) Collect(context.Context) (collect.Data, error) {
+	time.Sleep(c.delay)
+	return collect.Data{Snapshot: time.Now()}, nil
+}
+func (slowDeltaCollector) Delta(collect.Data, collect.Data) (collect.Data, error) {
+	return collect.Data{}, nil
+}
+
 // A boundary that runs out of its own budget is missing coverage, not a failed
 // report. Previously baseline and final collection shared one deadline with the
 // sampling window, so exceeding it marked sampling as errored and collapsed
@@ -58,6 +77,37 @@ func TestBoundaryOverrunKeepsTheCollectedReport(t *testing.T) {
 	}
 	if !noted {
 		t.Fatalf("the collector that could not finish left no diagnostic: %+v", report.Collection)
+	}
+}
+
+func TestNonCooperativeCollectorDoesNotOutliveBoundary(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+	started := time.Now()
+	report := Run(context.Background(), Config{BoundaryTimeout: 20 * time.Millisecond}, []collect.Collector{blockingCollector{release: release}, steadyCollector{}})
+	if elapsed := time.Since(started); elapsed > 150*time.Millisecond {
+		t.Fatalf("Run waited for a collector that ignored cancellation: %s", elapsed)
+	}
+	var noted bool
+	for _, status := range report.Collection {
+		noted = noted || (status.Collector == "blocking" && status.Status == "error" && strings.Contains(status.Detail, "deadline exceeded"))
+	}
+	if !noted {
+		t.Fatalf("missing deadline diagnostic for non-cooperative collector: %+v", report.Collection)
+	}
+}
+
+func TestSampleDurationExcludesBaselineCollection(t *testing.T) {
+	const delay = 25 * time.Millisecond
+	started := time.Now()
+	report := Run(context.Background(), Config{Duration: 10 * time.Millisecond}, []collect.Collector{slowDeltaCollector{delay: delay}})
+	total := time.Since(started)
+	sampled := time.Duration(report.SampleDurationSeconds * float64(time.Second))
+	if total-sampled < delay/2 {
+		t.Fatalf("sample duration included baseline setup: total=%s sampled=%s", total, sampled)
+	}
+	if sampled < 10*time.Millisecond {
+		t.Fatalf("sample duration excluded the requested sampling window: %s", sampled)
 	}
 }
 

@@ -15,7 +15,9 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"os"
 	"os/exec"
+	"strings"
 	"time"
 )
 
@@ -24,12 +26,21 @@ import (
 // makes the wait itself terminate when the process cannot be reaped.
 const WaitDelay = 2 * time.Second
 
+// DefaultMaxOutput bounds stdout retained by invocations that do not need a
+// collector-specific limit. Commands are optional evidence sources; one
+// unexpectedly chatty implementation must not be able to consume unbounded
+// process memory before its timeout expires.
+const DefaultMaxOutput = 1 << 20
+
 // Options adjusts one invocation. The zero value inherits the current
-// environment and does not cap output.
+// environment, forces stable C-locale command output, and applies
+// DefaultMaxOutput. Set MaxOutput negative only for a deliberately unbounded
+// invocation.
 type Options struct {
 	// Env replaces the child environment when non-nil.
 	Env []string
-	// MaxOutput caps retained stdout in bytes. Zero means no cap.
+	// MaxOutput caps retained stdout in bytes. Zero uses DefaultMaxOutput;
+	// negative disables the cap.
 	MaxOutput int
 }
 
@@ -53,9 +64,9 @@ func Output(ctx context.Context, name string, args ...string) ([]byte, error) {
 // unhealthy pool) can still use the output.
 func Run(ctx context.Context, opts Options, name string, args ...string) (Result, error) {
 	var out limitedBuffer
-	out.limit = opts.MaxOutput
+	out.limit = outputLimit(opts.MaxOutput)
 	cmd := exec.CommandContext(ctx, name, args...)
-	cmd.Env = opts.Env
+	cmd.Env = stableLocaleEnv(opts.Env)
 	cmd.Stdout = &out
 	cmd.Stderr = io.Discard
 	// Without WaitDelay, Wait blocks until the process releases its pipes even
@@ -63,6 +74,33 @@ func Run(ctx context.Context, opts Options, name string, args ...string) (Result
 	cmd.WaitDelay = WaitDelay
 	err := cmd.Run()
 	return Result{Output: out.Bytes(), Truncated: out.truncated}, err
+}
+
+func outputLimit(limit int) int {
+	if limit == 0 {
+		return DefaultMaxOutput
+	}
+	return limit
+}
+
+// stableLocaleEnv returns an environment with locale-sensitive command output
+// normalized to the portable C locale. Most collectors parse machine-like
+// English labels from optional tools; preserving a host's localized output
+// would turn a healthy capability into a parser failure. Options.Env still
+// replaces the inherited environment, except for these enforced locale keys.
+func stableLocaleEnv(env []string) []string {
+	if env == nil {
+		env = os.Environ()
+	}
+	result := make([]string, 0, len(env)+2)
+	for _, entry := range env {
+		key, _, _ := strings.Cut(entry, "=")
+		if key == "LC_ALL" || key == "LANG" {
+			continue
+		}
+		result = append(result, entry)
+	}
+	return append(result, "LC_ALL=C", "LANG=C")
 }
 
 // limitedBuffer keeps a bounded prefix of the output.

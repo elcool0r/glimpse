@@ -68,6 +68,7 @@ func Write(w io.Writer, r model.Report, o Options) {
 	writeWrapped(w, width, "", fmt.Sprintf("%s  %s", bold("GLIMPSE"), cleanText(r.Host.Hostname)))
 	writeWrapped(w, width, "", metadata(strings.Join(nonEmpty(r.Host.OS, r.Host.Kernel, fmt.Sprintf("%d CPUs", r.Host.CPUCount), fmt.Sprintf("sampled %.0fs", r.SampleDurationSeconds)), separator), o.Color))
 	fmt.Fprintln(w)
+	writeWrapped(w, width, "", sectionHeader("Overview", o.Color))
 	if c := r.Metrics.CPU; c != nil {
 		severity := sectionSeverity(r.Findings, "cpu")
 		if !quietSkip(severity) {
@@ -267,11 +268,12 @@ func Write(w io.Writer, r model.Report, o Options) {
 	if o.Events || o.EventsAll || r.Score.Status == model.SeverityCritical {
 		renderTimeline(w, width, r, o.Color, o.EventsAll)
 	}
+	infoFindings := compactInformationalFindings(r.Findings)
 	findings := actionableFindings(r.Findings)
 	if o.Verbose {
 		findings = r.Findings
 	}
-	if len(findings) > 0 {
+	if len(findings) > 0 || !o.Verbose && len(infoFindings) > 0 {
 		fmt.Fprintln(w)
 		writeWrapped(w, width, "", detailsHeader(o.Color))
 		for _, f := range findings {
@@ -299,12 +301,12 @@ func Write(w io.Writer, r model.Report, o Options) {
 				writeWrapped(w, width, "    ", formatSuggestion(f.Suggestion, o.Color))
 			}
 		}
-	} else if len(compactInformationalFindings(r.Findings)) == 0 {
+	} else if len(infoFindings) == 0 {
 		fmt.Fprintln(w)
 		writeWrapped(w, width, "", "No actionable findings from the collected signals.")
 	}
 	if !o.Verbose {
-		for _, finding := range compactInformationalFindings(r.Findings) {
+		for _, finding := range infoFindings {
 			writeWrapped(w, width, "", fmt.Sprintf("%s  %s", badge(model.SeverityInfo, o.Color), highlightContainerName(cleanText(finding.Title), o.Color)))
 		}
 	}

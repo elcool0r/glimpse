@@ -203,12 +203,14 @@ type Network struct {
 // NetworkState is a bounded local inventory from ss and ip route. It does not
 // contact the network or judge which listening services are intended.
 type NetworkState struct {
-	Available        bool              `json:"available"`
-	RoutesAvailable  bool              `json:"routes_available"`
-	ListeningSockets []ListeningSocket `json:"listening_sockets,omitempty"`
-	ConnectionStates []ConnectionState `json:"connection_states,omitempty"`
-	Routes           []Route           `json:"routes,omitempty"`
-	DNS              *DNSConfig        `json:"dns,omitempty"`
+	Available               bool              `json:"available"`
+	RoutesAvailable         bool              `json:"routes_available"`
+	ListeningSockets        []ListeningSocket `json:"listening_sockets,omitempty"`
+	ListeningSocketsLimited bool              `json:"listening_sockets_limited,omitempty"`
+	ConnectionStates        []ConnectionState `json:"connection_states,omitempty"`
+	Routes                  []Route           `json:"routes,omitempty"`
+	RoutesLimited           bool              `json:"routes_limited,omitempty"`
+	DNS                     *DNSConfig        `json:"dns,omitempty"`
 }
 
 // DNSConfig is the resolver configuration as written, not a test of whether it
@@ -335,6 +337,8 @@ type DeletedFiles struct {
 	TotalReferences        int           `json:"total_references"`
 	ProcessesScanned       int           `json:"processes_scanned"`
 	ProcessesSkipped       int           `json:"processes_skipped"`
+	ProcessesEligible      int           `json:"processes_eligible,omitempty"`
+	ProcessScanLimited     bool          `json:"process_scan_limited,omitempty"`
 	LargestHolderPID       int           `json:"largest_holder_pid,omitempty"`
 	LargestHolderCommand   string        `json:"largest_holder_command,omitempty"`
 	LargestHolderBytes     uint64        `json:"largest_holder_bytes,omitempty"`
@@ -377,6 +381,7 @@ type HTTPCheckResult struct {
 	URL           string  `json:"url"`
 	StatusCode    int     `json:"status_code,omitempty"`
 	Succeeded     bool    `json:"succeeded"`
+	ProxyUsed     bool    `json:"proxy_used,omitempty"`
 	Error         string  `json:"error,omitempty"`
 	LatencyMillis float64 `json:"latency_millis,omitempty"`
 }
@@ -435,8 +440,14 @@ type Process struct {
 }
 
 type Systemd struct {
-	Available   bool     `json:"available"`
-	FailedUnits []string `json:"failed_units,omitempty"`
+	Available bool `json:"available"`
+	// ServiceUnitsDiscovered counts the services in the list-units response;
+	// ServiceUnitsInspected is the bounded subset queried for restart data.
+	// The count is limited by the command output captured for this collector.
+	ServiceUnitsDiscovered int      `json:"service_units_discovered,omitempty"`
+	ServiceUnitsInspected  int      `json:"service_units_inspected,omitempty"`
+	ServiceUnitScanLimited bool     `json:"service_unit_scan_limited,omitempty"`
+	FailedUnits            []string `json:"failed_units,omitempty"`
 	// RestartingUnits lists services whose systemd-tracked restart counter
 	// increased during the sampling window -- a real-time signal, unlike
 	// the counter's raw cumulative-since-boot value, which would flag any
@@ -652,12 +663,18 @@ type CgroupV2 struct {
 // runtime or denied socket access is represented in Collection, not here as a
 // failed health state.
 type ContainerRuntime struct {
-	Runtime         string      `json:"runtime"`
-	Containers      []Container `json:"containers,omitempty"`
-	LogsChecked     int         `json:"logs_checked,omitempty"`
-	LogCandidates   int         `json:"log_candidates,omitempty"`
-	LogWindow       string      `json:"log_window,omitempty"`
-	LogCheckLimited bool        `json:"log_check_limited,omitempty"`
+	Runtime string `json:"runtime"`
+	// ContainersDiscovered counts IDs returned by the runtime's list command;
+	// ContainersInspected is the bounded subset passed to inspect. Both counts
+	// are limited by the command output captured for this collector.
+	ContainersDiscovered       int         `json:"containers_discovered,omitempty"`
+	ContainersInspected        int         `json:"containers_inspected,omitempty"`
+	ContainerInspectionLimited bool        `json:"container_inspection_limited,omitempty"`
+	Containers                 []Container `json:"containers,omitempty"`
+	LogsChecked                int         `json:"logs_checked,omitempty"`
+	LogCandidates              int         `json:"log_candidates,omitempty"`
+	LogWindow                  string      `json:"log_window,omitempty"`
+	LogCheckLimited            bool        `json:"log_check_limited,omitempty"`
 }
 
 // Container is deliberately a small common denominator for Docker and Podman.

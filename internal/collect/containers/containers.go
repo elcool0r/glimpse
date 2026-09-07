@@ -117,9 +117,12 @@ func (c *Collector) Collect(parent context.Context) (collect.Data, error) {
 			diagnostics = append(diagnostics, model.CollectionStatus{Collector: c.Name(), Status: "unavailable", Detail: fmt.Sprintf("%s list failed: %v", runtime, err)})
 			continue
 		}
-		ids := boundedIDs(string(idsRaw))
+		ids, discovered, inspectionLimited := boundedIDsWithCoverage(string(idsRaw))
 		if len(ids) == 0 {
-			result = append(result, model.ContainerRuntime{Runtime: runtime, Containers: []model.Container{}})
+			result = append(result, model.ContainerRuntime{
+				Runtime: runtime, Containers: []model.Container{},
+				ContainersDiscovered: discovered, ContainersInspected: len(ids), ContainerInspectionLimited: inspectionLimited,
+			})
 			continue
 		}
 		ctx, cancel = context.WithTimeout(parent, timeout)
@@ -177,7 +180,9 @@ func (c *Collector) Collect(parent context.Context) (collect.Data, error) {
 		}
 		logCandidates := countLogRelevant(containers)
 		result = append(result, model.ContainerRuntime{
-			Runtime: runtime, Containers: containers, LogsChecked: logsChecked, LogCandidates: logCandidates,
+			Runtime: runtime, Containers: containers,
+			ContainersDiscovered: discovered, ContainersInspected: len(ids), ContainerInspectionLimited: inspectionLimited,
+			LogsChecked: logsChecked, LogCandidates: logCandidates,
 			LogWindow: "last hour", LogCheckLimited: logsChecked < logCandidates,
 		})
 	}
@@ -331,20 +336,34 @@ func (c *Collector) Delta(first, last collect.Data) (collect.Data, error) {
 	return collect.Data{Containers: out}, nil
 }
 func boundedIDs(text string) []string {
-	ids := make([]string, 0, maxContainers)
+	ids, _, _ := boundedIDsWithCoverage(text)
+	return ids
+}
+
+// boundedIDsWithCoverage returns the number of distinct IDs observed in the
+// list response separately from the fixed-size inspection subset. The runtime
+// command itself is output-bounded, so discovered is only exact within the
+// response it returned.
+func boundedIDsWithCoverage(text string) (ids []string, discovered int, limited bool) {
+	ids = make([]string, 0, maxContainers)
 	seen := map[string]struct{}{}
 	for _, line := range strings.Split(text, "\n") {
 		id := strings.TrimSpace(line)
-		if id == "" || len(ids) >= maxContainers {
+		if id == "" {
 			continue
 		}
 		if _, ok := seen[id]; ok {
 			continue
 		}
 		seen[id] = struct{}{}
+		discovered++
+		if len(ids) >= maxContainers {
+			limited = true
+			continue
+		}
 		ids = append(ids, id)
 	}
-	return ids
+	return ids, discovered, limited
 }
 
 // ParseInspectJSONLines parses the one-JSON-object-per-container output from

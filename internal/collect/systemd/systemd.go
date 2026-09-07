@@ -79,6 +79,8 @@ func (c *Collector) Collect(parent context.Context) (collect.Data, error) {
 	var diagnostics []model.CollectionStatus
 	restarts := map[string]uint64{}
 	var recentStarts []model.SystemdUnitStart
+	serviceUnitsDiscovered, serviceUnitsInspected := 0, 0
+	serviceUnitScanLimited := false
 	listCtx, cancel := context.WithTimeout(parent, timeout)
 	listOutput, listErr := run(listCtx, path, "list-units", "--type=service", "--all", "--no-legend", "--plain", "--no-pager")
 	cancel()
@@ -89,9 +91,12 @@ func (c *Collector) Collect(parent context.Context) (collect.Data, error) {
 		diagnostics = append(diagnostics, model.CollectionStatus{Status: "unavailable", Detail: "list-units: " + listErr.Error()})
 	default:
 		names := parseUnitNames(string(listOutput))
+		serviceUnitsDiscovered = len(names)
 		if len(names) > maxUnits {
+			serviceUnitScanLimited = true
 			names = names[:maxUnits]
 		}
+		serviceUnitsInspected = len(names)
 		if len(names) > 0 {
 			args := append([]string{"show"}, names...)
 			args = append(args, "--property=Id,NRestarts,ActiveEnterTimestamp", "--no-pager")
@@ -111,7 +116,11 @@ func (c *Collector) Collect(parent context.Context) (collect.Data, error) {
 	}
 
 	return collect.Data{
-		Systemd:     &model.Systemd{Available: true, FailedUnits: ParseFailedUnits(string(failedOutput)), RecentStarts: recentStarts},
+		Systemd: &model.Systemd{
+			Available: true, FailedUnits: ParseFailedUnits(string(failedOutput)), RecentStarts: recentStarts,
+			ServiceUnitsDiscovered: serviceUnitsDiscovered, ServiceUnitsInspected: serviceUnitsInspected,
+			ServiceUnitScanLimited: serviceUnitScanLimited,
+		},
 		Snapshot:    snapshot{restarts: restarts},
 		Diagnostics: diagnostics,
 	}, nil

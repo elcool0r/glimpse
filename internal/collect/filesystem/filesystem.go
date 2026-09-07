@@ -3,9 +3,11 @@ package filesystem
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 
@@ -27,6 +29,15 @@ type Usage struct {
 	FreeInodes        uint64
 	UsedInodes        uint64
 	UsedInodeFraction float64
+}
+
+// Exclusion records a real mount deliberately omitted from statfs. These
+// mounts are not failures: probing network and FUSE filesystems can itself
+// block during the incident glimpse is meant to diagnose. Keeping the fact
+// separate makes that bounded behavior visible to JSON and verbose output.
+type Exclusion struct {
+	Type  string
+	Count int
 }
 
 // tmpfs is deliberately not in this set: it is RAM-backed but genuinely
@@ -69,32 +80,46 @@ var localTypes = map[string]struct{}{
 // Collect reads /proc/self/mountinfo and statfs data. Missing procfs is reported
 // to callers as an error; permission failures on individual mounts are skipped.
 func Collect(ctx context.Context, procRoot string) ([]Usage, error) {
-	return collectWithStatfs(ctx, procRoot, syscall.Statfs)
+	usages, _, err := CollectWithExclusions(ctx, procRoot)
+	return usages, err
+}
+
+// CollectWithExclusions returns sampled filesystems and the real mount types
+// intentionally not probed because they are not known-local filesystems.
+func CollectWithExclusions(ctx context.Context, procRoot string) ([]Usage, []Exclusion, error) {
+	return collectWithStatfsWithExclusions(ctx, procRoot, syscall.Statfs)
 }
 
 func collectWithStatfs(ctx context.Context, procRoot string, statfs func(string, *syscall.Statfs_t) error) ([]Usage, error) {
+	usages, _, err := collectWithStatfsWithExclusions(ctx, procRoot, statfs)
+	return usages, err
+}
+
+func collectWithStatfsWithExclusions(ctx context.Context, procRoot string, statfs func(string, *syscall.Statfs_t) error) ([]Usage, []Exclusion, error) {
 	if procRoot == "" {
 		procRoot = "/proc"
 	}
 	f, err := os.Open(filepath.Join(procRoot, "self/mountinfo"))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer f.Close()
 	mounts, err := ParseMountInfo(f)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	seen := make(map[string]struct{})
 	result := make([]Usage, 0, len(mounts))
+	excludedTypes := make(map[string]int)
 	for _, mount := range mounts {
 		if err := ctx.Err(); err != nil {
-			return result, err
+			return result, exclusions(excludedTypes), err
 		}
 		if !IsReal(mount) {
 			continue
 		}
 		if _, ok := localTypes[mount.Type]; !ok && mount.Type != "overlay" {
+			excludedTypes[mount.Type]++
 			continue
 		}
 		if _, ok := seen[mount.Target]; ok {
@@ -129,5 +154,36 @@ func collectWithStatfs(ctx context.Context, procRoot string, statfs func(string,
 	// remote filesystems. They are intentionally absent rather than presented
 	// as a failed host-health check; successfully sampled local mounts remain
 	// useful and analyzable.
-	return result, nil
+	return result, exclusions(excludedTypes), nil
+}
+
+func exclusions(types map[string]int) []Exclusion {
+	if len(types) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(types))
+	for name := range types {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	result := make([]Exclusion, 0, len(names))
+	for _, name := range names {
+		result = append(result, Exclusion{Type: name, Count: types[name]})
+	}
+	return result
+}
+
+// ExclusionDiagnostic summarizes intentional exclusions without exposing
+// mount sources. It is used only as collection coverage metadata.
+func ExclusionDiagnostic(excluded []Exclusion) string {
+	if len(excluded) == 0 {
+		return ""
+	}
+	types := make([]string, 0, len(excluded))
+	count := 0
+	for _, item := range excluded {
+		count += item.Count
+		types = append(types, fmt.Sprintf("%s=%d", item.Type, item.Count))
+	}
+	return fmt.Sprintf("filesystem coverage reduced: skipped %d potentially blocking mount(s) (%s)", count, strings.Join(types, ", "))
 }

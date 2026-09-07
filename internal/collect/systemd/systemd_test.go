@@ -3,7 +3,9 @@ package systemd
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -157,6 +159,25 @@ func TestCollectPopulatesRestartSnapshot(t *testing.T) {
 	snap, ok := data.Snapshot.(snapshot)
 	if !ok || snap.restarts["crashloop.service"] != 5 {
 		t.Fatalf("unexpected snapshot: %+v", data.Snapshot)
+	}
+}
+
+func TestCollectReportsBoundedRestartCoverage(t *testing.T) {
+	var units strings.Builder
+	for i := 0; i < maxUnits+1; i++ {
+		fmt.Fprintf(&units, "service-%03d.service loaded active running Service\n", i)
+	}
+	c := &Collector{
+		lookPath: func(string) (string, error) { return "/bin/systemctl", nil },
+		run:      fakeSystemctl(t, "", units.String(), ""),
+	}
+	data, err := c.Collect(context.Background())
+	if err != nil {
+		t.Fatalf("Collect returned error: %v", err)
+	}
+	got := data.Systemd
+	if got.ServiceUnitsDiscovered != maxUnits+1 || got.ServiceUnitsInspected != maxUnits || !got.ServiceUnitScanLimited {
+		t.Fatalf("coverage=%+v", got)
 	}
 }
 

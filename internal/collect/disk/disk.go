@@ -153,7 +153,7 @@ func ReadSnapshot(ctx context.Context, procRoot, sysRoot string) (Snapshot, erro
 		if err := ctx.Err(); err != nil {
 			return Snapshot{}, err
 		}
-		base := filepath.Join(sysRoot, "block", device.Name)
+		base := deviceSysfsPath(sysRoot, device)
 		info, err := os.Stat(base)
 		if err != nil {
 			// Without sysfs metadata, retain the device when its name is one
@@ -166,6 +166,9 @@ func ReadSnapshot(ctx context.Context, procRoot, sysRoot string) (Snapshot, erro
 			continue
 		}
 		if !info.IsDir() {
+			continue
+		}
+		if sysfsIsPartition(base) {
 			continue
 		}
 		if value, err := readUint(filepath.Join(base, "queue/rotational")); err == nil {
@@ -194,9 +197,66 @@ func ReadSnapshot(ctx context.Context, procRoot, sysRoot string) (Snapshot, erro
 }
 
 func physicalDeviceName(name string) bool {
-	return strings.HasPrefix(name, "sd") || strings.HasPrefix(name, "hd") ||
-		strings.HasPrefix(name, "vd") || strings.HasPrefix(name, "xvd") ||
-		strings.HasPrefix(name, "nvme") || strings.HasPrefix(name, "mmcblk")
+	return prefixedLetters(name, "sd") || prefixedLetters(name, "hd") ||
+		prefixedLetters(name, "vd") || prefixedLetters(name, "xvd") ||
+		nvmeDeviceName(name) || mmcDeviceName(name)
+}
+
+// deviceSysfsPath uses the kernel's major:minor topology link when present.
+// Unlike /sys/block/<name>, it resolves partitions as well as whole disks so
+// ReadSnapshot can reject partition entries before applying name fallbacks.
+func deviceSysfsPath(sysRoot string, device Device) string {
+	byNumber := filepath.Join(sysRoot, "dev", "block", fmt.Sprintf("%d:%d", device.Major, device.Minor))
+	if _, err := os.Lstat(byNumber); err == nil {
+		return byNumber
+	}
+	return filepath.Join(sysRoot, "block", device.Name)
+}
+
+func sysfsIsPartition(base string) bool {
+	_, err := os.Stat(filepath.Join(base, "partition"))
+	return err == nil
+}
+
+func prefixedLetters(name, prefix string) bool {
+	if !strings.HasPrefix(name, prefix) {
+		return false
+	}
+	value := strings.TrimPrefix(name, prefix)
+	if value == "" {
+		return false
+	}
+	for _, r := range value {
+		if r < 'a' || r > 'z' {
+			return false
+		}
+	}
+	return true
+}
+
+func nvmeDeviceName(name string) bool {
+	value := strings.TrimPrefix(name, "nvme")
+	controller, namespace, ok := strings.Cut(value, "n")
+	if !ok || controller == "" || namespace == "" {
+		return false
+	}
+	return decimalDigits(controller) && decimalDigits(namespace)
+}
+
+func mmcDeviceName(name string) bool {
+	return decimalDigits(strings.TrimPrefix(name, "mmcblk"))
+}
+
+func decimalDigits(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, r := range value {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func sysfsHasPhysicalDevice(base string) bool {

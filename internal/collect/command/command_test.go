@@ -2,7 +2,6 @@ package command
 
 import (
 	"context"
-	"os"
 	"os/exec"
 	"strings"
 	"testing"
@@ -28,6 +27,22 @@ func TestOutputCapTruncatesInsteadOfDiscarding(t *testing.T) {
 	}
 	if strings.Trim(string(result.Output), "A") != "" {
 		t.Fatalf("unexpected content: %q", result.Output)
+	}
+}
+
+func TestRunAppliesDefaultOutputCap(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh unavailable")
+	}
+	result, err := Run(context.Background(), Options{}, "sh", "-c", "i=0; while [ $i -le 1100000 ]; do printf A; i=$((i + 1)); done")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Output) != DefaultMaxOutput {
+		t.Fatalf("kept %d bytes, want default cap %d", len(result.Output), DefaultMaxOutput)
+	}
+	if !result.Truncated {
+		t.Fatal("default output cap did not report truncation")
 	}
 }
 
@@ -67,5 +82,20 @@ func TestOutputInheritsEnvironmentUnlessReplaced(t *testing.T) {
 	if err != nil || string(result.Output) != "replaced" {
 		t.Fatalf("out=%q err=%v", result.Output, err)
 	}
-	_ = os.Environ
+}
+
+func TestRunForcesStableCLocale(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh unavailable")
+	}
+	t.Setenv("LANG", "de_DE.UTF-8")
+	t.Setenv("LC_ALL", "de_DE.UTF-8")
+	result, err := Run(context.Background(), Options{}, "sh", "-c", "printf '%s|%s' \"$LC_ALL\" \"$LANG\"")
+	if err != nil || string(result.Output) != "C|C" {
+		t.Fatalf("out=%q err=%v, want C|C", result.Output, err)
+	}
+	result, err = Run(context.Background(), Options{Env: []string{"LANG=fr_FR.UTF-8", "LC_ALL=fr_FR.UTF-8", "GLIMPSE_COMMAND_TEST=replaced"}}, "sh", "-c", "printf '%s|%s|%s' \"$LC_ALL\" \"$LANG\" \"$GLIMPSE_COMMAND_TEST\"")
+	if err != nil || string(result.Output) != "C|C|replaced" {
+		t.Fatalf("out=%q err=%v, want C|C|replaced", result.Output, err)
+	}
 }

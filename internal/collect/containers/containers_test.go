@@ -29,6 +29,17 @@ func TestBoundedIDs(t *testing.T) {
 	}
 }
 
+func TestBoundedIDsReportsInspectionCoverage(t *testing.T) {
+	var raw strings.Builder
+	for i := 0; i < maxContainers+1; i++ {
+		fmt.Fprintf(&raw, "container-%03d\n", i)
+	}
+	ids, discovered, limited := boundedIDsWithCoverage(raw.String())
+	if len(ids) != maxContainers || discovered != maxContainers+1 || !limited {
+		t.Fatalf("ids=%d discovered=%d limited=%v", len(ids), discovered, limited)
+	}
+}
+
 func TestTransitionalHealthIsUnknown(t *testing.T) {
 	items, _ := ParseInspectJSONLines(`{"Id":"abc","Name":"/web","State":{"Health":{"Status":"starting"}}}`)
 	if len(items) != 1 || items[0].Healthy != nil {
@@ -136,6 +147,38 @@ func TestCollectForcesLocalRuntimeModes(t *testing.T) {
 	}
 	if calls[1][0] != "docker" || calls[1][1] != "--host" || !strings.HasPrefix(calls[1][2], "unix://") {
 		t.Fatalf("calls=%q", calls)
+	}
+}
+
+func TestCollectReportsBoundedInspectionCoverage(t *testing.T) {
+	var listed strings.Builder
+	for i := 0; i < maxContainers+1; i++ {
+		fmt.Fprintf(&listed, "container-%03d\n", i)
+	}
+	c := &Collector{
+		lookPath: func(name string) (string, error) {
+			if name == "docker" {
+				return "", errors.New("not installed")
+			}
+			return name, nil
+		},
+		run: func(_ context.Context, _ string, args ...string) ([]byte, error) {
+			if args[len(args)-1] == "--no-trunc" {
+				return []byte(listed.String()), nil
+			}
+			return []byte(`{"Id":"container-000","State":{"Status":"running"}}`), nil
+		},
+	}
+	data, err := c.Collect(context.Background())
+	if err != nil {
+		t.Fatalf("Collect returned error: %v", err)
+	}
+	if len(data.Containers) != 1 {
+		t.Fatalf("containers=%+v", data.Containers)
+	}
+	got := data.Containers[0]
+	if got.ContainersDiscovered != maxContainers+1 || got.ContainersInspected != maxContainers || !got.ContainerInspectionLimited {
+		t.Fatalf("coverage=%+v", got)
 	}
 }
 

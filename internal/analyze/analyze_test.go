@@ -133,6 +133,21 @@ func TestCgroupFindingsUseSampledEvents(t *testing.T) {
 	}
 }
 
+func TestCgroupMemoryLimitDoesNotRequireRuntimeClassification(t *testing.T) {
+	max := uint64(100)
+	report := model.Report{Metrics: model.Metrics{CPU: &model.CPU{}, CgroupV2: &model.CgroupV2{
+		Available:          true,
+		Containerized:      false,
+		MemoryCurrentBytes: 99,
+		MemoryMaxBytes:     &max,
+		MemoryOOMDelta:     1,
+	}}}
+	Report(&report)
+	if !hasFinding(report, "cgroup-memory-limit") {
+		t.Fatalf("finite pressured cgroup limit must be reported regardless of runtime classification: %#v", report.Findings)
+	}
+}
+
 func TestContainerRestartDeltaAndHealth(t *testing.T) {
 	healthy := true
 	report := model.Report{Metrics: model.Metrics{CPU: &model.CPU{}, Containers: []model.ContainerRuntime{{Runtime: "podman", Containers: []model.Container{{Name: "web", State: "running", Healthy: &healthy}}}}}}
@@ -318,8 +333,8 @@ func TestOptionalSuccessDoesNotHideMissingCoreCoverage(t *testing.T) {
 	}
 	r.Metrics.Systemd.FailedUnits = []string{"database.service"}
 	Report(&r)
-	if !hasFinding(r, "failed-units") || r.Score.Status != model.SeverityCritical {
-		t.Fatalf("known failure suppressed: %+v", r)
+	if !hasFinding(r, "failed-units") || r.Score.Status != model.SeverityUnknown {
+		t.Fatalf("incomplete coverage must retain evidence but invalidate the verdict: %+v", r)
 	}
 }
 

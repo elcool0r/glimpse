@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/elcool0r/glimpse/internal/analyze"
 	"github.com/elcool0r/glimpse/internal/model"
 )
 
@@ -72,6 +73,44 @@ func TestWriteSanitizesExternalTextAndRendersBoundedDetails(t *testing.T) {
 	}
 	if !strings.Contains(text, "(1 more evidence items)") || !strings.Contains(text, "(1 more processes)") {
 		t.Fatalf("bounded detail omission was not indicated:\n%s", text)
+	}
+}
+
+func TestOverviewAndDetailsHeadersAreColoredAndSeparated(t *testing.T) {
+	var output bytes.Buffer
+	Write(&output, model.Report{
+		Metrics:  model.Metrics{CPU: &model.CPU{}},
+		Findings: []model.Finding{{Severity: model.SeverityWarning, Title: "Example finding"}},
+	}, Options{Color: true})
+	text := output.String()
+	for _, header := range []string{"\x1b[35mOverview\x1b[0m", "\x1b[35mDetails\x1b[0m"} {
+		if !strings.Contains(text, header) {
+			t.Fatalf("missing colored header %q:\n%s", header, text)
+		}
+	}
+	if !strings.Contains(text, "\n\n\x1b[35mOverview\x1b[0m\n") || !strings.Contains(text, "\n\n\x1b[35mDetails\x1b[0m\n") {
+		t.Fatalf("section headers must have a free line above them:\n%s", text)
+	}
+}
+
+func TestInfoOnlyDetailsHaveAHeaderWithoutSeparatingLimits(t *testing.T) {
+	var output bytes.Buffer
+	Write(&output, model.Report{
+		Metrics: model.Metrics{
+			CPU:        &model.CPU{},
+			Resources:  &model.Resources{OpenFiles: 1, OpenFilesMaximum: 2},
+			Containers: []model.ContainerRuntime{{Runtime: "docker"}},
+		},
+		Findings: []model.Finding{{Severity: model.SeverityInfo, Title: "Informational fact"}},
+	}, Options{ASCII: true})
+	text := output.String()
+	limits := strings.Index(text, "Limits OK")
+	containers := strings.Index(text, "Containers OK")
+	if limits < 0 || containers < 0 || strings.Contains(text[limits:containers], "\n\n") {
+		t.Fatalf("overview must flow directly into integrations:\n%s", text)
+	}
+	if !strings.Contains(text, "\n\nDetails\nINFO  Informational fact") {
+		t.Fatalf("INFO-only details must retain their heading:\n%s", text)
 	}
 }
 
@@ -172,13 +211,89 @@ func TestContainerSummaryExplainsBoundedLogCheck(t *testing.T) {
 	}
 }
 
-func TestContainerSummaryElevatesLogIssues(t *testing.T) {
+func TestContainerSummaryDoesNotElevateGenericLogIssuesWithoutFinding(t *testing.T) {
 	var output bytes.Buffer
 	Write(&output, model.Report{Metrics: model.Metrics{Containers: []model.ContainerRuntime{{
 		Runtime: "docker", Containers: []model.Container{{State: "running", LogEvents: []model.LogEvent{{Kind: "error", Message: "error"}}}}, LogsChecked: 1, LogCandidates: 1,
 	}}}}, Options{})
-	if !strings.Contains(output.String(), "Containers WARN  docker") || !strings.Contains(output.String(), "1 log issue") {
+	if !strings.Contains(output.String(), "Containers OK  docker") || !strings.Contains(output.String(), "1 log issue") {
 		t.Fatal(output.String())
+	}
+}
+
+// These cases exercise the analyzer and the renderer together. A section's
+// visible badge must reflect the analyzer-owned finding severity; rendering
+// must not silently add or downgrade health policy of its own.
+func TestIntegrationSectionSeverityMatchesAnalyzerFindings(t *testing.T) {
+	tests := []struct {
+		name   string
+		report model.Report
+		want   string
+	}{
+		{
+			name: "generic container wording remains informational",
+			report: model.Report{Metrics: model.Metrics{Containers: []model.ContainerRuntime{{
+				Runtime:    "podman",
+				Containers: []model.Container{{Name: "web", State: "running", LogEvents: []model.LogEvent{{Kind: "error", Message: "retry error"}}}},
+			}}}},
+			want: "Containers INFO",
+		},
+		{
+			name: "intentional exited container remains okay",
+			report: model.Report{Metrics: model.Metrics{Containers: []model.ContainerRuntime{{
+				Runtime: "podman", Containers: []model.Container{{Name: "job", State: "exited"}},
+			}}}},
+			want: "Containers OK",
+		},
+		{
+			name: "critical kernel event stays critical",
+			report: model.Report{Metrics: model.Metrics{Kernel: &model.Kernel{
+				Available: true, Events: []model.LogEvent{{Kind: "kernel_panic", Message: "panic"}},
+			}}},
+			want: "Kernel CRIT",
+		},
+		{
+			name: "selinux permissive stays warning",
+			report: model.Report{Metrics: model.Metrics{Security: &model.Security{
+				Available: true, SELinux: "permissive", AppArmor: "enabled",
+			}}},
+			want: "Security WARN",
+		},
+		{
+			name: "cgroup oom stays critical",
+			report: model.Report{Metrics: model.Metrics{CgroupV2: &model.CgroupV2{
+				Available: true, Containerized: true, MemoryOOMKillDelta: 1,
+			}}},
+			want: "Cgroup v2 CRIT",
+		},
+		{
+			name: "device endurance warning stays warning",
+			report: model.Report{Metrics: model.Metrics{DeviceHealth: []model.DeviceHealth{{
+				Device: "nvme0n1", Kind: "nvme", AvailableSpare: .04, PercentageUsed: .96,
+			}}}},
+			want: "Devices WARN",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			analyze.Report(&tt.report)
+			var output bytes.Buffer
+			Write(&output, tt.report, Options{ASCII: true})
+			if !strings.Contains(output.String(), tt.want) {
+				t.Fatalf("rendered report missing %q:\n%s\nfindings: %#v", tt.want, output.String(), tt.report.Findings)
+			}
+		})
+	}
+}
+
+func TestSecurityKernelTaintExplainsInfoInline(t *testing.T) {
+	var output bytes.Buffer
+	Write(&output, model.Report{Metrics: model.Metrics{Security: &model.Security{
+		Available: true, SELinux: "unknown", AppArmor: "enabled", KernelTaintMask: 4097, KernelTaintModules: []string{"zfs", "spl"},
+	}}, Findings: []model.Finding{{ID: "security-kernel-tainted", Severity: model.SeverityInfo, Category: "security"}}}, Options{ASCII: true})
+	if got := output.String(); !strings.Contains(got, "Security INFO") || !strings.Contains(got, "Kernel taint INFO  mask 4097 (modules zfs,spl)") {
+		t.Fatalf("security INFO lacks inline taint evidence:\n%s", got)
 	}
 }
 

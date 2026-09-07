@@ -37,6 +37,11 @@ func TestRunSamplesTrendsWithinSingleWindow(t *testing.T) {
 	if len(report.Metrics.Trends) != 1 || report.Metrics.Trends[0].Name != "test.calls" {
 		t.Fatalf("unexpected trends: %#v", report.Metrics.Trends)
 	}
+	for _, status := range report.Collection {
+		if status.Collector == "" {
+			t.Fatalf("trend collection added an unnamed status: %+v", report.Collection)
+		}
+	}
 }
 
 type failedDeltaCollector struct{}

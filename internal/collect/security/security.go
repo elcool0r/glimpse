@@ -4,6 +4,7 @@ package security
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,7 +19,10 @@ import (
 	"github.com/elcool0r/glimpse/internal/model"
 )
 
-const maxCommandOutput = 256 << 10
+const (
+	maxCommandOutput      = 256 << 10
+	defaultCommandTimeout = 10 * time.Second
+)
 
 // journalWindow bounds the auth and denial counts to a stated interval.
 //
@@ -154,7 +158,7 @@ func (c *Collector) Collect(ctx context.Context) (collect.Data, error) {
 	}
 	timeout := c.Timeout
 	if timeout <= 0 {
-		timeout = 3 * time.Second
+		timeout = defaultCommandTimeout
 	}
 	isRoot := os.Geteuid() == 0
 	var reduced []string
@@ -174,7 +178,7 @@ func (c *Collector) Collect(ctx context.Context) (collect.Data, error) {
 		} else if ctx.Err() != nil {
 			return collect.Data{}, ctx.Err()
 		} else {
-			diagnostics = append(diagnostics, model.CollectionStatus{Status: "unavailable", Detail: "authentication journal: " + runErr.Error()})
+			diagnostics = append(diagnostics, model.CollectionStatus{Status: "unavailable", Detail: journalQueryDiagnostic("authentication journal", "failed-authentication counts for the last hour", timeout, runErr)})
 		}
 		// Interactive sudo commands: TTY=unknown (or an absent TTY field)
 		// marks a cron job or script running with no controlling terminal,
@@ -184,7 +188,7 @@ func (c *Collector) Collect(ctx context.Context) (collect.Data, error) {
 		} else if ctx.Err() != nil {
 			return collect.Data{}, ctx.Err()
 		} else {
-			diagnostics = append(diagnostics, model.CollectionStatus{Status: "unavailable", Detail: "sudo journal: " + runErr.Error()})
+			diagnostics = append(diagnostics, model.CollectionStatus{Status: "unavailable", Detail: journalQueryDiagnostic("sudo journal", "interactive sudo-command events", timeout, runErr)})
 		}
 		// SELinux AVC and AppArmor denials are emitted by the kernel.
 		if raw, runErr := boundedCommand(ctx, timeout, run, path, "--since=-"+journalWindow, "-k", "--no-pager", "--output=cat", "--lines="+journalMaxRecords); runErr == nil {
@@ -194,7 +198,7 @@ func (c *Collector) Collect(ctx context.Context) (collect.Data, error) {
 		} else if ctx.Err() != nil {
 			return collect.Data{}, ctx.Err()
 		} else {
-			diagnostics = append(diagnostics, model.CollectionStatus{Status: "unavailable", Detail: "kernel denial journal: " + runErr.Error()})
+			diagnostics = append(diagnostics, model.CollectionStatus{Status: "unavailable", Detail: journalQueryDiagnostic("kernel denial journal", "SELinux and AppArmor denial counts for the last hour", timeout, runErr)})
 		}
 	} else {
 		reduced = append(reduced, "journalctl is unavailable; authentication and denial counts were not collected")
@@ -262,7 +266,18 @@ func (c *Collector) Collect(ctx context.Context) (collect.Data, error) {
 func boundedCommand(parent context.Context, timeout time.Duration, run func(context.Context, string, ...string) ([]byte, error), path string, args ...string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
-	return run(ctx, path, args...)
+	raw, err := run(ctx, path, args...)
+	if ctx.Err() == context.DeadlineExceeded {
+		return raw, fmt.Errorf("%w after %s", context.DeadlineExceeded, timeout)
+	}
+	return raw, err
+}
+
+func journalQueryDiagnostic(query, omitted string, timeout time.Duration, err error) string {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Sprintf("%s query timed out after %s; %s were not collected", query, timeout, omitted)
+	}
+	return fmt.Sprintf("%s query failed; %s were not collected: %v", query, omitted, err)
 }
 
 func runCommand(ctx context.Context, name string, args ...string) ([]byte, error) {

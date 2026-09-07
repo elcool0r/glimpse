@@ -92,6 +92,7 @@ glimpse --no-containers              # skip Docker/Podman inspection
 | `--no-color` | Disable ANSI colors (also respects `NO_COLOR`) |
 | `--no-containers` | Disable Docker/Podman inspection |
 | `--disable-external-checks` | Disable the active DNS/gateway/MTU/HTTP checks that send real network traffic |
+| `--no-proxy` | Make HTTP/HTTPS active checks connect directly instead of honoring `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` |
 | `--bash-completion` | Print a Bash completion script |
 | `--version` | Print the version and exit |
 

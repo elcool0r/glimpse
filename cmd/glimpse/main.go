@@ -56,8 +56,8 @@ import (
 // generator (and its test) work from the same flag set instead of a second,
 // easily-forgotten list.
 type cliFlags struct {
-	duration                                                                                                                 *time.Duration
-	noContainers, jsonOutput, noColor, verbose, quiet, events, eventsAll, disableExternalChecks, showVersion, bashCompletion *bool
+	duration                                                                                                                          *time.Duration
+	noContainers, jsonOutput, noColor, verbose, quiet, events, eventsAll, disableExternalChecks, noProxy, showVersion, bashCompletion *bool
 }
 
 func registerFlags(fs *flag.FlagSet) *cliFlags {
@@ -71,6 +71,7 @@ func registerFlags(fs *flag.FlagSet) *cliFlags {
 		events:                fs.Bool("events", false, "always show today's recent-events timeline (normally shown only when a critical finding is present)"),
 		eventsAll:             fs.Bool("events-all", false, "show every recent event instead of the most recent 20; implies --events"),
 		disableExternalChecks: fs.Bool("disable-external-checks", false, "disable active checks that send real network traffic (DNS resolution, gateway/external/IPv6 ICMP, path MTU probe, HTTP/HTTPS GET); on by default"),
+		noProxy:               fs.Bool("no-proxy", false, "do not use HTTP_PROXY, HTTPS_PROXY, or NO_PROXY for HTTP/HTTPS active checks"),
 		showVersion:           fs.Bool("version", false, "print version"),
 		bashCompletion:        fs.Bool("bash-completion", false, "print Bash completion script; use as: source <(glimpse --bash-completion)"),
 	}
@@ -104,7 +105,7 @@ func main() {
 		os.Exit(3)
 	}
 	containerEnabled := !*f.noContainers && runtimeAvailable()
-	collectors := defaultCollectors(containerEnabled, !*f.disableExternalChecks)
+	collectors := defaultCollectors(containerEnabled, !*f.disableExternalChecks, *f.noProxy)
 	tty := platform.IsTerminal(os.Stdout)
 	var progress func(app.Progress)
 	if tty && !*f.jsonOutput {
@@ -126,7 +127,7 @@ func main() {
 // actually reachable: the TCP collector previously existed, was tested, and
 // was documented, but was never registered, leaving its model field, its
 // findings and its report row unreachable in the shipped binary.
-func defaultCollectors(includeContainers, enableExternalChecks bool) []collect.Collector {
+func defaultCollectors(includeContainers, enableExternalChecks bool, disableProxy ...bool) []collect.Collector {
 	collectors := []collect.Collector{
 		cpu.Collector{}, memory.Collector{}, filesystem.Collector{}, disk.Collector{},
 		network.Collector{}, network.TCPCollector{}, networkstate.New(), thermal.Collector{},
@@ -138,7 +139,8 @@ func defaultCollectors(includeContainers, enableExternalChecks bool) []collect.C
 		collectors = append(collectors, containers.New())
 	}
 	if enableExternalChecks {
-		collectors = append(collectors, dnsresolution.New(), gatewayping.New(), pathmtu.New(), httpcheck.New(), icmpcheck.New(), ipv6check.New())
+		noProxy := len(disableProxy) > 0 && disableProxy[0]
+		collectors = append(collectors, dnsresolution.New(), gatewayping.New(), pathmtu.New(), httpcheck.New(noProxy), icmpcheck.New(), ipv6check.New())
 	}
 	return collectors
 }
