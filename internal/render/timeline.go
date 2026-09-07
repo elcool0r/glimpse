@@ -102,6 +102,10 @@ func collectTimelineEvents(r model.Report) []timelineEvent {
 		add(now.Add(-time.Duration(*age*float64(time.Second))), source, label)
 	}
 
+	if r.Host.BootTime != nil {
+		add(*r.Host.BootTime, "system", "system booted")
+	}
+
 	if k := r.Metrics.Kernel; k != nil {
 		for _, event := range k.Events {
 			addAged(event.AgeSeconds, "kernel", cleanText(event.Message))

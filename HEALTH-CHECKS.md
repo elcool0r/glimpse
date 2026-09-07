@@ -163,6 +163,7 @@ Details instead. Only today (local midnight through now) is shown.
 
 | Source | What it covers | Notes |
 | --- | --- | --- |
+| `system` | The current boot, from `Host.BootTime` | Only shown when the boot itself falls within today |
 | `kernel` | Every kernel event scan pattern (see above) | Real timestamp from the journal record's own age |
 | a container runtime name (e.g. `docker`, `podman`) | OOM-killed, unhealthy, restarted, or exited-despite-restart-policy containers; container log lines matching the same concrete failure signatures the analyzer treats as actionable | State facts are stamped "now"; log-line facts carry a real timestamp |
 | `systemd` | Failed units (stamped "now"); unit (re)starts, from systemd's own `ActiveEnterTimestamp` (a real timestamp, independent of glimpse's own sampling window -- a restart from ten minutes before glimpse ran still appears, which a live restart-counter delta cannot see) | The live restart count observed during this specific sample is folded into the precisely-timed line when both are known |

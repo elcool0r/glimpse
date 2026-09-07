@@ -187,6 +187,36 @@ func TestTimelineExcludesGenericContainerLogNoise(t *testing.T) {
 	}
 }
 
+func TestTimelineIncludesRebootFromHostBootTime(t *testing.T) {
+	now := localNoonToday(t)
+	bootTime := now.Add(-3 * time.Hour)
+	report := model.Report{
+		GeneratedAt: now,
+		Host:        model.Host{BootTime: &bootTime},
+	}
+	events := collectTimelineEvents(report)
+	if len(events) != 1 || events[0].source != "system" || events[0].label != "system booted" {
+		t.Fatalf("expected a system-booted event, got %#v", events)
+	}
+	if !events[0].at.Equal(bootTime) {
+		t.Fatalf("expected the real boot time, got %v", events[0].at)
+	}
+}
+
+// A boot from before today is outside the timeline's window and must not
+// appear, the same as any other event.
+func TestTimelineExcludesRebootFromBeforeToday(t *testing.T) {
+	now := localNoonToday(t)
+	bootTime := now.Add(-30 * 24 * time.Hour)
+	report := model.Report{
+		GeneratedAt: now,
+		Host:        model.Host{BootTime: &bootTime},
+	}
+	if events := collectTimelineEvents(report); len(events) != 0 {
+		t.Fatalf("expected no events for an old boot time, got %#v", events)
+	}
+}
+
 func TestTimelineIncludesLiveContainerAndSystemdFacts(t *testing.T) {
 	report := model.Report{
 		GeneratedAt: time.Now(),

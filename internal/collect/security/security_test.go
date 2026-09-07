@@ -108,6 +108,38 @@ func (f fakeEntry) Info() (os.FileInfo, error) { return nil, nil }
 // matches inside them: on a busy host those records are the last few seconds,
 // so a real attack could score zero while a quiet host scored high. The count
 // needs a defined window and a defined population.
+// last has no --no-legend option (unlike lsblk/findmnt and other
+// util-linux tools that do); passing it made the whole command fail with
+// an unrecognized-option error, silently producing zero logins on every
+// real host. This pins the exact argument list so that regression can't
+// come back.
+func TestLastInvocationOmitsUnsupportedNoLegendFlag(t *testing.T) {
+	var lastArgs []string
+	c := New()
+	c.readFile = func(string) ([]byte, error) { return nil, os.ErrNotExist }
+	c.readDir = func(string) ([]os.DirEntry, error) { return nil, os.ErrNotExist }
+	c.lookPath = func(name string) (string, error) {
+		if name == "last" {
+			return "/usr/bin/last", nil
+		}
+		return "", errors.New("missing")
+	}
+	c.run = func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		lastArgs = args
+		return nil, nil
+	}
+	if _, err := c.Collect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(lastArgs, " ")
+	if strings.Contains(joined, "no-legend") {
+		t.Fatalf("last does not support --no-legend: %q", joined)
+	}
+	if !strings.Contains(joined, "--time-format=iso") {
+		t.Fatalf("expected ISO timestamps: %q", joined)
+	}
+}
+
 func TestJournalQueriesAreFilteredAndWindowed(t *testing.T) {
 	var queries [][]string
 	c := New()
@@ -207,6 +239,29 @@ func TestParseLastLoginsSkipsPseudoEntries(t *testing.T) {
 		"wtmp begins 2026-01-01T00:00:00+01:00\n"
 	if got := ParseLastLogins(input); len(got) != 0 {
 		t.Fatalf("expected no logins, got %#v", got)
+	}
+}
+
+// A tmux re-attach session has no remote host at all (it's a local
+// re-attach to an existing session, shown as "tmux(pid).%n" in the host
+// column) and must not be reported as an SSH login.
+func TestParseLastLoginsSkipsTmuxReattaches(t *testing.T) {
+	input := "root     pts/4        tmux(4058185).%5 2026-09-06T18:28:27+02:00 - 2026-09-06T18:36:10+02:00  (00:07)\n"
+	if got := ParseLastLogins(input); len(got) != 0 {
+		t.Fatalf("expected no logins for a tmux re-attach, got %#v", got)
+	}
+}
+
+// last truncates the host column to a fixed width, so an IPv4-mapped IPv6
+// address can arrive already cut off (e.g. "::ffff:172.18.0."). The word
+// boundary that anchors the IPv4 branch cannot anchor here -- "::" is
+// preceded only by whitespace, itself a non-word character -- so the IPv6
+// branch must still match starting directly at "::".
+func TestParseLastLoginsHandlesTruncatedIPv6Host(t *testing.T) {
+	input := "daniel   web console  ::ffff:172.18.0. 2025-12-28T06:05:17+01:00 - 2025-12-28T06:22:32+01:00  (00:17)\n"
+	got := ParseLastLogins(input)
+	if len(got) != 1 || got[0].User != "daniel" || got[0].Source != "::ffff:172.18.0." {
+		t.Fatalf("expected the truncated IPv6 host captured, got %#v", got)
 	}
 }
 

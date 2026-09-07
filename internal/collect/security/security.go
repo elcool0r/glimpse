@@ -205,7 +205,11 @@ func (c *Collector) Collect(ctx context.Context) (collect.Data, error) {
 	// record) is excluded by construction, which a text scan of sshd's
 	// identical-looking "Accepted" line cannot do.
 	if path, err := lookup("last"); err == nil {
-		if raw, runErr := boundedCommand(ctx, timeout, run, path, "--time-format=iso", "-i", "--no-legend", "-n", "200"); runErr == nil {
+		// last has no --no-legend option (unlike lsblk/findmnt and other
+		// util-linux tools); passing it made the whole command fail with an
+		// unrecognized-option error, silently producing zero logins. last's
+		// own output never has a header line to suppress in the first place.
+		if raw, runErr := boundedCommand(ctx, timeout, run, path, "--time-format=iso", "-i", "-n", "200"); runErr == nil {
 			logins = ParseLastLogins(string(raw))
 		} else if ctx.Err() != nil {
 			return collect.Data{}, ctx.Err()
@@ -279,7 +283,13 @@ var (
 	// "::" compression -- the form last actually prints -- rather than any
 	// bare run of colon-separated hex-looking groups, which would also
 	// match an ordinary HH:MM:SS time (hex digits overlap decimal ones).
-	ipLikePattern  = regexp.MustCompile(`\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b|\b[0-9a-fA-F]*::[0-9a-fA-F:]*\b`)
+	// The IPv6 branch has no leading \b: an address last truncates to fit
+	// its fixed-width host column can start directly with "::" (an
+	// IPv4-mapped address like "::ffff:172.18.0."), and \b cannot anchor
+	// between two non-word characters (a space and a colon), which would
+	// otherwise make that case fail to match at all. "." is included so a
+	// mapped address's embedded IPv4 tail is captured too.
+	ipLikePattern  = regexp.MustCompile(`\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b|[0-9a-fA-F.]*::[0-9a-fA-F.:]*`)
 	isoTimePattern = regexp.MustCompile(`\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:[+-]\d{2}:?\d{2}|Z)?`)
 )
 
