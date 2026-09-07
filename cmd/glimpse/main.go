@@ -56,13 +56,14 @@ func main() {
 	}
 	flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
 	var duration time.Duration
-	var noContainers, jsonOutput, noColor, verbose, quiet, disableExternalChecks, showVersion, bashCompletion bool
+	var noContainers, jsonOutput, noColor, verbose, quiet, events, disableExternalChecks, showVersion, bashCompletion bool
 	flag.DurationVar(&duration, "duration", 5*time.Second, "sampling duration (default: 5s); increase for a longer, more thorough sample, e.g. --duration 60s")
 	flag.BoolVar(&noContainers, "no-containers", false, "disable automatic container inspection")
 	flag.BoolVar(&jsonOutput, "json", false, "emit stable JSON")
 	flag.BoolVar(&noColor, "no-color", false, "disable color output")
 	flag.BoolVar(&verbose, "verbose", false, "show every check performed, not just problems")
 	flag.BoolVar(&quiet, "quiet", false, "only show checks that are not OK (INFO, WARN, CRIT, or UNKNOWN)")
+	flag.BoolVar(&events, "events", false, "always show today's recent-events timeline (normally shown only when a critical finding is present)")
 	flag.BoolVar(&disableExternalChecks, "disable-external-checks", false, "disable active checks that send real network traffic (DNS resolution, gateway/external/IPv6 ICMP, path MTU probe, HTTP/HTTPS GET); on by default")
 	flag.BoolVar(&showVersion, "version", false, "print version")
 	flag.BoolVar(&bashCompletion, "bash-completion", false, "print Bash completion script; use as: source <(glimpse --bash-completion)")
@@ -96,7 +97,7 @@ func main() {
 	defer cancel()
 	report := app.Run(ctx, app.Config{Duration: duration, SampleInterval: time.Second, Full: true, IncludeContainers: containerEnabled, Progress: progress}, collectors)
 	analyze.Report(&report)
-	code := writeReport(os.Stdout, os.Stderr, report, jsonOutput, verbose, render.Options{Color: !noColor && os.Getenv("NO_COLOR") == "" && tty, Verbose: verbose, Width: platform.TerminalWidth(os.Stdout), ASCII: !tty, Quiet: quiet})
+	code := writeReport(os.Stdout, os.Stderr, report, jsonOutput, verbose, render.Options{Color: !noColor && os.Getenv("NO_COLOR") == "" && tty, Verbose: verbose, Width: platform.TerminalWidth(os.Stdout), ASCII: !tty, Quiet: quiet, Events: events})
 	if ctx.Err() != nil {
 		code = 3
 	}

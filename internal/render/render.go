@@ -26,6 +26,11 @@ type Options struct {
 	// section badge of OK), leaving only rows with something to say:
 	// INFO, WARN, CRIT, or UNKNOWN.
 	Quiet bool
+	// Events always shows the "Recent events" timeline. Without it, the
+	// timeline only appears when the report already has a critical finding,
+	// since it exists to give a critical its story, not to narrate a
+	// healthy run.
+	Events bool
 }
 
 func Write(w io.Writer, r model.Report, o Options) {
@@ -256,6 +261,9 @@ func Write(w io.Writer, r model.Report, o Options) {
 		}
 	}
 	renderIntegrations(w, width, r, separator, o.Color, o.Verbose, o.Quiet)
+	if o.Events || r.Score.Status == model.SeverityCritical {
+		renderTimeline(w, width, r, o.Color)
+	}
 	findings := actionableFindings(r.Findings)
 	if o.Verbose {
 		findings = r.Findings
@@ -353,10 +361,14 @@ func highlightContainerName(title string, color bool) string {
 }
 
 func detailsHeader(color bool) string {
+	return sectionHeader("Details", color)
+}
+
+func sectionHeader(text string, color bool) string {
 	if !color {
-		return "Details"
+		return text
 	}
-	return "\x1b[35mDetails\x1b[0m"
+	return "\x1b[35m" + text + "\x1b[0m"
 }
 
 // checkLine prints one atomic check as its own badged line: a label, its own
