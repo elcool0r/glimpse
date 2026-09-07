@@ -121,7 +121,7 @@ func Report(report *model.Report) {
 		}
 	}
 	findings = append(findings, diskFindings(report)...)
-	findings = append(findings, tcpFindings(m.TCP, m.Resources)...)
+	findings = append(findings, tcpFindings(m.TCP, m.Resources, m.IPv6Check)...)
 	findings = append(findings, conntrackFindings(m.Conntrack)...)
 	findings = append(findings, deviceHealthFindings(m.DeviceHealth)...)
 	findings = append(findings, timeSyncFindings(m.TimeSync)...)
@@ -455,7 +455,7 @@ func conntrackFindings(conntrack *model.Conntrack) []model.Finding {
 		"Inspect the connection rate against nf_conntrack_max and the conntrack timeouts for the busiest protocol.", 12)}
 }
 
-func tcpFindings(tcp *model.TCP, resources *model.Resources) []model.Finding {
+func tcpFindings(tcp *model.TCP, resources *model.Resources, ipv6 *model.IPv6Check) []model.Finding {
 	if tcp == nil {
 		return nil
 	}
@@ -465,7 +465,19 @@ func tcpFindings(tcp *model.TCP, resources *model.Resources) []model.Finding {
 		if fraction(tcp.RetransmittedSegments, tcp.SegmentsOut) >= .10 {
 			severity, impact = model.SeverityCritical, 20
 		}
-		findings = append(findings, finding("tcp-retransmits", severity, "network", "Elevated TCP retransmissions", fmt.Sprintf("%d of %d outbound TCP segments were retransmitted during the sample (%.1f%%).", tcp.RetransmittedSegments, tcp.SegmentsOut, fraction(tcp.RetransmittedSegments, tcp.SegmentsOut)*100), "Inspect packet loss, interface counters, and the remote path.", impact))
+		summary := fmt.Sprintf("%d of %d outbound TCP segments were retransmitted during the sample (%.1f%%).", tcp.RetransmittedSegments, tcp.SegmentsOut, fraction(tcp.RetransmittedSegments, tcp.SegmentsOut)*100)
+		suggestion := "Inspect packet loss, interface counters, and the remote path."
+		// This counter is system-wide, not per-connection: any application that
+		// races a connection over IPv6 before falling back to IPv4 (or simply
+		// prefers IPv6 and never falls back) contributes its unanswered SYN
+		// retries to it too. When IPv6 is already reported unreachable, that is
+		// usually the more likely explanation and the one to fix first, rather
+		// than a separate, unrelated path problem.
+		if ipv6 != nil && ipv6.Available && ipv6.Sent > 0 && ipv6.Received == 0 {
+			summary += " This host's external IPv6 reachability check also failed during this sample; if any of this traffic was connections racing over IPv6 before falling back to IPv4, that alone can produce this many retransmits."
+			suggestion = "Fix or disable IPv6 first (see the IPv6 finding) and recheck this counter; if it persists afterward, then inspect packet loss, interface counters, and the remote path."
+		}
+		findings = append(findings, finding("tcp-retransmits", severity, "network", "Elevated TCP retransmissions", summary, suggestion, impact))
 	}
 	if tcp.ListenOverflows+tcp.ListenDrops > 0 {
 		// Naming somaxconn turns the finding from an observation into a number

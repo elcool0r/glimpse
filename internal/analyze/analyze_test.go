@@ -60,6 +60,49 @@ func TestTCPRetransmitUsesRatioAndVolume(t *testing.T) {
 	}
 }
 
+// Elevated TCP retransmissions is a system-wide counter: an application
+// racing connections over broken IPv6 before falling back to IPv4 (or never
+// falling back at all) contributes its unanswered SYN retries to the exact
+// same counter as a genuinely lossy path. When the IPv6 check independently
+// reports the host as unreachable, the retransmit finding should point at
+// that as the likely cause instead of reading as a second, unrelated fault.
+func TestTCPRetransmitCorrelatesWithBrokenIPv6(t *testing.T) {
+	report := model.Report{Metrics: model.Metrics{
+		CPU:       &model.CPU{},
+		TCP:       &model.TCP{SegmentsOut: 500, RetransmittedSegments: 20},
+		IPv6Check: &model.IPv6Check{Available: true, Target: "2606:4700:4700::1111", Sent: 3, Received: 0},
+	}}
+	Report(&report)
+	found := findingByID(report, "tcp-retransmits")
+	if found == nil {
+		t.Fatalf("expected the retransmit finding: %#v", report.Findings)
+	}
+	if !contains(found.Summary, "IPv6 reachability check also failed") {
+		t.Fatalf("retransmit finding did not mention the correlated IPv6 failure: %+v", found)
+	}
+	if !contains(found.Suggestion, "Fix or disable IPv6 first") {
+		t.Fatalf("retransmit suggestion did not point at IPv6 first: %+v", found)
+	}
+}
+
+// A working IPv6 check (or none at all) must not add the IPv6 caveat -- it
+// would be actively misleading on a host where IPv6 is not the cause.
+func TestTCPRetransmitStaysUncorrelatedWhenIPv6Works(t *testing.T) {
+	report := model.Report{Metrics: model.Metrics{
+		CPU:       &model.CPU{},
+		TCP:       &model.TCP{SegmentsOut: 500, RetransmittedSegments: 20},
+		IPv6Check: &model.IPv6Check{Available: true, Target: "2606:4700:4700::1111", Sent: 3, Received: 3},
+	}}
+	Report(&report)
+	found := findingByID(report, "tcp-retransmits")
+	if found == nil {
+		t.Fatalf("expected the retransmit finding: %#v", report.Findings)
+	}
+	if contains(found.Summary, "IPv6") {
+		t.Fatalf("healthy IPv6 must not be blamed: %+v", found)
+	}
+}
+
 func TestDeviceMediaErrorsAreCritical(t *testing.T) {
 	report := model.Report{Metrics: model.Metrics{CPU: &model.CPU{}, DeviceHealth: []model.DeviceHealth{{Device: "nvme0n1", Kind: "nvme", MediaErrors: 1}}}}
 	Report(&report)
