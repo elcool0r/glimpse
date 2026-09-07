@@ -3,14 +3,15 @@ package main
 import (
 	"bytes"
 	"encoding/json"
-	"github.com/elcool0r/glimpse/internal/model"
-	"github.com/elcool0r/glimpse/internal/render"
+	"flag"
 	"io"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/elcool0r/glimpse/internal/app"
+	"github.com/elcool0r/glimpse/internal/model"
+	"github.com/elcool0r/glimpse/internal/render"
 )
 
 func TestReportExitCodesIndependentOfFormat(t *testing.T) {
@@ -31,6 +32,24 @@ func TestReportExitCodesIndependentOfFormat(t *testing.T) {
 		}
 	}
 }
+
+// The bash completion word list is generated from the registered flags
+// rather than a hand-maintained string precisely so a new flag can't be
+// added without appearing here too, the way --quiet and --events once did.
+func TestBashCompletionListsEveryRegisteredFlag(t *testing.T) {
+	fs := flag.NewFlagSet("glimpse", flag.ContinueOnError)
+	registerFlags(fs)
+	script := bashCompletionScript(fs)
+	fs.VisitAll(func(f *flag.Flag) {
+		if !strings.Contains(script, "--"+f.Name) {
+			t.Errorf("bash completion is missing --%s", f.Name)
+		}
+	})
+	if !strings.Contains(script, "--help") {
+		t.Error("bash completion is missing --help")
+	}
+}
+
 func TestRequireLongOptions(t *testing.T) {
 	if err := requireLongOptions([]string{"--quick", "--duration=5s"}); err != nil {
 		t.Fatalf("long options unexpectedly rejected: %v", err)

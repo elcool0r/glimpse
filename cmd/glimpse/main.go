@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -49,55 +50,69 @@ import (
 	"github.com/elcool0r/glimpse/internal/version"
 )
 
+// cliFlags holds every registered flag's destination, so registerFlags is
+// the one place a flag is defined and both main and the bash-completion
+// generator (and its test) work from the same flag set instead of a second,
+// easily-forgotten list.
+type cliFlags struct {
+	duration                                                                                                      *time.Duration
+	noContainers, jsonOutput, noColor, verbose, quiet, events, disableExternalChecks, showVersion, bashCompletion *bool
+}
+
+func registerFlags(fs *flag.FlagSet) *cliFlags {
+	f := &cliFlags{
+		duration:              fs.Duration("duration", 5*time.Second, "sampling duration (default: 5s); increase for a longer, more thorough sample, e.g. --duration 60s"),
+		noContainers:          fs.Bool("no-containers", false, "disable automatic container inspection"),
+		jsonOutput:            fs.Bool("json", false, "emit stable JSON"),
+		noColor:               fs.Bool("no-color", false, "disable color output"),
+		verbose:               fs.Bool("verbose", false, "show every check performed, not just problems"),
+		quiet:                 fs.Bool("quiet", false, "only show checks that are not OK (INFO, WARN, CRIT, or UNKNOWN)"),
+		events:                fs.Bool("events", false, "always show today's recent-events timeline (normally shown only when a critical finding is present)"),
+		disableExternalChecks: fs.Bool("disable-external-checks", false, "disable active checks that send real network traffic (DNS resolution, gateway/external/IPv6 ICMP, path MTU probe, HTTP/HTTPS GET); on by default"),
+		showVersion:           fs.Bool("version", false, "print version"),
+		bashCompletion:        fs.Bool("bash-completion", false, "print Bash completion script; use as: source <(glimpse --bash-completion)"),
+	}
+	fs.Usage = usage
+	return f
+}
+
 func main() {
 	if err := requireLongOptions(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(3)
 	}
 	flag.CommandLine = flag.NewFlagSet(os.Args[0], flag.ContinueOnError)
-	var duration time.Duration
-	var noContainers, jsonOutput, noColor, verbose, quiet, events, disableExternalChecks, showVersion, bashCompletion bool
-	flag.DurationVar(&duration, "duration", 5*time.Second, "sampling duration (default: 5s); increase for a longer, more thorough sample, e.g. --duration 60s")
-	flag.BoolVar(&noContainers, "no-containers", false, "disable automatic container inspection")
-	flag.BoolVar(&jsonOutput, "json", false, "emit stable JSON")
-	flag.BoolVar(&noColor, "no-color", false, "disable color output")
-	flag.BoolVar(&verbose, "verbose", false, "show every check performed, not just problems")
-	flag.BoolVar(&quiet, "quiet", false, "only show checks that are not OK (INFO, WARN, CRIT, or UNKNOWN)")
-	flag.BoolVar(&events, "events", false, "always show today's recent-events timeline (normally shown only when a critical finding is present)")
-	flag.BoolVar(&disableExternalChecks, "disable-external-checks", false, "disable active checks that send real network traffic (DNS resolution, gateway/external/IPv6 ICMP, path MTU probe, HTTP/HTTPS GET); on by default")
-	flag.BoolVar(&showVersion, "version", false, "print version")
-	flag.BoolVar(&bashCompletion, "bash-completion", false, "print Bash completion script; use as: source <(glimpse --bash-completion)")
-	flag.CommandLine.Usage = usage
+	f := registerFlags(flag.CommandLine)
 	if err := flag.CommandLine.Parse(os.Args[1:]); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return
 		}
 		os.Exit(3)
 	}
-	if bashCompletion {
-		fmt.Fprint(os.Stdout, bashCompletionScript)
+	if *f.bashCompletion {
+		fmt.Fprint(os.Stdout, bashCompletionScript(flag.CommandLine))
 		return
 	}
-	if showVersion {
+	if *f.showVersion {
 		fmt.Println(version.Version)
 		return
 	}
-	if duration < 0 || flag.NArg() != 0 {
+	if *f.duration < 0 || flag.NArg() != 0 {
 		fmt.Fprintln(os.Stderr, "duration must be non-negative and positional arguments are not supported")
 		os.Exit(3)
 	}
-	containerEnabled := !noContainers && runtimeAvailable()
-	collectors := defaultCollectors(containerEnabled, !disableExternalChecks)
+	containerEnabled := !*f.noContainers && runtimeAvailable()
+	collectors := defaultCollectors(containerEnabled, !*f.disableExternalChecks)
 	tty := platform.IsTerminal(os.Stdout)
 	var progress func(app.Progress)
-	if tty && !jsonOutput {
+	if tty && !*f.jsonOutput {
 		progress = progressWriter(os.Stderr)
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	report := app.Run(ctx, app.Config{Duration: duration, SampleInterval: time.Second, Full: true, IncludeContainers: containerEnabled, Progress: progress}, collectors)
+	report := app.Run(ctx, app.Config{Duration: *f.duration, SampleInterval: time.Second, Full: true, IncludeContainers: containerEnabled, Progress: progress}, collectors)
 	analyze.Report(&report)
-	code := writeReport(os.Stdout, os.Stderr, report, jsonOutput, verbose, render.Options{Color: !noColor && os.Getenv("NO_COLOR") == "" && tty, Verbose: verbose, Width: platform.TerminalWidth(os.Stdout), ASCII: !tty, Quiet: quiet, Events: events})
+	code := writeReport(os.Stdout, os.Stderr, report, *f.jsonOutput, *f.verbose, render.Options{Color: !*f.noColor && os.Getenv("NO_COLOR") == "" && tty, Verbose: *f.verbose, Width: platform.TerminalWidth(os.Stdout), ASCII: !tty, Quiet: *f.quiet, Events: *f.events})
 	if ctx.Err() != nil {
 		code = 3
 	}
@@ -238,18 +253,28 @@ func usage() {
 	})
 }
 
-const bashCompletionScript = `# Bash completion for glimpse.
-_glimpse() {
-    local current previous
-    current="${COMP_WORDS[COMP_CWORD]}"
-    previous="${COMP_WORDS[COMP_CWORD-1]}"
-    case "$previous" in
-        --duration) COMPREPLY=( $(compgen -W '5s 30s 60s 5m' -- "$current") ); return 0 ;;
-    esac
-    COMPREPLY=( $(compgen -W '--duration --no-containers --json --no-color --verbose --disable-external-checks --version --bash-completion --help' -- "$current") )
+// bashCompletionScript builds the completion word list from the flags
+// actually registered on flag.CommandLine, so a new flag can't be added
+// without also appearing here -- a fixed word list previously went stale
+// the moment a flag was added and nobody remembered to update this string.
+func bashCompletionScript(fs *flag.FlagSet) string {
+	names := []string{"--help"}
+	fs.VisitAll(func(f *flag.Flag) {
+		names = append(names, "--"+f.Name)
+	})
+	sort.Strings(names)
+	return "# Bash completion for glimpse.\n" +
+		"_glimpse() {\n" +
+		"    local current previous\n" +
+		"    current=\"${COMP_WORDS[COMP_CWORD]}\"\n" +
+		"    previous=\"${COMP_WORDS[COMP_CWORD-1]}\"\n" +
+		"    case \"$previous\" in\n" +
+		"        --duration) COMPREPLY=( $(compgen -W '5s 30s 60s 5m' -- \"$current\") ); return 0 ;;\n" +
+		"    esac\n" +
+		"    COMPREPLY=( $(compgen -W '" + strings.Join(names, " ") + "' -- \"$current\") )\n" +
+		"}\n" +
+		"complete -F _glimpse glimpse\n"
 }
-complete -F _glimpse glimpse
-`
 
 // Keep renderer's writer-only API while propagating failed output to callers.
 type checkedWriter struct {
