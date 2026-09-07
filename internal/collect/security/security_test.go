@@ -229,6 +229,22 @@ func TestParseSudoCommandsExtractsInteractiveCommands(t *testing.T) {
 	}
 }
 
+// sudo right-pads short usernames with leading spaces so its own log lines
+// align in a fixed-width column -- "    root :", "  daniel :" -- which a
+// naive regex anchored to the start of the message never matches. This is
+// the exact real-world line format that first exposed the bug.
+func TestParseSudoCommandsHandlesPaddedUsernames(t *testing.T) {
+	input := "1700000000 danger-server sudo[2582758]:     root : TTY=pts/0 ; PWD=/root ; USER=root ; COMMAND=/usr/bin/echo foo\n" +
+		"1700000200 danger-server sudo[2587871]:   daniel : TTY=pts/0 ; PWD=/home/daniel ; USER=root ; COMMAND=/usr/bin/echo foo\n"
+	got := ParseSudoCommands(input)
+	if len(got) != 2 {
+		t.Fatalf("expected 2 sudo events, got %#v", got)
+	}
+	if got[0].User != "root" || got[1].User != "daniel" {
+		t.Fatalf("unexpected users: %+v", got)
+	}
+}
+
 // sudo logs TTY=unknown for a cron job or script with no controlling
 // terminal; that must be excluded the same way a non-interactive SSH
 // session is.

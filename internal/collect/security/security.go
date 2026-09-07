@@ -379,7 +379,11 @@ func ParseSudoCommands(output string) []model.SudoEvent {
 		if !ok {
 			continue
 		}
-		m := sudoCommandPattern.FindStringSubmatch(message)
+		// sudo right-pads short usernames with leading spaces so its log
+		// lines align in a fixed-width column ("    root :", "  daniel :");
+		// the pattern below anchors to the start of the message and would
+		// otherwise never match a padded username.
+		m := sudoCommandPattern.FindStringSubmatch(strings.TrimSpace(message))
 		if m == nil {
 			continue
 		}
