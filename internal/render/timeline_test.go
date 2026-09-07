@@ -63,6 +63,28 @@ func localNoonToday(t *testing.T) time.Time {
 	return time.Date(now.Year(), now.Month(), now.Day(), 12, 0, 0, 0, now.Location())
 }
 
+// A silently empty section is indistinguishable from --events doing
+// nothing; the report must say plainly that nothing qualified.
+func TestTimelineExplainsWhenNoEventsQualify(t *testing.T) {
+	report := model.Report{
+		Host:    model.Host{Hostname: "host"},
+		Score:   model.Score{Status: model.SeverityOK},
+		Metrics: model.Metrics{CPU: &model.CPU{}},
+		Findings: []model.Finding{
+			{ID: "zombies", Severity: model.SeverityInfo, Category: "process", Title: "Zombie processes present"},
+			{ID: "security-reboot-required", Severity: model.SeverityInfo, Category: "security", Title: "Reboot is pending"},
+		},
+	}
+	var out strings.Builder
+	Write(&out, report, Options{Events: true})
+	if !strings.Contains(out.String(), "Recent events (today)") {
+		t.Fatalf("expected the timeline header even with no qualifying events:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "No kernel, container, or service events with a known time were recorded today.") {
+		t.Fatalf("expected an explicit empty-state message:\n%s", out.String())
+	}
+}
+
 func TestTimelineOrdersNewestFirst(t *testing.T) {
 	now := localNoonToday(t)
 	report := model.Report{

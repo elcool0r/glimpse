@@ -29,15 +29,22 @@ type timelineEvent struct {
 // renderTimeline prints today's notable events -- kernel/hardware faults,
 // container incidents, and service failures/restarts -- in chronological
 // order (most recent first), so a critical finding arrives with the story
-// leading up to it instead of only its own isolated snapshot.
+// leading up to it instead of only its own isolated snapshot. It always
+// prints the section header once invoked (by a critical finding or
+// --events), even when nothing qualifies: a silently empty section would be
+// indistinguishable from --events doing nothing at all.
 func renderTimeline(w io.Writer, width int, r model.Report, color bool) {
 	events := collectTimelineEvents(r)
-	if len(events) == 0 {
-		return
-	}
 	sort.Slice(events, func(i, j int) bool { return events[i].at.After(events[j].at) })
 	fmt.Fprintln(w)
 	writeWrapped(w, width, "", sectionHeader("Recent events (today)", color))
+	if len(events) == 0 {
+		// A silently empty section here is indistinguishable from the flag
+		// doing nothing; say plainly that nothing qualified rather than just
+		// omitting the section, especially since --events was asked for.
+		writeWrapped(w, width, "", "No kernel, container, or service events with a known time were recorded today.")
+		return
+	}
 	omitted := 0
 	if len(events) > maxTimelineEvents {
 		omitted = len(events) - maxTimelineEvents
