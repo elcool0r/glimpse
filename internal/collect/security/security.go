@@ -36,10 +36,10 @@ const (
 	// record authentication outcomes. Priority cannot be used instead: these
 	// records are informational, not warnings.
 	authprivFacility = "SYSLOG_FACILITY=10"
-	// loginEventsWindow matches the timeline's own "today" scope, unlike the
+	// journalEventsWindow matches the timeline's own "today" scope, unlike the
 	// 1h journalWindow above (which bounds the noisier failed-auth *count*
 	// so its ratio has a well-defined denominator).
-	loginEventsWindow = "24h"
+	journalEventsWindow = "24h"
 )
 
 type Collector struct {
@@ -159,6 +159,7 @@ func (c *Collector) Collect(ctx context.Context) (collect.Data, error) {
 	isRoot := os.Geteuid() == 0
 	var reduced []string
 	var logins []model.LoginEvent
+	var sudoCommands []model.SudoEvent
 	if path, err := lookup("journalctl"); err == nil {
 		s.JournalWindow = journalWindow
 		// Authentication outcomes come from the authpriv facility; scanning an
@@ -175,16 +176,15 @@ func (c *Collector) Collect(ctx context.Context) (collect.Data, error) {
 		} else {
 			diagnostics = append(diagnostics, model.CollectionStatus{Status: "unavailable", Detail: "authentication journal: " + runErr.Error()})
 		}
-		// A separate, wider-window scan (short-unix, so each login keeps its
-		// real time) for successful interactive logins -- the 1h/--output=cat
-		// scan above only needs to count failures, not place them on a
-		// timeline.
-		if raw, runErr := boundedCommand(ctx, timeout, run, path, "--since=-"+loginEventsWindow, "--no-pager", "--output=short-unix", "--lines="+journalMaxRecords, authprivFacility); runErr == nil {
-			logins = ParseLoginEvents(string(raw))
+		// Interactive sudo commands: TTY=unknown (or an absent TTY field)
+		// marks a cron job or script running with no controlling terminal,
+		// which is excluded the same way a non-interactive SSH session is.
+		if raw, runErr := boundedCommand(ctx, timeout, run, path, "_COMM=sudo", "--since=-"+journalEventsWindow, "--no-pager", "--output=short-unix", "--lines="+journalMaxRecords); runErr == nil {
+			sudoCommands = ParseSudoCommands(string(raw))
 		} else if ctx.Err() != nil {
 			return collect.Data{}, ctx.Err()
 		} else {
-			diagnostics = append(diagnostics, model.CollectionStatus{Status: "unavailable", Detail: "login journal: " + runErr.Error()})
+			diagnostics = append(diagnostics, model.CollectionStatus{Status: "unavailable", Detail: "sudo journal: " + runErr.Error()})
 		}
 		// SELinux AVC and AppArmor denials are emitted by the kernel.
 		if raw, runErr := boundedCommand(ctx, timeout, run, path, "--since=-"+journalWindow, "-k", "--no-pager", "--output=cat", "--lines="+journalMaxRecords); runErr == nil {
@@ -198,6 +198,22 @@ func (c *Collector) Collect(ctx context.Context) (collect.Data, error) {
 		}
 	} else {
 		reduced = append(reduced, "journalctl is unavailable; authentication and denial counts were not collected")
+	}
+	// Real interactive login sessions come from wtmp via `last`, not sshd's
+	// own journal line: wtmp is only written for a session that allocates a
+	// login shell, so a non-interactive `ssh host command` (no pty, no wtmp
+	// record) is excluded by construction, which a text scan of sshd's
+	// identical-looking "Accepted" line cannot do.
+	if path, err := lookup("last"); err == nil {
+		if raw, runErr := boundedCommand(ctx, timeout, run, path, "--time-format=iso", "-i", "--no-legend", "-n", "200"); runErr == nil {
+			logins = ParseLastLogins(string(raw))
+		} else if ctx.Err() != nil {
+			return collect.Data{}, ctx.Err()
+		} else {
+			diagnostics = append(diagnostics, model.CollectionStatus{Status: "unavailable", Detail: "last: " + runErr.Error()})
+		}
+	} else {
+		reduced = append(reduced, "last is unavailable; login events were not collected")
 	}
 	if path, err := lookup("who"); err == nil {
 		if raw, runErr := boundedCommand(ctx, timeout, run, path); runErr == nil {
@@ -236,7 +252,7 @@ func (c *Collector) Collect(ctx context.Context) (collect.Data, error) {
 	}
 	s.Available = observed
 	privileges := &model.Privileges{IsRoot: isRoot, ReducedCoverage: reduced}
-	return collect.Data{Security: s, Privileges: privileges, Diagnostics: diagnostics, Logins: logins}, nil
+	return collect.Data{Security: s, Privileges: privileges, Diagnostics: diagnostics, Logins: logins, SudoCommands: sudoCommands}, nil
 }
 
 func boundedCommand(parent context.Context, timeout time.Duration, run func(context.Context, string, ...string) ([]byte, error), path string, args ...string) ([]byte, error) {
@@ -255,26 +271,95 @@ func runCommand(ctx context.Context, name string, args ...string) ([]byte, error
 func uintPtr(v uint64) *uint64 { return &v }
 
 var (
-	acceptedLoginPattern  = regexp.MustCompile(`^Accepted (publickey|password|keyboard-interactive/pam) for (?:invalid user )?(\S+) from (\S+) port \d+`)
-	sftpSubsystemPattern  = regexp.MustCompile(`subsystem request for sftp`)
-	sshdIdentifierPattern = regexp.MustCompile(`^sshd\[(\d+)\]$`)
+	// loginPseudoUsers are wtmp records that are not a real login: a boot
+	// marker, a runlevel/shutdown record, or the "wtmp/btmp begins" trailer
+	// line last prints at the end of its output.
+	loginPseudoUsers = map[string]bool{"reboot": true, "shutdown": true, "runlevel": true, "wtmp": true, "btmp": true}
+	// ipLikePattern matches an IPv4 address, or an IPv6 address containing
+	// "::" compression -- the form last actually prints -- rather than any
+	// bare run of colon-separated hex-looking groups, which would also
+	// match an ordinary HH:MM:SS time (hex digits overlap decimal ones).
+	ipLikePattern  = regexp.MustCompile(`\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b|\b[0-9a-fA-F]*::[0-9a-fA-F:]*\b`)
+	isoTimePattern = regexp.MustCompile(`\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:[+-]\d{2}:?\d{2}|Z)?`)
 )
 
-// ParseLoginEvents extracts successful interactive SSH logins from a
-// journalctl short-unix scan of the authpriv facility. A session that
-// immediately requests the sftp subsystem is excluded on a best-effort
-// basis: it covers sftp itself and, since OpenSSH 9.0, scp's default
-// SFTP-protocol mode, correlated by the sshd worker PID both lines share.
-// It cannot distinguish a real interactive login from a non-interactive
-// `ssh host command` invocation, since sshd logs an identical "Accepted"
-// line for both -- that is a limitation of the log source, not this parser.
-func ParseLoginEvents(output string) []model.LoginEvent {
-	type candidate struct {
-		at                   time.Time
-		method, user, source string
+// ParseLastLogins extracts real interactive login sessions from `last
+// --time-format=iso -i`. wtmp (last's own source) only gets a record when a
+// session allocates a login shell/pty, so a non-interactive
+// `ssh host command` invocation -- which allocates neither -- has no wtmp
+// entry and is excluded by construction, unlike a raw scan of sshd's own
+// log line (identical for both cases).
+//
+// Parsing is deliberately format-tolerant rather than column-exact: it
+// looks for a leading username, an IP-shaped token anywhere in the line
+// (present only for a remote/SSH session; a local console login has none
+// and is correctly skipped), and the first ISO-8601 timestamp on the line
+// (the session's start time; an end time or "still logged in" after it is
+// not needed here). -i suppresses reverse-DNS hostname lookups, which
+// would otherwise make this an unbounded-latency command on a host with
+// broken DNS.
+func ParseLastLogins(output string) []model.LoginEvent {
+	var logins []model.LoginEvent
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		user := fields[0]
+		if loginPseudoUsers[strings.ToLower(user)] {
+			continue
+		}
+		loc := isoTimePattern.FindStringIndex(line)
+		if loc == nil {
+			continue
+		}
+		stamp := line[loc[0]:loc[1]]
+		// The host/IP field always precedes the timestamp column in last's
+		// output; searching only that prefix keeps the IP match from ever
+		// colliding with digits inside the timestamp itself.
+		source := ipLikePattern.FindString(line[:loc[0]])
+		if source == "" {
+			continue
+		}
+		at, err := parseFlexibleISO(stamp)
+		if err != nil {
+			continue
+		}
+		logins = append(logins, model.LoginEvent{At: at, User: user, Source: source})
 	}
-	candidatesByPID := make(map[string]candidate)
-	sftpPIDs := make(map[string]bool)
+	sort.Slice(logins, func(i, j int) bool { return logins[i].At.Before(logins[j].At) })
+	return logins
+}
+
+// parseFlexibleISO accepts both a colon-separated UTC offset ("+02:00", the
+// documented ISO-8601 form) and the bare four-digit form ("+0200", what
+// strftime's %z actually produces, which some `last` builds use verbatim
+// for --time-format=iso).
+func parseFlexibleISO(s string) (time.Time, error) {
+	if t, err := time.Parse("2006-01-02T15:04:05Z07:00", s); err == nil {
+		return t, nil
+	}
+	return time.Parse("2006-01-02T15:04:05Z0700", s)
+}
+
+// sudoCommandPattern matches sudo's own log line, e.g.
+// "daniel : TTY=pts/1 ; PWD=/home/daniel ; USER=root ; COMMAND=/usr/bin/apt update".
+// TTY is captured separately so a cron/script invocation (TTY=unknown, or no
+// TTY field at all) can be excluded; COMMAND is captured greedily to the end
+// of the line since an argument may itself contain " ; ".
+var sudoCommandPattern = regexp.MustCompile(`^(\S+)\s*:.*?TTY=(\S+).*?USER=(\S+).*?COMMAND=(.*)$`)
+
+// ParseSudoCommands reads a journalctl short-unix scan filtered to
+// `_COMM=sudo`. Only commands run from a real terminal are kept: sudo
+// itself logs TTY=unknown for a cron job or script, which has no
+// controlling terminal, the same signal ParseLastLogins uses to exclude
+// non-interactive SSH sessions.
+func ParseSudoCommands(output string) []model.SudoEvent {
+	var events []model.SudoEvent
 	for _, raw := range strings.Split(output, "\n") {
 		line := strings.TrimSpace(raw)
 		stamp, rest, ok := strings.Cut(line, " ")
@@ -285,37 +370,27 @@ func ParseLoginEvents(output string) []model.LoginEvent {
 		if err != nil || seconds <= 0 {
 			continue
 		}
-		// rest: "<hostname> sshd[pid]: <message>"
+		// rest: "<hostname> sudo[pid]: <message>"
 		_, rest, ok = strings.Cut(rest, " ")
 		if !ok {
 			continue
 		}
-		identifier, message, ok := strings.Cut(rest, ": ")
+		_, message, ok := strings.Cut(rest, ": ")
 		if !ok {
 			continue
 		}
-		pidMatch := sshdIdentifierPattern.FindStringSubmatch(identifier)
-		if pidMatch == nil {
+		m := sudoCommandPattern.FindStringSubmatch(message)
+		if m == nil {
 			continue
 		}
-		pid := pidMatch[1]
-		if sftpSubsystemPattern.MatchString(message) {
-			sftpPIDs[pid] = true
+		tty := m[2]
+		if tty == "" || strings.EqualFold(tty, "unknown") {
 			continue
 		}
-		if m := acceptedLoginPattern.FindStringSubmatch(message); m != nil {
-			candidatesByPID[pid] = candidate{at: time.Unix(int64(seconds), 0), method: m[1], user: m[2], source: m[3]}
-		}
+		events = append(events, model.SudoEvent{At: time.Unix(int64(seconds), 0), User: m[1], RunAs: m[3], Command: strings.TrimSpace(m[4])})
 	}
-	var logins []model.LoginEvent
-	for pid, c := range candidatesByPID {
-		if sftpPIDs[pid] {
-			continue
-		}
-		logins = append(logins, model.LoginEvent{At: c.at, User: c.user, Source: c.source, Method: c.method})
-	}
-	sort.Slice(logins, func(i, j int) bool { return logins[i].At.Before(logins[j].At) })
-	return logins
+	sort.Slice(events, func(i, j int) bool { return events[i].At.Before(events[j].At) })
+	return events
 }
 
 // ParseJournalSecurity classifies high-signal auth and MAC denial messages.

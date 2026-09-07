@@ -80,6 +80,7 @@ type Metrics struct {
 	Trends          []Trend            `json:"trends,omitempty"`
 	PackageActivity []PackageActivity  `json:"package_activity,omitempty"`
 	Logins          []LoginEvent       `json:"logins,omitempty"`
+	SudoCommands    []SudoEvent        `json:"sudo_commands,omitempty"`
 }
 
 // PackageActivity is one bounded, timestamped package-manager transaction --
@@ -92,17 +93,30 @@ type PackageActivity struct {
 	Summary string    `json:"summary"`
 }
 
-// LoginEvent is one successful interactive SSH authentication. It is scoped
-// to logins specifically: a scripted `ssh host command` invocation produces
-// the identical sshd log line as a real interactive session and cannot be
-// distinguished from it at this level, but a session that immediately
-// requests the sftp subsystem (covering both sftp and modern scp, which
-// defaults to the SFTP protocol) is excluded on a best-effort basis.
+// LoginEvent is one real interactive login session, from wtmp (the `last`
+// command's own source of truth). wtmp is only written for a session that
+// allocates a login shell, so a non-interactive `ssh host command` -- which
+// allocates no pty and writes no wtmp record -- is excluded by construction,
+// unlike a naive read of sshd's own "Accepted" log line (which is identical
+// for both). Method is not populated: wtmp does not record how the session
+// authenticated, only who, from where, and when.
 type LoginEvent struct {
 	At     time.Time `json:"at"`
 	User   string    `json:"user"`
 	Source string    `json:"source,omitempty"`
 	Method string    `json:"method,omitempty"`
+}
+
+// SudoEvent is one interactive sudo command execution. It is scoped to
+// commands run from a real terminal (sudo logs TTY=unknown, or omits TTY,
+// for cron jobs and scripts that have no controlling terminal), which
+// excludes automated sudo usage the same way LoginEvent excludes
+// non-interactive SSH sessions.
+type SudoEvent struct {
+	At      time.Time `json:"at"`
+	User    string    `json:"user"`
+	RunAs   string    `json:"run_as,omitempty"`
+	Command string    `json:"command"`
 }
 
 type CPU struct {

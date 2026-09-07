@@ -21,8 +21,8 @@ const maxTimelineEvents = 20
 // -- this report cannot say when that condition started, and guessing would
 // be worse than leaving it out; that state is already reported properly
 // elsewhere (the metric row and Details). source names where the fact came
-// from (kernel, systemd, a container runtime, apt/yum, ssh), so a reader
-// knows which log to open to dig further without guessing.
+// from (kernel, systemd, a container runtime, apt/yum, ssh, sudo), so a
+// reader knows which log to open to dig further without guessing.
 type timelineEvent struct {
 	at     time.Time
 	label  string
@@ -31,33 +31,37 @@ type timelineEvent struct {
 
 // renderTimeline prints today's notable events -- kernel/hardware faults,
 // container incidents, and service failures/restarts -- in chronological
-// order (most recent first), so a critical finding arrives with the story
-// leading up to it instead of only its own isolated snapshot. It always
-// prints the section header once invoked (by a critical finding or
+// order (oldest first, latest last, the way a log or scrollback reads), so
+// a critical finding arrives with the story leading up to it instead of
+// only its own isolated snapshot. It always prints the section header once
+// invoked (by a critical finding or
 // --events), even when nothing qualifies: a silently empty section would be
 // indistinguishable from --events doing nothing at all.
 func renderTimeline(w io.Writer, width int, r model.Report, color bool) {
 	events := collectTimelineEvents(r)
-	sort.Slice(events, func(i, j int) bool { return events[i].at.After(events[j].at) })
+	// Oldest first, latest last: this reads top-to-bottom the way a log or
+	// scrollback does, with "now" nearest the prompt.
+	sort.Slice(events, func(i, j int) bool { return events[i].at.Before(events[j].at) })
 	fmt.Fprintln(w)
 	writeWrapped(w, width, "", sectionHeader("Recent events (today)", color))
 	if len(events) == 0 {
 		// A silently empty section here is indistinguishable from the flag
 		// doing nothing; say plainly that nothing qualified rather than just
 		// omitting the section, especially since --events was asked for.
-		writeWrapped(w, width, "", "No kernel, container, service, package, or login events with a known time were recorded today.")
+		writeWrapped(w, width, "", "No kernel, container, service, package, login, or sudo events with a known time were recorded today.")
 		return
 	}
 	omitted := 0
 	if len(events) > maxTimelineEvents {
+		// The events being cut are the oldest ones (index 0 onward), since
+		// the most recent must survive the cap; say so before the list
+		// rather than after, since it now describes what came before it.
 		omitted = len(events) - maxTimelineEvents
-		events = events[:maxTimelineEvents]
+		events = events[omitted:]
+		writeWrapped(w, width, "", fmt.Sprintf("(%d more event(s) earlier today)", omitted))
 	}
 	for _, e := range events {
 		writeWrapped(w, width, "", fmt.Sprintf("%s  %s  %s", metadata(e.at.Local().Format("15:04"), color), metadata("["+e.source+"]", color), cleanText(e.label)))
-	}
-	if omitted > 0 {
-		writeWrapped(w, width, "", fmt.Sprintf("(%d more event(s) earlier today)", omitted))
 	}
 }
 
@@ -65,9 +69,9 @@ func renderTimeline(w io.Writer, width int, r model.Report, color bool) {
 // collected. Two kinds of source exist:
 //
 //   - A real historical timestamp: kernel journal entries, container log
-//     lines, package-manager transactions, and SSH logins all carry (or can
-//     derive) a real moment. Anything without one cannot be placed on the
-//     timeline and is left out (it still appears elsewhere).
+//     lines, package-manager transactions, SSH logins, and sudo commands all
+//     carry (or can derive) a real moment. Anything without one cannot be
+//     placed on the timeline and is left out (it still appears elsewhere).
 //   - A live fact with no historical record of when it started: a
 //     currently-failed systemd unit, a container this sample found
 //     unhealthy or OOM-killed. These are stamped "now" -- true for the
@@ -185,7 +189,26 @@ func collectTimelineEvents(r model.Report) []timelineEvent {
 		add(login.At, "ssh", label)
 	}
 
+	for _, cmd := range r.Metrics.SudoCommands {
+		label := fmt.Sprintf("%s ran sudo", cleanText(cmd.User))
+		if cmd.RunAs != "" && !strings.EqualFold(cmd.RunAs, "root") {
+			label += " as " + cleanText(cmd.RunAs)
+		}
+		label += ": " + truncateForDisplay(cleanText(cmd.Command), 80)
+		add(cmd.At, "sudo", label)
+	}
+
 	return events
+}
+
+// truncateForDisplay caps a raw command line to a readable length; the full
+// text is still available in the underlying model/JSON for anyone who needs
+// it.
+func truncateForDisplay(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "..."
 }
 
 // timelineSpecificLogKind mirrors analyze.specificLogKind: only a concrete

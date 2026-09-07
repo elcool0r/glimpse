@@ -1,7 +1,7 @@
 package render
 
 import (
-	"sort"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -80,28 +80,60 @@ func TestTimelineExplainsWhenNoEventsQualify(t *testing.T) {
 	if !strings.Contains(out.String(), "Recent events (today)") {
 		t.Fatalf("expected the timeline header even with no qualifying events:\n%s", out.String())
 	}
-	if !strings.Contains(out.String(), "No kernel, container, service, package, or login events") {
+	if !strings.Contains(out.String(), "No kernel, container, service, package, login, or sudo events") {
 		t.Fatalf("expected an explicit empty-state message:\n%s", out.String())
 	}
 }
 
-func TestTimelineOrdersNewestFirst(t *testing.T) {
+// The rendered timeline reads top-to-bottom like a log or scrollback: oldest
+// first, latest last, closest to whatever comes after it in the report.
+func TestRenderedTimelineOrdersOldestFirst(t *testing.T) {
 	now := localNoonToday(t)
 	report := model.Report{
+		Host:        model.Host{Hostname: "host"},
 		GeneratedAt: now,
 		Score:       model.Score{Status: model.SeverityCritical},
 		Metrics: model.Metrics{Kernel: &model.Kernel{Available: true, Events: []model.LogEvent{
 			{Kind: "oom", Message: "older event", AgeSeconds: ageSeconds(2 * time.Hour)},
-			{Kind: "oom", Message: "newer event", AgeSeconds: ageSeconds(10 * time.Minute)},
+			{Kind: "panic", Message: "newer event", AgeSeconds: ageSeconds(10 * time.Minute)},
 		}}},
 	}
-	events := collectTimelineEvents(report)
-	sort.Slice(events, func(i, j int) bool { return events[i].at.After(events[j].at) })
-	if len(events) != 2 {
-		t.Fatalf("expected 2 events, got %#v", events)
+	var out strings.Builder
+	Write(&out, report, Options{ASCII: true})
+	text := out.String()
+	olderIdx := strings.Index(text, "older event")
+	newerIdx := strings.Index(text, "newer event")
+	if olderIdx == -1 || newerIdx == -1 || olderIdx > newerIdx {
+		t.Fatalf("expected the older event to render before the newer one:\n%s", text)
 	}
-	if events[0].label != "newer event" || events[1].label != "older event" {
-		t.Fatalf("expected newest first, got %#v", events)
+}
+
+// The events being cut by the cap are the oldest ones, so the surviving
+// list must still end with the single most recent event, not have it
+// pushed out by the cap.
+func TestTimelineCapKeepsTheMostRecentEvents(t *testing.T) {
+	now := localNoonToday(t)
+	var kernelEvents []model.LogEvent
+	for i := 0; i < maxTimelineEvents; i++ {
+		kernelEvents = append(kernelEvents, model.LogEvent{Kind: "oom", Message: fmt.Sprintf("event-%d", i), AgeSeconds: ageSeconds(time.Duration(maxTimelineEvents-i) * time.Minute)})
+	}
+	kernelEvents = append(kernelEvents, model.LogEvent{Kind: "panic", Message: "most-recent", AgeSeconds: ageSeconds(time.Second)})
+	report := model.Report{
+		Host:        model.Host{Hostname: "host"},
+		GeneratedAt: now,
+		Score:       model.Score{Status: model.SeverityCritical},
+		Metrics:     model.Metrics{Kernel: &model.Kernel{Available: true, Events: kernelEvents}},
+	}
+	var out strings.Builder
+	Write(&out, report, Options{ASCII: true})
+	if !strings.Contains(out.String(), "most-recent") {
+		t.Fatalf("expected the most recent event to survive the cap:\n%s", out.String())
+	}
+	if strings.Contains(out.String(), "event-0") {
+		t.Fatalf("expected the single oldest event dropped by the cap:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "event-1") {
+		t.Fatalf("expected the event right at the cap boundary to survive:\n%s", out.String())
 	}
 }
 
@@ -253,6 +285,39 @@ func TestTimelineIncludesLoginsWithDetail(t *testing.T) {
 	}
 	if !strings.Contains(events[0].label, "daniel") || !strings.Contains(events[0].label, "203.0.113.5") || !strings.Contains(events[0].label, "publickey") {
 		t.Fatalf("login label missing detail: %q", events[0].label)
+	}
+}
+
+func TestTimelineIncludesSudoCommandsWithSource(t *testing.T) {
+	now := localNoonToday(t)
+	report := model.Report{
+		GeneratedAt: now,
+		Metrics: model.Metrics{SudoCommands: []model.SudoEvent{
+			{At: now.Add(-time.Hour), User: "daniel", RunAs: "root", Command: "/usr/bin/apt update"},
+		}},
+	}
+	events := collectTimelineEvents(report)
+	if len(events) != 1 || events[0].source != "sudo" {
+		t.Fatalf("expected a sudo-sourced event: %#v", events)
+	}
+	if !strings.Contains(events[0].label, "daniel") || !strings.Contains(events[0].label, "apt update") {
+		t.Fatalf("sudo label missing detail: %q", events[0].label)
+	}
+}
+
+// A long command must not be dropped entirely, just capped for readability.
+func TestTimelineTruncatesLongSudoCommands(t *testing.T) {
+	now := localNoonToday(t)
+	longCmd := strings.Repeat("x", 200)
+	report := model.Report{
+		GeneratedAt: now,
+		Metrics: model.Metrics{SudoCommands: []model.SudoEvent{
+			{At: now.Add(-time.Hour), User: "daniel", RunAs: "root", Command: longCmd},
+		}},
+	}
+	events := collectTimelineEvents(report)
+	if len(events) != 1 || len(events[0].label) >= len(longCmd) {
+		t.Fatalf("expected the command truncated, got label of length %d", len(events[0].label))
 	}
 }
 

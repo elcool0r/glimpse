@@ -137,9 +137,9 @@ func TestJournalQueriesAreFilteredAndWindowed(t *testing.T) {
 	if !strings.Contains(auth, "--since=-"+journalWindow) {
 		t.Fatalf("authentication query has no bounded window: %q", auth)
 	}
-	logins := strings.Join(queries[1], " ")
-	if !strings.Contains(logins, authprivFacility) || !strings.Contains(logins, "--since=-"+loginEventsWindow) {
-		t.Fatalf("login query is not a bounded, wider-window auth read: %q", logins)
+	sudo := strings.Join(queries[1], " ")
+	if !strings.Contains(sudo, "_COMM=sudo") || !strings.Contains(sudo, "--since=-"+journalEventsWindow) {
+		t.Fatalf("sudo query is not a bounded, wider-window read: %q", sudo)
 	}
 	denials := strings.Join(queries[2], " ")
 	if !strings.Contains(denials, "-k") || !strings.Contains(denials, "--since=-"+journalWindow) {
@@ -172,46 +172,80 @@ func TestFailedJournalQueryIsReportedAsMissingCoverage(t *testing.T) {
 	}
 }
 
-func TestParseLoginEventsExtractsUserSourceAndMethod(t *testing.T) {
-	input := "1700000000 danger-server sshd[12345]: Accepted publickey for daniel from 203.0.113.5 port 51000 ssh2: ED25519 SHA256:abc\n" +
-		"1700000100 danger-server sshd[12399]: Accepted password for bob from 198.51.100.7 port 51001 ssh2\n" +
-		"1700000300 danger-server sshd[12500]: Failed password for invalid user admin from 1.2.3.4 port 51010 ssh2\n"
-	got := ParseLoginEvents(input)
+func TestParseLastLoginsExtractsUserAndSource(t *testing.T) {
+	input := "daniel   pts/1        203.0.113.5      2026-09-07T14:41:00+02:00 - 2026-09-07T14:42:00+02:00  (00:00)\n" +
+		"daniel   pts/1        203.0.113.5      2026-09-07T11:17:00+02:00   still logged in\n"
+	got := ParseLastLogins(input)
 	if len(got) != 2 {
 		t.Fatalf("expected 2 logins, got %#v", got)
 	}
-	if got[0].User != "daniel" || got[0].Source != "203.0.113.5" || got[0].Method != "publickey" {
+	if got[0].User != "daniel" || got[0].Source != "203.0.113.5" {
 		t.Fatalf("unexpected first login: %+v", got[0])
-	}
-	if got[1].User != "bob" || got[1].Method != "password" {
-		t.Fatalf("unexpected second login: %+v", got[1])
 	}
 	if !got[0].At.Before(got[1].At) {
 		t.Fatalf("expected chronological order: %+v", got)
 	}
-}
-
-// scp defaults to the SFTP protocol since OpenSSH 9.0, and plain sftp use is
-// indistinguishable from it at this log level; both are file transfers, not
-// interactive logins, and are excluded via the sshd worker PID they share
-// with the "Accepted" line.
-func TestParseLoginEventsExcludesSFTPSessions(t *testing.T) {
-	input := "1700000200 danger-server sshd[12420]: Accepted publickey for carol from 192.0.2.9 port 51002 ssh2: ED25519 SHA256:def\n" +
-		"1700000201 danger-server sshd[12420]: subsystem request for sftp\n"
-	got := ParseLoginEvents(input)
-	if len(got) != 0 {
-		t.Fatalf("expected the sftp session excluded, got %#v", got)
+	if got[0].Method != "" {
+		t.Fatalf("last cannot reveal an auth method: %+v", got[0])
 	}
 }
 
-// A PID appearing only in an unrelated line (no Accepted line at all) must
-// not fabricate a login, and lines missing the sshd[pid] identifier entirely
-// must be ignored rather than misattributed.
-func TestParseLoginEventsIgnoresNonLoginLines(t *testing.T) {
-	input := "1700000000 danger-server sudo: daniel : COMMAND=/usr/bin/systemctl restart nginx\n" +
-		"1700000100 danger-server sshd[1]: Connection closed by 203.0.113.5\n"
-	if got := ParseLoginEvents(input); len(got) != 0 {
+// A local console login has no remote host/IP field at all -- that absence
+// is exactly what distinguishes it from an SSH session, so it must not be
+// reported as one.
+func TestParseLastLoginsSkipsLocalLogins(t *testing.T) {
+	input := "daniel   tty1                          2026-09-07T09:00:00+02:00   still logged in\n"
+	if got := ParseLastLogins(input); len(got) != 0 {
+		t.Fatalf("expected no logins for a local console session, got %#v", got)
+	}
+}
+
+// The reboot pseudo-entry and the "wtmp begins" trailer must not be
+// reported as a login.
+func TestParseLastLoginsSkipsPseudoEntries(t *testing.T) {
+	input := "reboot   system boot  6.8.0-138-generic 2026-09-07T08:00:00+02:00\n" +
+		"wtmp begins 2026-01-01T00:00:00+01:00\n"
+	if got := ParseLastLogins(input); len(got) != 0 {
 		t.Fatalf("expected no logins, got %#v", got)
+	}
+}
+
+func TestParseFlexibleISOAcceptsBothOffsetForms(t *testing.T) {
+	for _, s := range []string{"2026-09-07T14:41:00+02:00", "2026-09-07T14:41:00+0200"} {
+		if _, err := parseFlexibleISO(s); err != nil {
+			t.Errorf("%s: %v", s, err)
+		}
+	}
+}
+
+func TestParseSudoCommandsExtractsInteractiveCommands(t *testing.T) {
+	input := "1700000000 kuhlpunkt.de sudo[2532844]: daniel : TTY=pts/1 ; PWD=/home/daniel ; USER=root ; COMMAND=/usr/bin/apt update\n"
+	got := ParseSudoCommands(input)
+	if len(got) != 1 {
+		t.Fatalf("expected one sudo event, got %#v", got)
+	}
+	if got[0].User != "daniel" || got[0].RunAs != "root" || got[0].Command != "/usr/bin/apt update" {
+		t.Fatalf("unexpected sudo event: %+v", got[0])
+	}
+}
+
+// sudo logs TTY=unknown for a cron job or script with no controlling
+// terminal; that must be excluded the same way a non-interactive SSH
+// session is.
+func TestParseSudoCommandsExcludesNonInteractive(t *testing.T) {
+	input := "1700000000 kuhlpunkt.de sudo[999]: root : TTY=unknown ; PWD=/ ; USER=root ; COMMAND=/usr/local/bin/backup.sh\n"
+	if got := ParseSudoCommands(input); len(got) != 0 {
+		t.Fatalf("expected the cron/script invocation excluded, got %#v", got)
+	}
+}
+
+// A command argument may itself contain " ; ", which must not truncate the
+// captured command or be mistaken for a field separator.
+func TestParseSudoCommandsCapturesFullCommand(t *testing.T) {
+	input := `1700000000 kuhlpunkt.de sudo[1]: daniel : TTY=pts/1 ; PWD=/home/daniel ; USER=root ; COMMAND=/usr/bin/bash -c "echo a ; echo b"` + "\n"
+	got := ParseSudoCommands(input)
+	if len(got) != 1 || !strings.Contains(got[0].Command, "echo a ; echo b") {
+		t.Fatalf("command truncated: %#v", got)
 	}
 }
 

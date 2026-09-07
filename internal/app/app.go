@@ -397,6 +397,9 @@ func apply(metrics *model.Metrics, data collect.Data) {
 	if data.Logins != nil {
 		metrics.Logins = data.Logins
 	}
+	if data.SudoCommands != nil {
+		metrics.SudoCommands = data.SudoCommands
+	}
 }
 
 func compactStatuses(statuses []model.CollectionStatus) []model.CollectionStatus {

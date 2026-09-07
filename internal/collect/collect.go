@@ -52,6 +52,7 @@ type Data struct {
 	Trends          []model.Trend
 	PackageActivity []model.PackageActivity
 	Logins          []model.LoginEvent
+	SudoCommands    []model.SudoEvent
 }
 
 // Collector reads one coherent observation. Sampling invokes Collect at the
