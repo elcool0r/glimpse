@@ -379,12 +379,11 @@ func parseInspectJSONLinesStrict(text string) ([]model.Container, map[string]uin
 		Status string `json:"Status"`
 	}
 	type state struct {
-		Status       string  `json:"Status"`
-		Running      bool    `json:"Running"`
-		OOMKilled    bool    `json:"OOMKilled"`
-		Restarting   bool    `json:"Restarting"`
-		RestartCount uint64  `json:"RestartCount"`
-		Health       *health `json:"Health"`
+		Status     string  `json:"Status"`
+		Running    bool    `json:"Running"`
+		OOMKilled  bool    `json:"OOMKilled"`
+		Restarting bool    `json:"Restarting"`
+		Health     *health `json:"Health"`
 	}
 	type hostConfig struct {
 		RestartPolicy struct {
@@ -392,10 +391,11 @@ func parseInspectJSONLinesStrict(text string) ([]model.Container, map[string]uin
 		} `json:"RestartPolicy"`
 	}
 	type inspect struct {
-		ID         string     `json:"Id"`
-		Name       string     `json:"Name"`
-		State      state      `json:"State"`
-		HostConfig hostConfig `json:"HostConfig"`
+		ID           string     `json:"Id"`
+		Name         string     `json:"Name"`
+		RestartCount uint64     `json:"RestartCount"`
+		State        state      `json:"State"`
+		HostConfig   hostConfig `json:"HostConfig"`
 	}
 	items := make([]model.Container, 0)
 	restarts := map[string]uint64{}
@@ -441,7 +441,7 @@ func parseInspectJSONLinesStrict(text string) ([]model.Container, map[string]uin
 			}
 		}
 		items = append(items, item)
-		restarts[x.ID] = x.State.RestartCount
+		restarts[x.ID] = x.RestartCount
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].Name < items[j].Name })
 	if len(items) == 0 {
@@ -481,10 +481,8 @@ func localRuntimeEnv() []string {
 // because `--tail` has already restricted the read to recent records; the
 // caller reports the clipping so partial evidence is never mistaken for a
 // complete read.
-// Stderr is intentionally not folded into evidence: it belongs to the runtime
-// client and could otherwise be mistaken for an application failure.
 func runLimitedLogCommand(ctx context.Context, args []string, path string) ([]byte, bool, error) {
-	result, err := command.Run(ctx, command.Options{Env: localRuntimeEnv(), MaxOutput: maxLogBytes}, path, args...)
+	result, err := command.Run(ctx, command.Options{Env: localRuntimeEnv(), MaxOutput: maxLogBytes, CaptureStderr: true}, path, args...)
 	if err != nil {
 		return nil, false, err
 	}

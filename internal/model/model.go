@@ -345,24 +345,20 @@ type DeletedFiles struct {
 	LargestHolderFileCount int           `json:"largest_holder_file_count,omitempty"`
 }
 
-// PathMTUCheck discovers the usable path MTU to a fixed external anchor by
-// sending a baseline ping, then a descending series of non-fragmentable
-// pings, and recording the largest one that got through. DiscoveredMTU is 0
-// when none of them did -- the actual black-hole case -- and is otherwise
-// the discovered value, which may legitimately be below CeilingMTU (normal
-// with PPPoE, VPNs, and tunnels when path MTU discovery is working). Like
-// DNSResolution and GatewayCheck, it sends real packets and only runs in the
-// active-check profile (--disable-external-checks turns it off).
+// PathMTUCheck records observations from a bounded descending series of IPv4
+// don't-fragment echo probes to a fixed external anchor. DiscoveredMTU is the
+// largest tested packet size that received an echo reply, or zero when none
+// did. PacketTooBigFeedback records narrowly recognized feedback in raw probe
+// output; its absence does not establish why a probe received no reply.
 type PathMTUCheck struct {
 	Available bool   `json:"available"`
 	Target    string `json:"target"`
-	// CeilingMTU is the largest size tested (the standard Ethernet MTU);
-	// FloorMTU is the smallest size tested before giving up on finding any
-	// usable size at all.
-	CeilingMTU    int  `json:"ceiling_mtu"`
-	FloorMTU      int  `json:"floor_mtu"`
-	BaselineOK    bool `json:"baseline_ok"`
-	DiscoveredMTU int  `json:"discovered_mtu,omitempty"`
+	// CeilingMTU and FloorMTU bound the tested packet-size candidates.
+	CeilingMTU           int  `json:"ceiling_mtu"`
+	FloorMTU             int  `json:"floor_mtu"`
+	BaselineOK           bool `json:"baseline_ok"`
+	DiscoveredMTU        int  `json:"discovered_mtu,omitempty"`
+	PacketTooBigFeedback bool `json:"packet_too_big_feedback,omitempty"`
 }
 
 // HTTPCheck actively fetches a fixed external URL over HTTP and over HTTPS.
@@ -448,6 +444,10 @@ type Systemd struct {
 	ServiceUnitsInspected  int      `json:"service_units_inspected,omitempty"`
 	ServiceUnitScanLimited bool     `json:"service_unit_scan_limited,omitempty"`
 	FailedUnits            []string `json:"failed_units,omitempty"`
+	// FailedUnitSince records systemd's StateChangeTimestamp for failed units
+	// when it is available. The timestamp is kept separately so FailedUnits
+	// remains a stable, compact list for existing consumers.
+	FailedUnitSince map[string]time.Time `json:"failed_unit_since,omitempty"`
 	// RestartingUnits lists services whose systemd-tracked restart counter
 	// increased during the sampling window -- a real-time signal, unlike
 	// the counter's raw cumulative-since-boot value, which would flag any
@@ -644,9 +644,20 @@ type KernelVulnerability struct {
 // ending in Delta are changes during this report's sampling window; this keeps
 // historical cgroup events from becoming spurious current-health findings.
 type CgroupV2 struct {
-	Available                bool    `json:"available"`
-	Path                     string  `json:"path,omitempty"`
-	Containerized            bool    `json:"containerized"`
+	Available     bool   `json:"available"`
+	Path          string `json:"path,omitempty"`
+	Containerized bool   `json:"containerized"`
+	// The validity pointers are additive schema-v1 fields. Nil preserves the
+	// legacy meaning used by hand-built reports and older JSON; collectors set
+	// them explicitly for every observation.
+	MemoryCurrentValid       *bool   `json:"memory_current_valid,omitempty"`
+	MemoryMaxValid           *bool   `json:"memory_max_valid,omitempty"`
+	MemorySwapCurrentValid   *bool   `json:"memory_swap_current_valid,omitempty"`
+	MemorySwapMaxValid       *bool   `json:"memory_swap_max_valid,omitempty"`
+	PIDsCurrentValid         *bool   `json:"pids_current_valid,omitempty"`
+	PIDsMaxValid             *bool   `json:"pids_max_valid,omitempty"`
+	MemoryEventsSampled      *bool   `json:"memory_events_sampled,omitempty"`
+	CPUStatSampled           *bool   `json:"cpu_stat_sampled,omitempty"`
 	MemoryCurrentBytes       uint64  `json:"memory_current_bytes,omitempty"`
 	MemoryMaxBytes           *uint64 `json:"memory_max_bytes,omitempty"`
 	MemorySwapCurrentBytes   uint64  `json:"memory_swap_current_bytes,omitempty"`
@@ -698,13 +709,27 @@ type Container struct {
 // counters are current pool values, not sampled deltas; a non-ONLINE health or
 // permanent data errors is therefore the strongest signal.
 type ZFSPool struct {
-	Name            string `json:"name"`
-	Health          string `json:"health"`
-	ReadErrors      uint64 `json:"read_errors,omitempty"`
-	WriteErrors     uint64 `json:"write_errors,omitempty"`
-	ChecksumErrors  uint64 `json:"checksum_errors,omitempty"`
-	ScanState       string `json:"scan_state,omitempty"`
-	PermanentErrors bool   `json:"permanent_errors,omitempty"`
+	Name            string         `json:"name"`
+	Health          string         `json:"health"`
+	ReadErrors      uint64         `json:"read_errors,omitempty"`
+	WriteErrors     uint64         `json:"write_errors,omitempty"`
+	ChecksumErrors  uint64         `json:"checksum_errors,omitempty"`
+	Approximate     bool           `json:"approximate,omitempty"`
+	VdevErrors      []ZFSVdevError `json:"vdev_errors,omitempty"`
+	ScanState       string         `json:"scan_state,omitempty"`
+	PermanentErrors bool           `json:"permanent_errors,omitempty"`
+}
+
+// ZFSVdevError preserves error evidence from an affected vdev row. Counters
+// are not summed with pool counters because aggregate mirror/raidz rows repeat
+// the same errors. Approximate is set when zpool emitted a legacy scaled value.
+type ZFSVdevError struct {
+	Name           string `json:"name"`
+	State          string `json:"state"`
+	ReadErrors     uint64 `json:"read_errors,omitempty"`
+	WriteErrors    uint64 `json:"write_errors,omitempty"`
+	ChecksumErrors uint64 `json:"checksum_errors,omitempty"`
+	Approximate    bool   `json:"approximate,omitempty"`
 }
 
 type SoftwareRAID struct {
@@ -777,14 +802,16 @@ type Evidence struct {
 }
 
 type Finding struct {
-	ID          string     `json:"id"`
-	Severity    Severity   `json:"severity"`
-	Category    string     `json:"category"`
-	Title       string     `json:"title"`
-	Summary     string     `json:"summary"`
-	Evidence    []Evidence `json:"evidence,omitempty"`
-	Suggestion  string     `json:"suggestion,omitempty"`
-	ScoreImpact int        `json:"score_impact"`
+	ID                  string     `json:"id"`
+	Severity            Severity   `json:"severity"`
+	Category            string     `json:"category"`
+	Title               string     `json:"title"`
+	Summary             string     `json:"summary"`
+	Evidence            []Evidence `json:"evidence,omitempty"`
+	Suggestion          string     `json:"suggestion,omitempty"`
+	DiagnosticCommand   string     `json:"diagnostic_command,omitempty"`
+	EventTime           *time.Time `json:"event_time,omitempty"`
+	ScoreImpact         int        `json:"score_impact"`
 }
 
 type Score struct {

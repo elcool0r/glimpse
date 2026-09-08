@@ -30,6 +30,59 @@ func TestOutputCapTruncatesInsteadOfDiscarding(t *testing.T) {
 	}
 }
 
+func TestRunCaptureStderrCollectsBothStreams(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh unavailable")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	result, err := Run(ctx, Options{MaxOutput: 128, CaptureStderr: true}, "sh", "-c", "printf stdout; printf stderr >&2")
+	if err != nil || !strings.Contains(string(result.Output), "stdout") || !strings.Contains(string(result.Output), "stderr") {
+		t.Fatalf("output=%q err=%v", result.Output, err)
+	}
+}
+
+func TestRunCaptureStderrUsesTotalBound(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh unavailable")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	result, err := Run(ctx, Options{MaxOutput: 64, CaptureStderr: true}, "sh", "-c", "printf 'O%.0s' $(seq 1 100); printf 'E%.0s' $(seq 1 100) >&2")
+	if err != nil || len(result.Output) != 64 || !result.Truncated {
+		t.Fatalf("len=%d truncated=%v err=%v", len(result.Output), result.Truncated, err)
+	}
+}
+
+func TestRunCaptureStderrFailedCommandReturnsErrorAndCapturedOutput(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh unavailable")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	result, err := Run(ctx, Options{CaptureStderr: true}, "sh", "-c", "printf 'client diagnostic' >&2; exit 7")
+	if err == nil {
+		t.Fatal("expected failed command")
+	}
+	if len(result.Output) == 0 {
+		// The command helper preserves output for callers that need nonzero exit
+		// data; log-specific code rejects this result before classification.
+		t.Fatal("expected captured diagnostic for caller-side failure handling")
+	}
+}
+
+func TestRunDefaultStillDiscardsStderr(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh unavailable")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	result, err := Run(ctx, Options{}, "sh", "-c", "printf stderr >&2")
+	if err != nil || len(result.Output) != 0 {
+		t.Fatalf("output=%q err=%v", result.Output, err)
+	}
+}
+
 func TestRunAppliesDefaultOutputCap(t *testing.T) {
 	if _, err := exec.LookPath("sh"); err != nil {
 		t.Skip("sh unavailable")
@@ -58,7 +111,7 @@ func TestRunReturnsPromptlyWhenTheChildIgnoresCancellation(t *testing.T) {
 	started := time.Now()
 	// The child ignores SIGKILL's effect on its grandchild, which keeps the
 	// inherited stdout pipe open after the child itself is killed.
-	_, err := Run(ctx, Options{}, "sh", "-c", "sleep 30 & sleep 30")
+	_, err := Run(ctx, Options{CaptureStderr: true}, "sh", "-c", "sleep 30 & sleep 30")
 	elapsed := time.Since(started)
 	if err == nil {
 		t.Fatal("expected the bounded run to fail")

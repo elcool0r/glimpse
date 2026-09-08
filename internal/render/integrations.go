@@ -129,11 +129,10 @@ func renderIntegrations(w io.Writer, width int, r model.Report, separator string
 		if !strings.EqualFold(health, "ONLINE") {
 			healthSeverity = model.SeverityCritical
 		}
-		errorCount := pool.ReadErrors + pool.WriteErrors + pool.ChecksumErrors
 		errorsSeverity := model.SeverityOK
 		if pool.PermanentErrors {
 			errorsSeverity = model.SeverityCritical
-		} else if errorCount > 0 {
+		} else if zfsPoolHasErrors(pool) {
 			errorsSeverity = model.SeverityWarning
 		}
 		severity := healthSeverity
@@ -144,11 +143,21 @@ func renderIntegrations(w io.Writer, width int, r model.Report, separator string
 			writeWrapped(w, width, "", fmt.Sprintf("%s %s  %s", sectionLabel("ZFS", severity, color), badge(severity, color), cleanText(pool.Name)))
 			if verbose {
 				checkLine(w, width, "    ", "Pool health", healthSeverity, color, health)
-				errorsDetail := fmt.Sprintf("read %d%swrite %d%schecksum %d", pool.ReadErrors, separator, pool.WriteErrors, separator, pool.ChecksumErrors)
+				errorsDetail := fmt.Sprintf("root row read %d%swrite %d%schecksum %d", pool.ReadErrors, separator, pool.WriteErrors, separator, pool.ChecksumErrors)
+				if pool.Approximate || zfsVdevApproximate(pool.VdevErrors) {
+					errorsDetail += separator + "some counters approximate"
+				}
 				if pool.PermanentErrors {
 					errorsDetail += separator + "permanent errors present"
 				}
 				checkLine(w, width, "    ", "Data integrity", errorsSeverity, color, errorsDetail)
+				for _, vdev := range pool.VdevErrors {
+					vdevDetail := fmt.Sprintf("%s: read %d%swrite %d%schecksum %d", vdev.State, vdev.ReadErrors, separator, vdev.WriteErrors, separator, vdev.ChecksumErrors)
+					if vdev.Approximate {
+						vdevDetail += separator + "approximate counters"
+					}
+					checkLine(w, width, "    ", "Vdev "+cleanText(vdev.Name), model.SeverityWarning, color, vdevDetail)
+				}
 				scanSeverity := model.SeverityOK
 				scanDetail := cleanText(pool.ScanState)
 				if scanDetail == "" {
@@ -158,12 +167,19 @@ func renderIntegrations(w io.Writer, width int, r model.Report, separator string
 				}
 				checkLine(w, width, "    ", "Scrub/resilver", scanSeverity, color, scanDetail)
 			} else if healthSeverity != model.SeverityOK || errorsSeverity != model.SeverityOK {
-				writeWrapped(w, width, "    ", fmt.Sprintf("health %s%serrors read %d/write %d/checksum %d", health, separator, pool.ReadErrors, pool.WriteErrors, pool.ChecksumErrors))
+				detail := fmt.Sprintf("health %s%sroot row errors read %d/write %d/checksum %d", health, separator, pool.ReadErrors, pool.WriteErrors, pool.ChecksumErrors)
+				if len(pool.VdevErrors) > 0 {
+					names := make([]string, 0, len(pool.VdevErrors))
+					for _, vdev := range pool.VdevErrors {
+						names = append(names, cleanText(vdev.Name))
+					}
+					detail += separator + "vdevs " + strings.Join(names, ", ")
+				}
+				writeWrapped(w, width, "    ", detail)
 			}
 		}
 	}
 	note("zfs")
-
 	if len(m.SoftwareRAID) > 0 || m.LVM != nil || len(m.MountChecks) > 0 {
 		severity := model.SeverityOK
 		raidCount, raidBad := len(m.SoftwareRAID), 0
@@ -410,35 +426,44 @@ func renderIntegrations(w io.Writer, width int, r model.Report, separator string
 
 	if check := m.PathMTUCheck; check != nil && check.Available {
 		severity := findingSeverity(r.Findings, "path-mtu-blackhole", "path-mtu-reduced")
-		result := fmt.Sprintf("%d/%d bytes usable", check.CeilingMTU, check.CeilingMTU)
+		result := fmt.Sprintf("%d-byte IPv4 DF probe replied", check.CeilingMTU)
 		switch {
 		case check.DiscoveredMTU == 0:
-			result = fmt.Sprintf("no packet size got through down to %d bytes (possible black hole)", check.FloorMTU)
+			result = fmt.Sprintf("no IPv4 DF echo replies from %d down to %d bytes", check.CeilingMTU, check.FloorMTU)
 		case check.DiscoveredMTU < check.CeilingMTU:
-			result = fmt.Sprintf("%d/%d bytes usable (reduced but working normally, typical for a VPN or tunnel)", check.DiscoveredMTU, check.CeilingMTU)
+			result = fmt.Sprintf("largest tested IPv4 DF echo reply: %d/%d bytes", check.DiscoveredMTU, check.CeilingMTU)
 		}
-		// A reduced-but-discovered MTU is common and expected (PPPoE, VPNs,
-		// tunnels); showing that INFO badge on every run is noise for a
-		// permanent, intentional configuration, so it is quiet by default
-		// and stays available under --verbose. OK and WARN/CRIT rows still
-		// always show, consistent with every other active check.
+		if check.DiscoveredMTU == 0 {
+			if check.PacketTooBigFeedback {
+				result += separator + "packet-too-big feedback observed"
+			} else {
+				result += separator + "no packet-too-big feedback observed"
+			}
+		}
+		// The reduced-size INFO observation is quiet by default and remains
+		// available under --verbose. OK and WARN/CRIT rows always show.
 		if !skip(severity) {
 			if verbose || severity != model.SeverityInfo {
 				writeWrapped(w, width, "", fmt.Sprintf("%s %s  %s%s%s", sectionLabel("Path MTU", severity, color), badge(severity, color), cleanText(check.Target), separator, result))
 			}
 			if verbose {
-				checkLine(w, width, "    ", "Baseline (small packet)", model.SeverityOK, color, "reachable")
+				checkLine(w, width, "    ", "Baseline (small packet)", model.SeverityOK, color, "echo reply received")
 				mtuSeverity := model.SeverityOK
-				mtuDetail := fmt.Sprintf("%d bytes, the full tested ceiling", check.DiscoveredMTU)
+				mtuDetail := fmt.Sprintf("%d bytes; largest tested IPv4 DF packet replied", check.DiscoveredMTU)
 				switch {
 				case check.DiscoveredMTU == 0:
 					mtuSeverity = severity
-					mtuDetail = fmt.Sprintf("none found; every size from %d down to %d bytes was dropped", check.CeilingMTU, check.FloorMTU)
+					mtuDetail = fmt.Sprintf("no echo replies from tested sizes %d down to %d bytes", check.CeilingMTU, check.FloorMTU)
 				case check.DiscoveredMTU < check.CeilingMTU:
 					mtuSeverity = severity
-					mtuDetail = fmt.Sprintf("%d bytes -- below the %d-byte ceiling, but a working, cleanly discovered size (PMTUD is functioning correctly)", check.DiscoveredMTU, check.CeilingMTU)
+					mtuDetail = fmt.Sprintf("%d bytes; larger tested sizes up to %d bytes did not reply", check.DiscoveredMTU, check.CeilingMTU)
 				}
-				checkLine(w, width, "    ", "Discovered path MTU", mtuSeverity, color, mtuDetail)
+				checkLine(w, width, "    ", "Largest tested IPv4 DF reply", mtuSeverity, color, mtuDetail)
+				feedback := "not observed in probe output"
+				if check.PacketTooBigFeedback {
+					feedback = "observed in probe output"
+				}
+				checkLine(w, width, "    ", "Packet-too-big feedback", model.SeverityInfo, color, feedback)
 			}
 		}
 	}
@@ -658,22 +683,81 @@ func renderIntegrations(w io.Writer, width int, r model.Report, separator string
 		writeWrapped(w, width, "", fmt.Sprintf("%s %s  containerized: %t", sectionLabel("Cgroup v2", severity, color), badge(severity, color), cgroup.Containerized))
 		if verbose {
 			checkLine(w, width, "    ", "Path", model.SeverityOK, color, cleanText(cgroup.Path))
-			if cgroup.MemoryMaxBytes != nil && *cgroup.MemoryMaxBytes > 0 {
+			if !cgroupValid(cgroup.MemoryCurrentValid) {
+				checkLine(w, width, "    ", "Memory current", model.SeverityUnknown, color, "unavailable")
+			} else {
+				checkLine(w, width, "    ", "Memory current", model.SeverityOK, color, fmt.Sprintf("%d bytes", cgroup.MemoryCurrentBytes))
+			}
+			if cgroup.MemoryMaxValid != nil && !*cgroup.MemoryMaxValid {
+				checkLine(w, width, "    ", "Memory limit", model.SeverityUnknown, color, "unavailable")
+			} else if cgroup.MemoryMaxBytes != nil && *cgroup.MemoryMaxBytes > 0 && cgroupValid(cgroup.MemoryCurrentValid) {
 				fraction := float64(cgroup.MemoryCurrentBytes) * 100 / float64(*cgroup.MemoryMaxBytes)
 				memSeverity := findingSeverity(r.Findings, "cgroup-memory-limit")
 				checkLine(w, width, "    ", "Memory limit", memSeverity, color, fmt.Sprintf("%.0f%% used", fraction))
+			} else if cgroup.MemoryMaxBytes != nil && *cgroup.MemoryMaxBytes > 0 {
+				checkLine(w, width, "    ", "Memory limit", model.SeverityUnknown, color, fmt.Sprintf("%d bytes; usage unavailable", *cgroup.MemoryMaxBytes))
+			} else if cgroup.MemoryMaxBytes != nil {
+				checkLine(w, width, "    ", "Memory limit", model.SeverityOK, color, fmt.Sprintf("%d/%d bytes", cgroup.MemoryCurrentBytes, *cgroup.MemoryMaxBytes))
 			} else {
-				checkLine(w, width, "    ", "Memory limit", model.SeverityOK, color, "none set")
+				checkLine(w, width, "    ", "Memory limit", model.SeverityOK, color, "unlimited")
 			}
-			if cgroup.PIDsMax != nil && *cgroup.PIDsMax > 0 {
+			if !cgroupValid(cgroup.PIDsCurrentValid) {
+				checkLine(w, width, "    ", "PIDs current", model.SeverityUnknown, color, "unavailable")
+			} else {
+				checkLine(w, width, "    ", "PIDs current", model.SeverityOK, color, fmt.Sprintf("%d", cgroup.PIDsCurrent))
+			}
+			if cgroup.PIDsMaxValid != nil && !*cgroup.PIDsMaxValid {
+				checkLine(w, width, "    ", "PID limit", model.SeverityUnknown, color, "unavailable")
+			} else if cgroup.PIDsMax != nil && *cgroup.PIDsMax > 0 && cgroupValid(cgroup.PIDsCurrentValid) {
 				pidSeverity := findingSeverity(r.Findings, "cgroup-pids-limit")
 				checkLine(w, width, "    ", "PID limit", pidSeverity, color, fmt.Sprintf("%d/%d", cgroup.PIDsCurrent, *cgroup.PIDsMax))
+			} else if cgroup.PIDsMax != nil && *cgroup.PIDsMax > 0 {
+				checkLine(w, width, "    ", "PID limit", model.SeverityUnknown, color, fmt.Sprintf("unavailable/%d", *cgroup.PIDsMax))
+			} else if cgroup.PIDsMax != nil {
+				checkLine(w, width, "    ", "PID limit", model.SeverityOK, color, fmt.Sprintf("%d/%d", cgroup.PIDsCurrent, *cgroup.PIDsMax))
 			} else {
-				checkLine(w, width, "    ", "PID limit", model.SeverityOK, color, "none set")
+				checkLine(w, width, "    ", "PID limit", model.SeverityOK, color, "unlimited")
+			}
+			if cgroup.MemoryEventsSampled != nil && !*cgroup.MemoryEventsSampled {
+				checkLine(w, width, "    ", "Memory events", model.SeverityUnknown, color, "sample unavailable")
+			} else if cgroup.MemoryEventsSampled != nil {
+				checkLine(w, width, "    ", "Memory events", model.SeverityOK, color, fmt.Sprintf("OOM %d, kills %d", cgroup.MemoryOOMDelta, cgroup.MemoryOOMKillDelta))
+			}
+			if cgroup.CPUStatSampled != nil && !*cgroup.CPUStatSampled {
+				checkLine(w, width, "    ", "CPU statistics", model.SeverityUnknown, color, "sample unavailable")
+			} else if cgroup.CPUStatSampled != nil {
+				checkLine(w, width, "    ", "CPU statistics", model.SeverityOK, color, fmt.Sprintf("%.3fs used, %.3fs throttled", cgroup.CPUUsageSecondsDelta, cgroup.CPUThrottledSecondsDelta))
 			}
 		}
 	}
 	note("cgroup-v2")
+}
+
+func cgroupValid(valid *bool) bool { return valid == nil || *valid }
+
+func zfsPoolHasErrors(pool model.ZFSPool) bool {
+	if pool.ReadErrors > 0 || pool.WriteErrors > 0 || pool.ChecksumErrors > 0 {
+		return true
+	}
+	return zfsVdevHasErrors(pool.VdevErrors)
+}
+
+func zfsVdevHasErrors(vdevs []model.ZFSVdevError) bool {
+	for _, vdev := range vdevs {
+		if vdev.ReadErrors > 0 || vdev.WriteErrors > 0 || vdev.ChecksumErrors > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func zfsVdevApproximate(vdevs []model.ZFSVdevError) bool {
+	for _, vdev := range vdevs {
+		if vdev.Approximate {
+			return true
+		}
+	}
+	return false
 }
 
 // kernelPatternKinds mirrors the pattern kinds kernel.eventKind can return, so

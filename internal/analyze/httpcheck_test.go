@@ -1,6 +1,7 @@
 package analyze
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/elcool0r/glimpse/internal/model"
@@ -10,7 +11,7 @@ func pathMTUReport(check *model.PathMTUCheck) model.Report {
 	return model.Report{Metrics: model.Metrics{CPU: &model.CPU{}, PathMTUCheck: check}}
 }
 
-func TestPathMTUNoUsableSizeWarns(t *testing.T) {
+func TestPathMTUNoTestedDFRepliesWarns(t *testing.T) {
 	report := pathMTUReport(&model.PathMTUCheck{Available: true, Target: "1.1.1.1", CeilingMTU: 1500, FloorMTU: 576, BaselineOK: true, DiscoveredMTU: 0})
 	Report(&report)
 	found := findingByID(report, "path-mtu-blackhole")
@@ -21,11 +22,12 @@ func TestPathMTUNoUsableSizeWarns(t *testing.T) {
 		t.Fatalf("severity = %s, want warning", found.Severity)
 	}
 	if findingByID(report, "path-mtu-reduced") != nil {
-		t.Fatalf("should not also fire the reduced-but-healthy finding: %+v", report.Findings)
+		t.Fatalf("should not also fire the reduced-size finding: %+v", report.Findings)
 	}
+	assertPathMTUFindingIsObservational(t, *found)
 }
 
-func TestPathMTUReducedButDiscoveredIsInfo(t *testing.T) {
+func TestPathMTUReducedDFReplyIsInfo(t *testing.T) {
 	report := pathMTUReport(&model.PathMTUCheck{Available: true, Target: "1.1.1.1", CeilingMTU: 1500, FloorMTU: 576, BaselineOK: true, DiscoveredMTU: 1420})
 	Report(&report)
 	found := findingByID(report, "path-mtu-reduced")
@@ -33,10 +35,37 @@ func TestPathMTUReducedButDiscoveredIsInfo(t *testing.T) {
 		t.Fatalf("no finding when a smaller size was discovered: %+v", report.Findings)
 	}
 	if found.Severity != model.SeverityInfo {
-		t.Fatalf("severity = %s, want info (a discovered, working reduced MTU is healthy)", found.Severity)
+		t.Fatalf("severity = %s, want info", found.Severity)
 	}
 	if findingByID(report, "path-mtu-blackhole") != nil {
 		t.Fatalf("should not also fire the black-hole finding: %+v", report.Findings)
+	}
+	assertPathMTUFindingIsObservational(t, *found)
+	if !strings.Contains(found.Title+found.Summary, "Largest tested IPv4 DF echo reply") && !strings.Contains(found.Title+found.Summary, "larger tested sizes") {
+		t.Fatalf("finding lacks tested-probe wording: %+v", found)
+	}
+}
+
+func TestPathMTUNoReplyFindingDistinguishesObservedFeedback(t *testing.T) {
+	without := pathMTUReport(&model.PathMTUCheck{Available: true, Target: "1.1.1.1", CeilingMTU: 1500, FloorMTU: 576, BaselineOK: true})
+	with := pathMTUReport(&model.PathMTUCheck{Available: true, Target: "1.1.1.1", CeilingMTU: 1500, FloorMTU: 576, BaselineOK: true, PacketTooBigFeedback: true})
+	Report(&without)
+	Report(&with)
+	a, b := findingByID(without, "path-mtu-blackhole"), findingByID(with, "path-mtu-blackhole")
+	if a == nil || b == nil || !strings.Contains(a.Summary, "No packet-too-big feedback was observed") || !strings.Contains(b.Summary, "Packet-too-big feedback was observed") {
+		t.Fatalf("feedback evidence not distinguished: without=%+v with=%+v", a, b)
+	}
+	assertPathMTUFindingIsObservational(t, *a)
+	assertPathMTUFindingIsObservational(t, *b)
+}
+
+func assertPathMTUFindingIsObservational(t *testing.T, found model.Finding) {
+	t.Helper()
+	text := strings.ToLower(found.Title + " " + found.Summary + " " + found.Suggestion)
+	for _, forbidden := range []string{"pmtud", "functioning correctly", "healthy", "cleanly discovered", "path mtu is", "feedback was filtered"} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("finding makes unsupported claim %q: %+v", forbidden, found)
+		}
 	}
 }
 

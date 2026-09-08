@@ -3,6 +3,7 @@ package pathmtu
 import (
 	"context"
 	"errors"
+	"os/exec"
 	"strconv"
 	"strings"
 	"testing"
@@ -37,6 +38,15 @@ func deliveredOutput() []byte {
 --- 1.1.1.1 ping statistics ---
 1 packets transmitted, 1 packets received, 0% packet loss
 round-trip min/avg/max = 12.0/12.0/12.0 ms
+`)
+}
+
+func packetTooBigOutput() []byte {
+	return []byte(`PING 1.1.1.1 (1.1.1.1) 1472(1500) bytes of data.
+From 192.0.2.1 icmp_seq=1 Frag needed and DF set (mtu = 1400)
+
+--- 1.1.1.1 ping statistics ---
+1 packets transmitted, 0 received, +1 errors, 100% packet loss
 `)
 }
 
@@ -75,7 +85,7 @@ func TestCollectFullMTUWorks(t *testing.T) {
 	}
 }
 
-func TestCollectDiscoversReducedMTU(t *testing.T) {
+func TestCollectRecordsLargestReducedDFReply(t *testing.T) {
 	c := &Collector{
 		lookPath: func(string) (string, error) { return "/bin/ping", nil },
 		run: func(_ context.Context, _ string, args ...string) ([]byte, error) {
@@ -103,9 +113,71 @@ func TestCollectDiscoversReducedMTU(t *testing.T) {
 	if check.DiscoveredMTU >= check.CeilingMTU {
 		t.Fatalf("expected a reduced MTU below the ceiling, got %d/%d", check.DiscoveredMTU, check.CeilingMTU)
 	}
+	if check.PacketTooBigFeedback {
+		t.Fatalf("summary-only drops must not invent packet-too-big feedback: %+v", check)
+	}
 }
 
-func TestCollectNoUsableSizeIsBlackhole(t *testing.T) {
+func TestCollectKeepsPacketTooBigFeedbackSeparateFromEchoReply(t *testing.T) {
+	c := &Collector{
+		lookPath: func(string) (string, error) { return "/bin/ping", nil },
+		run: func(_ context.Context, _ string, args ...string) ([]byte, error) {
+			if !containsFlag(args, "-M") {
+				return []byte(baselineOKOutput), nil
+			}
+			if payloadArg(args) <= 1400 {
+				return deliveredOutput(), nil
+			}
+			return packetTooBigOutput(), errors.New("exit status 1")
+		},
+	}
+	data, err := c.Collect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	check := data.PathMTUCheck
+	if check == nil || check.DiscoveredMTU != 1428 || !check.PacketTooBigFeedback {
+		t.Fatalf("feedback and reply observation = %+v", check)
+	}
+}
+
+func TestPacketTooBigFeedbackRecognitionIsNarrow(t *testing.T) {
+	tests := []struct {
+		name string
+		text string
+		want bool
+	}{
+		{name: "remote feedback", text: "Frag needed and DF set (mtu = 1400)", want: true},
+		{name: "local feedback", text: "ping: local error: Message too long, mtu=1400", want: true},
+		{name: "case insensitive", text: "MESSAGE TOO LONG", want: true},
+		{name: "timeout", text: "1 packets transmitted, 0 received, 100% packet loss", want: false},
+		{name: "exit text", text: "exit status 1", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := hasPacketTooBigFeedback([]byte(tt.text)); got != tt.want {
+				t.Fatalf("hasPacketTooBigFeedback(%q) = %t, want %t", tt.text, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestRunCommandCapturesFeedbackFromStderrUnderCLocale(t *testing.T) {
+	path, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("sh unavailable")
+	}
+	output, err := runCommand(context.Background(), path, "-c", `printf 'locale=%s\n' "$LC_ALL"; printf 'Frag needed and DF set\n' >&2`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(output)
+	if !strings.Contains(text, "locale=C") || !hasPacketTooBigFeedback(output) {
+		t.Fatalf("combined stable-locale output = %q", text)
+	}
+}
+
+func TestCollectRecordsWhenNoTestedDFSizeReplies(t *testing.T) {
 	c := &Collector{
 		lookPath: func(string) (string, error) { return "/bin/ping", nil },
 		run: func(_ context.Context, _ string, args ...string) ([]byte, error) {
@@ -121,7 +193,7 @@ func TestCollectNoUsableSizeIsBlackhole(t *testing.T) {
 	}
 	check := data.PathMTUCheck
 	if check == nil || check.DiscoveredMTU != 0 {
-		t.Fatalf("expected DiscoveredMTU=0 (black hole) when nothing gets through, got %+v", check)
+		t.Fatalf("expected DiscoveredMTU=0 when no tested DF size replied, got %+v", check)
 	}
 	if !check.BaselineOK {
 		t.Fatalf("baseline should still be OK: %+v", check)

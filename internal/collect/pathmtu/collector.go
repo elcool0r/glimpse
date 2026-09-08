@@ -1,15 +1,8 @@
-// Package pathmtu discovers the actual usable path MTU to a fixed external
-// anchor host, rather than only testing a single size. A single pass/fail
-// probe at 1500 bytes cannot tell a genuine black hole apart from a merely
-// reduced but correctly discovered path MTU -- which is normal and healthy
-// with PPPoE, VPNs, and tunnels as long as path MTU discovery (PMTUD) is
-// working. This collector sends a baseline ping, then a descending series of
-// non-fragmentable ("don't fragment") pings, and reports the largest size
-// that got through. No usable size at all, despite the baseline succeeding,
-// is the actual black-hole signal: PMTUD depends on ICMP "fragmentation
-// needed" messages reaching the sender, and when those are filtered, every
-// oversized non-fragmentable packet is dropped silently instead of being
-// answered with a smaller MTU.
+// Package pathmtu sends a bounded descending series of IPv4 don't-fragment
+// echo probes to a fixed external anchor. It records the largest tested packet
+// size that received an echo reply and whether probe output contained narrow,
+// stable packet-too-big feedback. These observations do not establish the
+// exact path MTU or the behavior of path MTU discovery for other traffic.
 //
 // This targets a fixed external host rather than the default gateway that
 // internal/collect/gatewayping already checks, because the fault this looks
@@ -25,9 +18,11 @@ import (
 	"context"
 	"os/exec"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/elcool0r/glimpse/internal/collect"
+	"github.com/elcool0r/glimpse/internal/collect/command"
 	"github.com/elcool0r/glimpse/internal/collect/pingutil"
 	"github.com/elcool0r/glimpse/internal/model"
 )
@@ -43,6 +38,7 @@ const (
 	ceilingMTU     = 1500
 	perPingTimeout = 1 // seconds, passed to `ping -W`
 	commandTimeout = 3 * time.Second
+	maxOutput      = 8 << 10
 )
 
 // candidatePayloads are ICMP payload sizes to test with the don't-fragment
@@ -59,7 +55,15 @@ type Collector struct {
 }
 
 func New() *Collector {
-	return &Collector{lookPath: exec.LookPath, run: pingutil.RunCommand}
+	return &Collector{lookPath: exec.LookPath, run: runCommand}
+}
+
+// runCommand retains both output streams because iputils may write
+// packet-too-big evidence to stderr. command.Run applies one shared bound and
+// the repository-wide C locale to both streams.
+func runCommand(ctx context.Context, path string, args ...string) ([]byte, error) {
+	result, err := command.Run(ctx, command.Options{MaxOutput: maxOutput, CaptureStderr: true}, path, args...)
+	return result.Output, err
 }
 
 func (c *Collector) Name() string { return "path-mtu" }
@@ -74,7 +78,7 @@ func (c *Collector) Collect(parent context.Context) (collect.Data, error) {
 		lookPath = exec.LookPath
 	}
 	if run == nil {
-		run = pingutil.RunCommand
+		run = runCommand
 	}
 
 	path, lookErr := lookPath("ping")
@@ -82,7 +86,7 @@ func (c *Collector) Collect(parent context.Context) (collect.Data, error) {
 		return collect.Data{Diagnostics: []model.CollectionStatus{{Status: "unavailable", Detail: "ping: " + lookErr.Error()}}}, nil
 	}
 
-	if _, received, _, err := pingOnce(parent, run, path, "-c", "1", "-W", strconv.Itoa(perPingTimeout), target); err != nil {
+	if _, _, received, _, err := pingOnce(parent, run, path, "-c", "1", "-W", strconv.Itoa(perPingTimeout), target); err != nil {
 		return collect.Data{Diagnostics: []model.CollectionStatus{{Status: "unavailable", Detail: "path mtu baseline: " + err.Error()}}}, nil
 	} else if parent.Err() != nil {
 		return collect.Data{}, parent.Err()
@@ -94,6 +98,7 @@ func (c *Collector) Collect(parent context.Context) (collect.Data, error) {
 	}
 
 	discovered := 0
+	packetTooBigFeedback := false
 	for _, payload := range candidatePayloads {
 		// -M do sets the don't-fragment bit: the defining property of this
 		// probe. Where the local ping binary does not support it (some
@@ -101,7 +106,8 @@ func (c *Collector) Collect(parent context.Context) (collect.Data, error) {
 		// reports the whole check unavailable rather than treating a tool
 		// incompatibility as a black hole -- a genuine drop still produces a
 		// normal summary line, just with zero packets received.
-		_, received, _, err := pingOnce(parent, run, path, "-M", "do", "-s", strconv.Itoa(payload), "-c", "1", "-W", strconv.Itoa(perPingTimeout), target)
+		output, _, received, _, err := pingOnce(parent, run, path, "-M", "do", "-s", strconv.Itoa(payload), "-c", "1", "-W", strconv.Itoa(perPingTimeout), target)
+		packetTooBigFeedback = packetTooBigFeedback || hasPacketTooBigFeedback(output)
 		if parent.Err() != nil {
 			return collect.Data{}, parent.Err()
 		}
@@ -120,16 +126,27 @@ func (c *Collector) Collect(parent context.Context) (collect.Data, error) {
 		CeilingMTU: ceilingMTU,
 		FloorMTU:   candidatePayloads[len(candidatePayloads)-1] + 28,
 		BaselineOK: true,
-		// DiscoveredMTU stays 0 when nothing in the descending series got
-		// through at all -- the black-hole case, not merely a reduced but
-		// discoverable path MTU.
-		DiscoveredMTU: discovered,
+		// DiscoveredMTU is retained for JSON compatibility. It is the largest
+		// tested IPv4 DF packet size that received an echo reply, or zero.
+		DiscoveredMTU:        discovered,
+		PacketTooBigFeedback: packetTooBigFeedback,
 	}
 	return collect.Data{PathMTUCheck: check}, nil
 }
 
-func pingOnce(parent context.Context, run func(context.Context, string, ...string) ([]byte, error), path string, args ...string) (sent, received int, avgMillis float64, err error) {
+func pingOnce(parent context.Context, run func(context.Context, string, ...string) ([]byte, error), path string, args ...string) (output []byte, sent, received int, avgMillis float64, err error) {
 	ctx, cancel := context.WithTimeout(parent, commandTimeout)
 	defer cancel()
-	return pingutil.Run(ctx, run, path, args...)
+	wrappedRun := func(ctx context.Context, path string, args ...string) ([]byte, error) {
+		var runErr error
+		output, runErr = run(ctx, path, args...)
+		return output, runErr
+	}
+	sent, received, avgMillis, err = pingutil.Run(ctx, wrappedRun, path, args...)
+	return output, sent, received, avgMillis, err
+}
+
+func hasPacketTooBigFeedback(output []byte) bool {
+	text := strings.ToLower(string(output))
+	return strings.Contains(text, "frag needed") || strings.Contains(text, "message too long")
 }

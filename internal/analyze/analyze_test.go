@@ -3,6 +3,7 @@ package analyze
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/elcool0r/glimpse/internal/model"
 )
@@ -161,6 +162,9 @@ func TestContainerRestartDeltaAndHealth(t *testing.T) {
 	Report(&report)
 	if !hasFinding(report, "container-podman-web-unhealthy") || !hasFinding(report, "container-podman-web-restarts") {
 		t.Fatalf("expected unhealthy/restarting findings: %#v", report.Findings)
+	}
+	if found := findingByID(report, "container-podman-web-restarts"); found == nil || found.Severity != model.SeverityCritical {
+		t.Fatalf("three restarts must be critical: %#v", report.Findings)
 	}
 }
 
@@ -335,6 +339,19 @@ func TestOptionalSuccessDoesNotHideMissingCoreCoverage(t *testing.T) {
 	Report(&r)
 	if !hasFinding(r, "failed-units") || r.Score.Status != model.SeverityUnknown {
 		t.Fatalf("incomplete coverage must retain evidence but invalidate the verdict: %+v", r)
+	}
+}
+
+func TestFailedSystemdUnitsIncludeStateChangeTime(t *testing.T) {
+	since := time.Date(2026, 9, 8, 10, 43, 2, 0, time.Local)
+	report := model.Report{Metrics: model.Metrics{Systemd: &model.Systemd{
+		Available: true, FailedUnits: []string{"glimpse-test-failure.service"},
+		FailedUnitSince: map[string]time.Time{"glimpse-test-failure.service": since},
+	}}}
+	Report(&report)
+	found := findingByID(report, "failed-units")
+	if found == nil || !strings.Contains(found.Summary, "glimpse-test-failure.service (since 10:43 2026-09-08)") {
+		t.Fatalf("failed-unit summary missing time: %+v", found)
 	}
 }
 

@@ -76,6 +76,15 @@ func TestParseActiveEnterTimestamps(t *testing.T) {
 	}
 }
 
+func TestParseUnitTimestamps(t *testing.T) {
+	when := time.Date(2026, 9, 8, 10, 43, 2, 0, time.Local)
+	input := "Id=glimpse-test-failure.service\nStateChangeTimestamp=" + when.Format(activeEnterLayout) + " CEST\n\n"
+	got := parseUnitTimestamps(input, "StateChangeTimestamp")
+	if len(got) != 1 || !got["glimpse-test-failure.service"].Equal(when) {
+		t.Fatalf("got %#v, want the parsed state-change timestamp", got)
+	}
+}
+
 // A restart counter or timestamp belongs to the block it appears in; a
 // stray value before any Id= line must not be attributed to anything.
 func TestParseActiveEnterTimestampsIgnoresOrphanedValue(t *testing.T) {
@@ -125,6 +134,24 @@ func TestCollectPopulatesRecentStartsFromActiveEnterTimestamp(t *testing.T) {
 	}
 	if len(data.Systemd.RecentStarts) != 1 || data.Systemd.RecentStarts[0].Unit != "systemd-resolved.service" {
 		t.Fatalf("expected a recent start for systemd-resolved.service: %+v", data.Systemd.RecentStarts)
+	}
+}
+
+func TestCollectPopulatesFailedUnitStateChangeTime(t *testing.T) {
+	when := time.Date(2026, 9, 8, 10, 43, 2, 0, time.Local)
+	c := &Collector{
+		lookPath: func(string) (string, error) { return "/bin/systemctl", nil },
+		run: fakeSystemctl(t,
+			"glimpse-test-failure.service loaded failed failed /bin/false\n",
+			"glimpse-test-failure.service loaded failed failed /bin/false\n",
+			"Id=glimpse-test-failure.service\nStateChangeTimestamp="+when.Format(activeEnterLayout)+" CEST\n\n"),
+	}
+	data, err := c.Collect(context.Background())
+	if err != nil {
+		t.Fatalf("Collect returned error: %v", err)
+	}
+	if got := data.Systemd.FailedUnitSince["glimpse-test-failure.service"]; !got.Equal(when) {
+		t.Fatalf("got failed-unit time %v, want %v", got, when)
 	}
 }
 

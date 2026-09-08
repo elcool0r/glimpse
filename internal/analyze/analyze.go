@@ -14,14 +14,14 @@ func Report(report *model.Report) {
 	findings := make([]model.Finding, 0)
 	m := report.Metrics
 	if cpu := m.CPU; cpu != nil && (cpu.Sampled == nil || *cpu.Sampled) && cpu.Utilization >= cpuUtilizationWarning && cpu.Load1 > float64(max(1, report.Host.CPUCount)) && m.Pressure != nil && m.Pressure.CPU.SomeAvg10 >= cpuPressureWarning {
-		findings = append(findings, finding("cpu-contention", model.SeverityWarning, "cpu", "Sustained CPU contention", fmt.Sprintf("CPU averaged %.0f%%, load was %.1f across %d CPUs, and CPU PSI some avg10 was %.1f%%.", cpu.Utilization*100, cpu.Load1, report.Host.CPUCount, m.Pressure.CPU.SomeAvg10), "Inspect runnable processes and CPU limits.", 10))
+		findings = append(findings, findingWithDiagnostic("cpu-contention", model.SeverityWarning, "cpu", "Sustained CPU contention", fmt.Sprintf("CPU averaged %.0f%%, load was %.1f across %d CPUs, and CPU PSI some avg10 was %.1f%%.", cpu.Utilization*100, cpu.Load1, report.Host.CPUCount, m.Pressure.CPU.SomeAvg10), "Inspect runnable processes and CPU limits.", "ps aux --sort=-%cpu | head -11", 10))
 	}
 	if cpu := m.CPU; cpu != nil && (cpu.Sampled == nil || *cpu.Sampled) && cpu.Steal >= cpuStealWarning && m.Pressure != nil && m.Pressure.CPU.SomeAvg10 >= cpuStealPressure {
-		findings = append(findings, finding("cpu-steal", model.SeverityWarning, "cpu", "CPU time lost to the hypervisor", fmt.Sprintf("Steal averaged %.1f%% during the sample and CPU PSI some avg10 was %.1f%%.", cpu.Steal*100, m.Pressure.CPU.SomeAvg10), "Inspect hypervisor contention and the VM CPU allocation.", 10))
+		findings = append(findings, findingWithDiagnostic("cpu-steal", model.SeverityWarning, "cpu", "CPU time lost to the hypervisor", fmt.Sprintf("Steal averaged %.1f%% during the sample and CPU PSI some avg10 was %.1f%%.", cpu.Steal*100, m.Pressure.CPU.SomeAvg10), "Inspect hypervisor contention and the VM CPU allocation.", "watch -n 1 'grep cpu /proc/stat'", 10))
 	}
 
 	if mem := m.Memory; mem != nil && mem.AvailableFraction < memoryAvailableWarning && ((m.Pressure != nil && m.Pressure.Memory.SomeAvg10 >= memoryPressureWarning) || mem.SwapInBytes > 0 || mem.SwapOutBytes > 0) {
-		findings = append(findings, finding("memory-pressure", model.SeverityWarning, "memory", "Memory pressure observed", fmt.Sprintf("MemAvailable is %.1f%%; memory PSI some avg10 is %.1f%%; swap activity during the sample was %s.", mem.AvailableFraction*100, pressureMemory(m.Pressure), bytes(mem.SwapInBytes+mem.SwapOutBytes)), "Inspect top memory consumers and cgroup limits.", 12))
+		findings = append(findings, findingWithDiagnostic("memory-pressure", model.SeverityWarning, "memory", "Memory pressure observed", fmt.Sprintf("MemAvailable is %.1f%%; memory PSI some avg10 is %.1f%%; swap activity during the sample was %s.", mem.AvailableFraction*100, pressureMemory(m.Pressure), bytes(mem.SwapInBytes+mem.SwapOutBytes)), "Inspect top memory consumers and cgroup limits.", "ps aux --sort=-%mem | head -11", 12))
 	}
 	for _, fs := range m.Filesystems {
 		if fs.ReadOnly {
@@ -34,9 +34,11 @@ func Report(report *model.Report) {
 			continue
 		}
 		if fs.UsedFraction >= filesystemFull {
-			findings = append(findings, finding("filesystem-"+fs.MountPoint, model.SeverityCritical, "filesystem", "Filesystem nearly full", fmt.Sprintf("%s (%s) is %.1f%% used.", fs.MountPoint, fs.Type, fs.UsedFraction*100), "Free space or review retention policies.", 20))
+			cmd := fmt.Sprintf("du -sh %s/* 2>/dev/null | sort -rh | head -10", fs.MountPoint)
+			findings = append(findings, findingWithDiagnostic("filesystem-"+fs.MountPoint, model.SeverityCritical, "filesystem", "Filesystem nearly full", fmt.Sprintf("%s (%s) is %.1f%% used.", fs.MountPoint, fs.Type, fs.UsedFraction*100), "Free space or review retention policies.", cmd, 20))
 		} else if fs.UsedFraction >= filesystemWarning {
-			findings = append(findings, finding("filesystem-"+fs.MountPoint, model.SeverityWarning, "filesystem", "Filesystem filling up", fmt.Sprintf("%s (%s) is %.1f%% used.", fs.MountPoint, fs.Type, fs.UsedFraction*100), "Review large files and retention policies.", 8))
+			cmd := fmt.Sprintf("du -sh %s/* 2>/dev/null | sort -rh | head -10", fs.MountPoint)
+			findings = append(findings, findingWithDiagnostic("filesystem-"+fs.MountPoint, model.SeverityWarning, "filesystem", "Filesystem filling up", fmt.Sprintf("%s (%s) is %.1f%% used.", fs.MountPoint, fs.Type, fs.UsedFraction*100), "Review large files and retention policies.", cmd, 8))
 		}
 		if fs.InodesTotal > 0 && fs.InodesFree <= fs.InodesTotal {
 			used := fraction(fs.InodesTotal-fs.InodesFree, fs.InodesTotal)
@@ -96,7 +98,7 @@ func Report(report *model.Report) {
 		findings = append(findings, stuckProcessFinding(p))
 	}
 	if s := m.Systemd; s != nil && len(s.FailedUnits) > 0 {
-		findings = append(findings, finding("failed-units", model.SeverityCritical, "services", "Failed systemd units", fmt.Sprintf("%d failed units: %v", len(s.FailedUnits), s.FailedUnits), "Run systemctl --failed and inspect the affected unit logs.", 25))
+		findings = append(findings, finding("failed-units", model.SeverityCritical, "services", "Failed systemd units", failedUnitsSummary(s), "Run systemctl --failed and inspect the affected unit logs.", 25))
 	}
 	if s := m.Systemd; s != nil {
 		// A unit using Restart=always crash-looping never appears in
@@ -138,6 +140,18 @@ func Report(report *model.Report) {
 		return
 	}
 	report.Score = scoreFindings(findings)
+}
+
+func failedUnitsSummary(systemd *model.Systemd) string {
+	units := make([]string, 0, len(systemd.FailedUnits))
+	for _, unit := range systemd.FailedUnits {
+		label := unit
+		if since, ok := systemd.FailedUnitSince[unit]; ok && !since.IsZero() {
+			label = fmt.Sprintf("%s (since %s)", unit, since.Local().Format("15:04 2006-01-02"))
+		}
+		units = append(units, label)
+	}
+	return fmt.Sprintf("%d failed units: %v", len(units), units)
 }
 
 // scoreFindings subtracts each finding's impact, bounded per category so one
@@ -241,22 +255,27 @@ func cgroupFindings(cgroup *model.CgroupV2, pressure *model.Pressure) []model.Fi
 		return nil
 	}
 	var findings []model.Finding
-	if cgroup.MemoryOOMKillDelta > 0 {
+	if cgroupValid(cgroup.MemoryEventsSampled) && cgroup.MemoryOOMKillDelta > 0 {
 		findings = append(findings, finding("cgroup-oom-kill", model.SeverityCritical, "cgroup", "Cgroup OOM kills during sample", fmt.Sprintf("The current cgroup recorded %d OOM kill(s) during the sampling window.", cgroup.MemoryOOMKillDelta), "Inspect the workload's memory limit and the largest memory consumers.", 25))
-	} else if cgroup.MemoryOOMDelta > 0 {
+	} else if cgroupValid(cgroup.MemoryEventsSampled) && cgroup.MemoryOOMDelta > 0 {
 		findings = append(findings, finding("cgroup-oom", model.SeverityWarning, "cgroup", "Cgroup memory allocation failures", fmt.Sprintf("The current cgroup recorded %d memory OOM event(s) during the sampling window.", cgroup.MemoryOOMDelta), "Inspect the workload's memory limit and memory demand.", 15))
 	}
-	if cgroup.CPUUsageSecondsDelta >= .1 && cgroup.CPUThrottledSecondsDelta >= .1 && cgroup.CPUThrottledSecondsDelta/cgroup.CPUUsageSecondsDelta >= .10 {
+	if cgroupValid(cgroup.CPUStatSampled) && cgroup.CPUUsageSecondsDelta >= .1 && cgroup.CPUThrottledSecondsDelta >= .1 && cgroup.CPUThrottledSecondsDelta/cgroup.CPUUsageSecondsDelta >= .10 {
 		findings = append(findings, finding("cgroup-cpu-throttling", model.SeverityWarning, "cgroup", "Cgroup CPU quota throttling", fmt.Sprintf("The current cgroup spent %.1fs throttled while using %.1fs CPU during the sample.", cgroup.CPUThrottledSecondsDelta, cgroup.CPUUsageSecondsDelta), "Inspect the CPU quota and runnable workload in this cgroup.", 10))
 	}
-	if cgroup.PIDsMax != nil && *cgroup.PIDsMax > 0 && fraction(cgroup.PIDsCurrent, *cgroup.PIDsMax) >= .95 {
+	if cgroupValid(cgroup.PIDsCurrentValid) && cgroupValid(cgroup.PIDsMaxValid) && cgroup.PIDsMax != nil && *cgroup.PIDsMax > 0 && fraction(cgroup.PIDsCurrent, *cgroup.PIDsMax) >= .95 {
 		findings = append(findings, finding("cgroup-pids-limit", model.SeverityWarning, "cgroup", "Cgroup PID limit nearly exhausted", fmt.Sprintf("The current cgroup uses %d of %d allowed PIDs.", cgroup.PIDsCurrent, *cgroup.PIDsMax), "Inspect process growth and raise the cgroup PID limit only if demand is expected.", 10))
 	}
-	if cgroup.MemoryMaxBytes != nil && *cgroup.MemoryMaxBytes > 0 && fraction(cgroup.MemoryCurrentBytes, *cgroup.MemoryMaxBytes) >= .95 && (cgroup.MemoryOOMDelta > 0 || cgroup.MemoryOOMKillDelta > 0 || pressure != nil && pressure.Memory.SomeAvg10 >= 1) {
+	if cgroupValid(cgroup.MemoryCurrentValid) && cgroupValid(cgroup.MemoryMaxValid) && cgroup.MemoryMaxBytes != nil && *cgroup.MemoryMaxBytes > 0 && fraction(cgroup.MemoryCurrentBytes, *cgroup.MemoryMaxBytes) >= .95 && ((cgroupValid(cgroup.MemoryEventsSampled) && (cgroup.MemoryOOMDelta > 0 || cgroup.MemoryOOMKillDelta > 0)) || pressure != nil && pressure.Memory.SomeAvg10 >= 1) {
 		findings = append(findings, finding("cgroup-memory-limit", model.SeverityWarning, "cgroup", "Cgroup memory limit under pressure", fmt.Sprintf("The current cgroup uses %.1f%% of its %s memory limit with corroborating memory pressure.", fraction(cgroup.MemoryCurrentBytes, *cgroup.MemoryMaxBytes)*100, bytes(*cgroup.MemoryMaxBytes)), "Inspect the cgroup memory limit and workload memory demand.", 12))
 	}
 	return findings
 }
+
+// Nil validity retains compatibility with legacy hand-built reports and
+// schema-v1 JSON. Collectors use explicit false to suppress conclusions from
+// unavailable or malformed cgroup files.
+func cgroupValid(valid *bool) bool { return valid == nil || *valid }
 
 func containerFindings(runtimes []model.ContainerRuntime) []model.Finding {
 	var findings []model.Finding
@@ -379,11 +398,47 @@ func zfsFindings(pools []model.ZFSPool) []model.Finding {
 			findings = append(findings, finding("zfs-pool-"+pool.Name+"-permanent-errors", model.SeverityCritical, "zfs", "ZFS reports permanent data errors", fmt.Sprintf("Pool %s is ONLINE but zpool status reports permanent data errors.", pool.Name), "Restore affected data from backup and investigate zpool status -v immediately.", 30))
 			continue
 		}
-		if pool.ReadErrors+pool.WriteErrors+pool.ChecksumErrors > 0 {
-			findings = append(findings, finding("zfs-pool-"+pool.Name+"-io-errors", model.SeverityWarning, "zfs", "ZFS pool reports device errors", fmt.Sprintf("Pool %s has %d read, %d write, and %d checksum errors.", pool.Name, pool.ReadErrors, pool.WriteErrors, pool.ChecksumErrors), "Run zpool status -v and inspect the affected device path and cables.", 15))
+		if zfsPoolHasErrors(pool) {
+			findings = append(findings, zfsErrorFinding(pool))
 		}
 	}
 	return findings
+}
+
+func zfsPoolHasErrors(pool model.ZFSPool) bool {
+	if pool.ReadErrors > 0 || pool.WriteErrors > 0 || pool.ChecksumErrors > 0 {
+		return true
+	}
+	for _, vdev := range pool.VdevErrors {
+		if vdev.ReadErrors > 0 || vdev.WriteErrors > 0 || vdev.ChecksumErrors > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func zfsErrorFinding(pool model.ZFSPool) model.Finding {
+	summary := fmt.Sprintf("Pool %s root row has %d read, %d write, and %d checksum errors.", pool.Name, pool.ReadErrors, pool.WriteErrors, pool.ChecksumErrors)
+	if len(pool.VdevErrors) > 0 {
+		parts := make([]string, 0, len(pool.VdevErrors))
+		for _, vdev := range pool.VdevErrors {
+			parts = append(parts, fmt.Sprintf("%s (%s: %d read, %d write, %d checksum)", vdev.Name, vdev.State, vdev.ReadErrors, vdev.WriteErrors, vdev.ChecksumErrors))
+		}
+		summary += " Affected vdevs: " + strings.Join(parts, "; ") + "."
+	}
+	if pool.Approximate || zfsVdevApproximate(pool.VdevErrors) {
+		summary += " Some counters use approximate scaled values."
+	}
+	return finding("zfs-pool-"+pool.Name+"-io-errors", model.SeverityWarning, "zfs", "ZFS pool reports device errors", summary, "Run zpool status -v and inspect the affected device path and cables.", 15)
+}
+
+func zfsVdevApproximate(vdevs []model.ZFSVdevError) bool {
+	for _, vdev := range vdevs {
+		if vdev.Approximate {
+			return true
+		}
+	}
+	return false
 }
 
 func diskFindings(report *model.Report) []model.Finding {
@@ -661,6 +716,14 @@ func abs(v float64) float64 {
 }
 func finding(id string, s model.Severity, category, title, summary, suggestion string, impact int) model.Finding {
 	return model.Finding{ID: id, Severity: s, Category: category, Title: title, Summary: summary, Suggestion: suggestion, ScoreImpact: impact}
+}
+
+func findingWithDiagnostic(id string, s model.Severity, category, title, summary, suggestion, diagnostic string, impact int) model.Finding {
+	return model.Finding{ID: id, Severity: s, Category: category, Title: title, Summary: summary, Suggestion: suggestion, DiagnosticCommand: diagnostic, ScoreImpact: impact}
+}
+
+func findingWithEventTime(id string, s model.Severity, category, title, summary, suggestion, diagnostic string, eventTime *time.Time, impact int) model.Finding {
+	return model.Finding{ID: id, Severity: s, Category: category, Title: title, Summary: summary, Suggestion: suggestion, DiagnosticCommand: diagnostic, EventTime: eventTime, ScoreImpact: impact}
 }
 func pressureMemory(p *model.Pressure) float64 {
 	if p == nil {

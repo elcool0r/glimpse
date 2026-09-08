@@ -77,7 +77,9 @@ func (c *Collector) Collect(parent context.Context) (collect.Data, error) {
 	}
 
 	var diagnostics []model.CollectionStatus
+	failedUnits := ParseFailedUnits(string(failedOutput))
 	restarts := map[string]uint64{}
+	failedSince := map[string]time.Time{}
 	var recentStarts []model.SystemdUnitStart
 	serviceUnitsDiscovered, serviceUnitsInspected := 0, 0
 	serviceUnitScanLimited := false
@@ -91,6 +93,19 @@ func (c *Collector) Collect(parent context.Context) (collect.Data, error) {
 		diagnostics = append(diagnostics, model.CollectionStatus{Status: "unavailable", Detail: "list-units: " + listErr.Error()})
 	default:
 		names := parseUnitNames(string(listOutput))
+		// Failed units are normally included in list-units, but append any
+		// missing names so failed non-service units can also receive their
+		// StateChangeTimestamp.
+		known := make(map[string]struct{}, len(names))
+		for _, name := range names {
+			known[name] = struct{}{}
+		}
+		for _, unit := range failedUnits {
+			if _, ok := known[unit]; !ok {
+				names = append(names, unit)
+				known[unit] = struct{}{}
+			}
+		}
 		serviceUnitsDiscovered = len(names)
 		if len(names) > maxUnits {
 			serviceUnitScanLimited = true
@@ -99,7 +114,7 @@ func (c *Collector) Collect(parent context.Context) (collect.Data, error) {
 		serviceUnitsInspected = len(names)
 		if len(names) > 0 {
 			args := append([]string{"show"}, names...)
-			args = append(args, "--property=Id,NRestarts,ActiveEnterTimestamp", "--no-pager")
+			args = append(args, "--property=Id,NRestarts,ActiveEnterTimestamp,StateChangeTimestamp", "--no-pager")
 			showCtx, cancel := context.WithTimeout(parent, timeout)
 			showOutput, showErr := run(showCtx, path, args...)
 			cancel()
@@ -110,14 +125,16 @@ func (c *Collector) Collect(parent context.Context) (collect.Data, error) {
 				diagnostics = append(diagnostics, model.CollectionStatus{Status: "unavailable", Detail: "show: " + showErr.Error()})
 			default:
 				restarts = parseRestarts(string(showOutput))
-				recentStarts = recentUnitStarts(parseActiveEnterTimestamps(string(showOutput)), time.Now())
+				showText := string(showOutput)
+				recentStarts = recentUnitStarts(parseActiveEnterTimestamps(showText), time.Now())
+				failedSince = parseUnitTimestamps(showText, "StateChangeTimestamp")
 			}
 		}
 	}
 
 	return collect.Data{
 		Systemd: &model.Systemd{
-			Available: true, FailedUnits: ParseFailedUnits(string(failedOutput)), RecentStarts: recentStarts,
+			Available: true, FailedUnits: failedUnits, FailedUnitSince: failedSince, RecentStarts: recentStarts,
 			ServiceUnitsDiscovered: serviceUnitsDiscovered, ServiceUnitsInspected: serviceUnitsInspected,
 			ServiceUnitScanLimited: serviceUnitScanLimited,
 		},
@@ -195,6 +212,10 @@ const activeEnterLayout = "Mon 2006-01-02 15:04:05"
 // does. A unit that has never been active reports an empty value, which is
 // skipped rather than treated as an error.
 func parseActiveEnterTimestamps(output string) map[string]time.Time {
+	return parseUnitTimestamps(output, "ActiveEnterTimestamp")
+}
+
+func parseUnitTimestamps(output, property string) map[string]time.Time {
 	result := make(map[string]time.Time)
 	var currentID string
 	for _, line := range strings.Split(output, "\n") {
@@ -210,7 +231,7 @@ func parseActiveEnterTimestamps(output string) map[string]time.Time {
 		switch key {
 		case "Id":
 			currentID = value
-		case "ActiveEnterTimestamp":
+		case property:
 			if currentID == "" || value == "" {
 				continue
 			}

@@ -5,22 +5,47 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 	"unicode/utf8"
 
+	"github.com/elcool0r/glimpse/internal/analyze"
 	"github.com/elcool0r/glimpse/internal/collect"
 	"github.com/elcool0r/glimpse/internal/model"
 )
 
 func TestParseInspectJSONLines(t *testing.T) {
-	raw := `{"Id":"abc","Name":"/web","State":{"Status":"running","RestartCount":3,"Health":{"Status":"healthy"}},"HostConfig":{"RestartPolicy":{"Name":"unless-stopped"}}}` + "\n" + `not json`
+	raw := `{"Id":"abc","Name":"/web","RestartCount":3,"State":{"Status":"running","Health":{"Status":"healthy"}},"HostConfig":{"RestartPolicy":{"Name":"unless-stopped"}}}` + "\n" + `not json`
 	items, restarts := ParseInspectJSONLines(raw)
 	if len(items) != 1 || items[0].Name != "web" || items[0].Healthy == nil || !*items[0].Healthy || !items[0].HasRestartPolicy || restarts["abc"] != 3 {
 		t.Fatalf("%+v %#v", items, restarts)
 	}
+}
+
+func TestParseAndDeltaRealDockerRestartCount(t *testing.T) {
+	firstItems, firstRestarts := ParseInspectJSONLines(`{"Id":"abc","Name":"/web","RestartCount":1,"State":{"Status":"running"}}`)
+	lastItems, lastRestarts := ParseInspectJSONLines(`{"Id":"abc","Name":"/web","RestartCount":4,"State":{"Status":"running"}}`)
+	if len(firstItems) != 1 || len(lastItems) != 1 || firstRestarts["abc"] != 1 || lastRestarts["abc"] != 4 {
+		t.Fatalf("restart snapshots first=%v/%v last=%v/%v", firstItems, firstRestarts, lastItems, lastRestarts)
+	}
+	data, err := (&Collector{}).Delta(
+		collect.Data{Snapshot: snapshot{restarts: map[string]uint64{"docker:abc": firstRestarts["abc"]}}},
+		collect.Data{Containers: []model.ContainerRuntime{{Runtime: "docker", Containers: lastItems}}, Snapshot: snapshot{restarts: map[string]uint64{"docker:abc": lastRestarts["abc"]}}},
+	)
+	if err != nil || len(data.Containers) != 1 || data.Containers[0].Containers[0].RestartCount != 3 {
+		t.Fatalf("delta=%+v err=%v", data, err)
+	}
+	report := model.Report{Metrics: model.Metrics{CPU: &model.CPU{}, Containers: data.Containers}}
+	analyze.Report(&report)
+	for _, finding := range report.Findings {
+		if finding.ID == "container-docker-web-restarts" && finding.Severity == model.SeverityCritical {
+			return
+		}
+	}
+	t.Fatalf("real-shaped 1->4 restart delta did not produce a critical finding: %+v", report.Findings)
 }
 func TestBoundedIDs(t *testing.T) {
 	got := boundedIDs("a\na\n b \n")
@@ -340,6 +365,18 @@ func TestDeltaTreatsContainerCreatedDuringWindowAsNormal(t *testing.T) {
 	}
 }
 
+func TestDeltaRejectsRestartCounterReset(t *testing.T) {
+	first := collect.Data{Snapshot: snapshot{restarts: map[string]uint64{"docker:abc": 4}}}
+	last := collect.Data{
+		Containers: []model.ContainerRuntime{{Runtime: "docker", Containers: []model.Container{{ID: "abc", State: "running"}}}},
+		Snapshot:   snapshot{restarts: map[string]uint64{"docker:abc": 1}},
+	}
+	data, err := (&Collector{}).Delta(first, last)
+	if err == nil || data.Containers[0].Containers[0].RestartCount != 0 {
+		t.Fatalf("reset was treated as a restart delta: data=%+v err=%v", data, err)
+	}
+}
+
 func TestCollectPropagatesParentCancellationDuringLogs(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -397,6 +434,30 @@ func TestActualRuntimeProcessesStripRemoteEnvironment(t *testing.T) {
 	logOut, _, logErr := runLimitedLogCommand(ctx, []string{"-test.run=^TestRuntimeEnvironmentHelper$"}, os.Args[0])
 	if logErr != nil || string(logOut) != "local environment" {
 		t.Fatalf("log command environment not isolated: %s %v", logOut, logErr)
+	}
+}
+
+func TestRunLimitedLogCommandCapturesApplicationStderrOnSuccess(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh unavailable")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	out, _, err := runLimitedLogCommand(ctx, []string{"-c", "printf 'panic: stderr-only' >&2"}, "sh")
+	if err != nil || len(ClassifyLogEvents(string(out))) != 1 {
+		t.Fatalf("output=%q events=%+v err=%v", out, ClassifyLogEvents(string(out)), err)
+	}
+}
+
+func TestRunLimitedLogCommandRejectsFailedClientDiagnostics(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh unavailable")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	out, _, err := runLimitedLogCommand(ctx, []string{"-c", "printf 'panic: client diagnostic' >&2; exit 7"}, "sh")
+	if err == nil || out != nil {
+		t.Fatalf("output=%q err=%v; failed log commands must not be classified", out, err)
 	}
 }
 

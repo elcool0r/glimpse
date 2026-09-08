@@ -276,29 +276,30 @@ func gatewayFindings(check *model.GatewayCheck) []model.Finding {
 	return findings
 }
 
-// pathMTUFindings judges the discovered path MTU, not just whether the
-// single largest size got through. A dropped baseline ping means the anchor
+// pathMTUFindings reports only the observations made by the bounded IPv4 DF
+// probe series. A dropped baseline ping means the anchor
 // host is unreachable right now, which the gateway and DNS checks already
 // speak to -- it says nothing about MTU specifically, so it produces no
-// finding here. A reduced but discovered path MTU is normal and healthy with
-// PPPoE, VPNs, and tunnels when path MTU discovery is working, so it is
-// informational, not a warning; only the absence of any usable size at all
-// -- evidence that PMTUD itself is not working, typically because the ICMP
-// "fragmentation needed" replies that drive it are being filtered -- is the
-// actual black-hole finding.
+// finding here. A reply below the tested ceiling is informational. Receiving
+// no replies across the series remains a warning, with packet-too-big feedback
+// reported separately from the echo result.
 func pathMTUFindings(check *model.PathMTUCheck) []model.Finding {
 	if check == nil || !check.Available || !check.BaselineOK {
 		return nil
 	}
 	if check.DiscoveredMTU == 0 {
-		return []model.Finding{finding("path-mtu-blackhole", model.SeverityWarning, "network", "Possible path MTU black hole",
-			fmt.Sprintf("Small packets to %s succeed, but every non-fragmentable packet size down to %d bytes failed; no usable path MTU could be discovered.", check.Target, check.FloorMTU),
-			"Inspect whether ICMP \"fragmentation needed\" messages are being filtered on the path (path MTU discovery depends on them), and any VPN/tunnel/middlebox MTU settings; large transfers over this path may hang or stall even though small ones and pings work.", 12)}
+		feedback := "No packet-too-big feedback was observed in the probe output."
+		if check.PacketTooBigFeedback {
+			feedback = "Packet-too-big feedback was observed in the probe output."
+		}
+		return []model.Finding{finding("path-mtu-blackhole", model.SeverityWarning, "network", "No IPv4 DF echo replies across tested sizes",
+			fmt.Sprintf("The baseline ping to %s replied, but IPv4 DF probes from %d down to %d bytes received no echo replies. %s", check.Target, check.CeilingMTU, check.FloorMTU, feedback),
+			"Inspect VPN, tunnel, middlebox, and ICMP handling if large transfers over this path stall while smaller packets succeed.", 12)}
 	}
 	if check.DiscoveredMTU < check.CeilingMTU {
-		return []model.Finding{finding("path-mtu-reduced", model.SeverityInfo, "network", fmt.Sprintf("Path MTU is %d bytes, not %d -- this is normal, not a fault", check.DiscoveredMTU, check.CeilingMTU),
-			fmt.Sprintf("Path MTU to %s was cleanly discovered at %d of %d tested bytes. A reduced path MTU is expected and healthy behind a VPN, tunnel, or PPPoE connection as long as path MTU discovery (the mechanism that found this size) is working, which it is here.", check.Target, check.DiscoveredMTU, check.CeilingMTU),
-			"No action needed if large transfers over this path already work normally.", 0)}
+		return []model.Finding{finding("path-mtu-reduced", model.SeverityInfo, "network", fmt.Sprintf("Largest tested IPv4 DF echo reply was %d bytes", check.DiscoveredMTU),
+			fmt.Sprintf("The %d-byte IPv4 DF probe to %s replied after larger tested sizes up to %d bytes did not reply.", check.DiscoveredMTU, check.Target, check.CeilingMTU),
+			"Compare this observation with VPN, tunnel, and interface settings if large transfers over this path stall.", 0)}
 	}
 	return nil
 }

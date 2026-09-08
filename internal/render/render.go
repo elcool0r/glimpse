@@ -465,13 +465,10 @@ func informationalFindings(findings []model.Finding) []model.Finding {
 	return result
 }
 
-// quietInfoFindingIDs holds informational finding IDs whose own check
-// already states the same fact in its compact summary row (for example,
-// Path MTU's row already says "reduced but working normally"). Repeating
-// them as a generic one-line fact in the non-verbose report is redundant,
-// and for a host with an intentional, permanent reduced MTU it never goes
-// away -- so these stay out of the compact report and remain fully visible
-// in --verbose and in JSON.
+// quietInfoFindingIDs holds informational finding IDs whose own check exposes
+// the same observation under --verbose. Repeating them as a generic one-line
+// fact on every non-verbose run is noise, so these remain visible in verbose
+// output and JSON.
 var quietInfoFindingIDs = map[string]bool{
 	"path-mtu-reduced": true,
 }

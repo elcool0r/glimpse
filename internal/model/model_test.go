@@ -29,6 +29,42 @@ func TestMetricsOmitOptionalMilestoneTwoCategories(t *testing.T) {
 	}
 }
 
+func TestCgroupValidityFlagsPreserveExplicitFalseAndTrue(t *testing.T) {
+	valid, invalid := true, false
+	b, err := json.Marshal(CgroupV2{MemoryCurrentValid: &valid, MemoryMaxValid: &invalid})
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(b)
+	if !strings.Contains(text, `"memory_current_valid":true`) || !strings.Contains(text, `"memory_max_valid":false`) {
+		t.Fatalf("validity flags lost: %s", text)
+	}
+	var roundTrip CgroupV2
+	if err := json.Unmarshal(b, &roundTrip); err != nil {
+		t.Fatal(err)
+	}
+	if roundTrip.MemoryCurrentValid == nil || !*roundTrip.MemoryCurrentValid || roundTrip.MemoryMaxValid == nil || *roundTrip.MemoryMaxValid {
+		t.Fatalf("validity flags did not round trip: %+v", roundTrip)
+	}
+}
+
+func TestPathMTUPacketTooBigFeedbackJSON(t *testing.T) {
+	b, err := json.Marshal(PathMTUCheck{Available: true, DiscoveredMTU: 1428, PacketTooBigFeedback: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"packet_too_big_feedback":true`) {
+		t.Fatalf("packet-too-big evidence missing: %s", b)
+	}
+	var roundTrip PathMTUCheck
+	if err := json.Unmarshal(b, &roundTrip); err != nil {
+		t.Fatal(err)
+	}
+	if !roundTrip.PacketTooBigFeedback || roundTrip.DiscoveredMTU != 1428 {
+		t.Fatalf("path MTU evidence did not round trip: %+v", roundTrip)
+	}
+}
+
 // Report JSON is a public API. Keep this compact representative document as a
 // golden contract so accidental field renames, unit shape changes, or omitted
 // required top-level fields fail loudly.

@@ -438,14 +438,13 @@ func TestVerboseExternalTextIsSanitized(t *testing.T) {
 	}
 }
 
-// A reduced-but-discovered path MTU is common (PPPoE, VPNs) and permanent
-// for a given host, so its INFO row would otherwise reappear on every run
-// forever; it stays quiet by default and only shows under --verbose. OK and
-// WARN/CRIT rows for this same check are unaffected.
+// A reduced-size DF reply can be a persistent observation, so its INFO row
+// stays quiet by default and appears under --verbose. OK and WARN/CRIT rows
+// for this same check are unaffected.
 func TestPathMTUInfoRowHiddenUnlessVerbose(t *testing.T) {
 	report := model.Report{
 		Metrics:  model.Metrics{PathMTUCheck: &model.PathMTUCheck{Available: true, Target: "1.1.1.1", CeilingMTU: 1500, FloorMTU: 576, BaselineOK: true, DiscoveredMTU: 1420}},
-		Findings: []model.Finding{{ID: "path-mtu-reduced", Severity: model.SeverityInfo, Category: "network", Title: "Path MTU is 1420 bytes, not 1500 -- this is normal, not a fault"}},
+		Findings: []model.Finding{{ID: "path-mtu-reduced", Severity: model.SeverityInfo, Category: "network", Title: "Largest tested IPv4 DF echo reply was 1420 bytes"}},
 	}
 
 	var compact strings.Builder
@@ -461,10 +460,10 @@ func TestPathMTUInfoRowHiddenUnlessVerbose(t *testing.T) {
 	}
 }
 
-func TestPathMTUCriticalRowAlwaysShown(t *testing.T) {
+func TestPathMTUWarningRowAlwaysShown(t *testing.T) {
 	report := model.Report{
 		Metrics:  model.Metrics{PathMTUCheck: &model.PathMTUCheck{Available: true, Target: "1.1.1.1", CeilingMTU: 1500, FloorMTU: 576, BaselineOK: true, DiscoveredMTU: 0}},
-		Findings: []model.Finding{{ID: "path-mtu-blackhole", Severity: model.SeverityWarning, Category: "network", Title: "Possible path MTU black hole"}},
+		Findings: []model.Finding{{ID: "path-mtu-blackhole", Severity: model.SeverityWarning, Category: "network", Title: "No IPv4 DF echo replies across tested sizes"}},
 	}
 	var out strings.Builder
 	Write(&out, report, Options{})
@@ -485,7 +484,7 @@ func TestNetworkAndTCPBadgesIgnoreUnrelatedNetworkCategoryFindings(t *testing.T)
 			TCP:     &model.TCP{SegmentsOut: 100},
 		},
 		Findings: []model.Finding{
-			{ID: "path-mtu-reduced", Severity: model.SeverityInfo, Category: "network", Title: "Path MTU is 1420 bytes, not 1500 -- this is normal, not a fault"},
+			{ID: "path-mtu-reduced", Severity: model.SeverityInfo, Category: "network", Title: "Largest tested IPv4 DF echo reply was 1420 bytes"},
 			{ID: "dns-resolution-external-failed", Severity: model.SeverityCritical, Category: "network", Title: "External DNS server unreachable"},
 		},
 	}

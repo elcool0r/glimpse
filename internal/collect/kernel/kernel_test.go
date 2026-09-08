@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strconv"
 	"testing"
 	"time"
 
+	"github.com/elcool0r/glimpse/internal/analyze"
 	"github.com/elcool0r/glimpse/internal/model"
 )
 
@@ -104,15 +106,110 @@ func TestIsVirtualInterfaceMessageRequiresWordBoundary(t *testing.T) {
 // once ENOSPC-style journal-wide grepping was added alongside the -k scans)
 // must not be reported twice.
 func TestAppendNewEventsDeduplicatesAcrossScans(t *testing.T) {
-	seen := map[string]struct{}{}
-	events := appendNewEvents(nil, seen, []model.LogEvent{{Kind: "disk_full", Message: "first"}})
-	events = appendNewEvents(events, seen, []model.LogEvent{{Kind: "disk_full", Message: "second"}, {Kind: "segfault", Message: "third"}})
+	events := appendNewEvents(nil, []model.LogEvent{{Kind: "disk_full", Message: "first"}})
+	events = appendNewEvents(events, []model.LogEvent{{Kind: "disk_full", Message: "second"}, {Kind: "segfault", Message: "third"}})
 	if len(events) != 2 {
 		t.Fatalf("expected the duplicate disk_full dropped, got %#v", events)
 	}
 	if events[0].Message != "first" || events[1].Kind != "segfault" {
 		t.Fatalf("unexpected merge result: %#v", events)
 	}
+}
+
+func TestParseEventsKeepsNewestCanonicalEvent(t *testing.T) {
+	now := time.Unix(2_000_000_000, 0)
+	old := now.Add(-2 * time.Hour).Unix()
+	recent := now.Add(-time.Minute).Unix()
+	got := ParseEvents(
+		itoa(old)+" host kernel: Out of memory: old\n"+
+			itoa(recent)+" host kernel: Killed process 42 (worker)", now)
+	if len(got) != 1 {
+		t.Fatalf("got %d events, want one canonical OOM event: %#v", len(got), got)
+	}
+	if got[0].Message != "Killed process 42 (worker)" || got[0].AgeSeconds == nil || *got[0].AgeSeconds > 61 {
+		t.Fatalf("old OOM survived instead of recent event: %#v", got[0])
+	}
+
+	// The reverse order must keep the already encountered recent event.
+	reversed := ParseEvents(
+		itoa(recent)+" host kernel: Killed process 42 (worker)\n"+
+			itoa(old)+" host kernel: Out of memory: old", now)
+	if len(reversed) != 1 || reversed[0].Message != "Killed process 42 (worker)" {
+		t.Fatalf("reverse-order scan regressed to old event: %#v", reversed)
+	}
+}
+
+func TestAppendNewEventsKeepsNewestAcrossScansAndCanonicalOOM(t *testing.T) {
+	events := appendNewEvents(nil, []model.LogEvent{{Kind: "oom", Message: "old", AgeSeconds: seconds(2 * time.Hour)}})
+	events = appendNewEvents(events, []model.LogEvent{{Kind: "cgroup_oom", Message: "recent", AgeSeconds: seconds(time.Minute)}})
+	if len(events) != 1 || events[0].Kind != "cgroup_oom" || events[0].Message != "recent" {
+		t.Fatalf("cross-scan canonical OOM did not retain newest event: %#v", events)
+	}
+
+	// Ordinary I/O events use the same newest-event rule, even when a later
+	// scan returns records in reverse chronological order.
+	events = appendNewEvents(events, []model.LogEvent{
+		{Kind: "io_error", Message: "older", AgeSeconds: seconds(2 * time.Hour)},
+		{Kind: "io_error", Message: "newest", AgeSeconds: seconds(time.Minute)},
+	})
+	if len(events) != 2 || events[1].Message != "newest" {
+		t.Fatalf("cross-scan I/O event selection regressed: %#v", events)
+	}
+}
+
+func TestEventAgeSelectionPrefersKnownAndStableTies(t *testing.T) {
+	known := seconds(time.Minute)
+	events := appendNewEvents(nil, []model.LogEvent{{Kind: "io_error", Message: "unknown"}})
+	events = appendNewEvents(events, []model.LogEvent{{Kind: "io_error", Message: "known", AgeSeconds: known}})
+	if events[0].Message != "known" {
+		t.Fatalf("known timestamp should replace unknown evidence: %#v", events)
+	}
+	events = appendNewEvents(events, []model.LogEvent{{Kind: "io_error", Message: "unknown later"}})
+	if events[0].Message != "known" {
+		t.Fatalf("unknown timestamp should not replace known evidence: %#v", events)
+	}
+	events = appendNewEvents(events, []model.LogEvent{{Kind: "io_error", Message: "equal age", AgeSeconds: known}})
+	if events[0].Message != "known" {
+		t.Fatalf("equal ages should retain first encounter: %#v", events)
+	}
+}
+
+func TestParseEventsLeavesMalformedTimestampAgeUnknown(t *testing.T) {
+	for _, timestamp := range []string{"NaN", "+Inf", "-1"} {
+		t.Run(timestamp, func(t *testing.T) {
+			events := ParseEvents(timestamp+" host kernel: Out of memory: malformed", time.Unix(2_000_000_000, 0))
+			if len(events) != 1 || events[0].AgeSeconds != nil {
+				t.Fatalf("malformed timestamp must remain unknown, got %#v", events)
+			}
+		})
+	}
+}
+
+func TestNewestOOMRemainsCriticalInAnalysis(t *testing.T) {
+	now := time.Unix(2_000_000_000, 0)
+	old := now.Add(-2 * time.Hour).Unix()
+	recent := now.Add(-time.Minute).Unix()
+	events := ParseEvents(itoa(old)+" host kernel: Out of memory: old\n"+itoa(recent)+" host kernel: Killed process 42", now)
+	report := &model.Report{Metrics: model.Metrics{Kernel: &model.Kernel{Available: true, Events: events}}}
+	analyze.Report(report)
+	for _, finding := range report.Findings {
+		if finding.ID == "kernel-oom" {
+			if finding.Severity != model.SeverityCritical {
+				t.Fatalf("newest OOM should remain critical, got %#v", finding)
+			}
+			return
+		}
+	}
+	t.Fatalf("kernel OOM finding missing: %#v", report.Findings)
+}
+
+func seconds(duration time.Duration) *float64 {
+	value := duration.Seconds()
+	return &value
+}
+
+func itoa(value int64) string {
+	return strconv.FormatInt(value, 10)
 }
 
 func TestUnavailableJournalIsNotAnError(t *testing.T) {

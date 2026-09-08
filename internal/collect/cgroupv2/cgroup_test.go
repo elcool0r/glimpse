@@ -2,7 +2,15 @@ package cgroupv2
 
 import (
 	"context"
+	"errors"
+	"os"
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/elcool0r/glimpse/internal/analyze"
+	"github.com/elcool0r/glimpse/internal/collect"
+	"github.com/elcool0r/glimpse/internal/model"
 )
 
 func TestCollectorRespectsCancelledContext(t *testing.T) {
@@ -45,3 +53,147 @@ func TestIsContainerizedRecognizesLXCAndSystemdNspawn(t *testing.T) {
 		t.Fatal("ordinary user scope must not be classified as containerized")
 	}
 }
+
+func TestCollectSetsPerFileValidityAndReportsFailures(t *testing.T) {
+	files := map[string]string{
+		"/proc/self/cgroup":                          "0::/slice/a\n",
+		"/sys/fs/cgroup/cgroup.controllers":          "memory pids cpu\n",
+		"/sys/fs/cgroup/slice/a/memory.current":      "0\n",
+		"/sys/fs/cgroup/slice/a/memory.max":          "max\n",
+		"/sys/fs/cgroup/slice/a/memory.swap.current": "7\n",
+		"/sys/fs/cgroup/slice/a/memory.swap.max":     "bad\n",
+		"/sys/fs/cgroup/slice/a/pids.current":        "0\n",
+		"/sys/fs/cgroup/slice/a/pids.max":            "12\n",
+		"/sys/fs/cgroup/slice/a/memory.events":       "oom 0\noom_kill 0\n",
+		"/sys/fs/cgroup/slice/a/cpu.stat":            "usage_usec 0\nthrottled_usec 0\n",
+	}
+	read := func(name string) ([]byte, error) {
+		if value, ok := files[name]; ok {
+			return []byte(value), nil
+		}
+		return nil, os.ErrNotExist
+	}
+	c := &Collector{ProcRoot: "/proc", CgroupRoot: "/sys/fs/cgroup", readFile: read, stat: func(string) (os.FileInfo, error) { return fakeInfo{}, nil }}
+	data, err := c.Collect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := data.CgroupV2
+	if got == nil || got.MemoryCurrentValid == nil || !*got.MemoryCurrentValid || got.MemoryCurrentBytes != 0 {
+		t.Fatalf("zero current must be valid: %+v", got)
+	}
+	if got.MemoryMaxValid == nil || !*got.MemoryMaxValid || got.MemoryMaxBytes != nil {
+		t.Fatalf("max must be valid unlimited: %+v", got)
+	}
+	if got.MemorySwapMaxValid == nil || *got.MemorySwapMaxValid {
+		t.Fatalf("malformed max must be invalid: %+v", got)
+	}
+	if got.MemoryEventsSampled == nil || !*got.MemoryEventsSampled || got.CPUStatSampled == nil || !*got.CPUStatSampled {
+		t.Fatalf("required event groups should be sampled: %+v", got)
+	}
+	if len(data.Diagnostics) != 1 || !strings.Contains(data.Diagnostics[0].Detail, "memory.swap.max") || !strings.Contains(data.Diagnostics[0].Detail, "malformed") {
+		t.Fatalf("diagnostics = %+v", data.Diagnostics)
+	}
+}
+
+func TestCollectRequiredGroupsNeedBothCounters(t *testing.T) {
+	files := map[string]string{
+		"/proc/self/cgroup":                     "/proc/self/cgroup", // replaced below
+		"/sys/fs/cgroup/cgroup.controllers":     "memory pids cpu",
+		"/sys/fs/cgroup/slice/a/memory.current": "1", "/sys/fs/cgroup/slice/a/memory.max": "max",
+		"/sys/fs/cgroup/slice/a/memory.swap.current": "1", "/sys/fs/cgroup/slice/a/memory.swap.max": "max",
+		"/sys/fs/cgroup/slice/a/pids.current": "1", "/sys/fs/cgroup/slice/a/pids.max": "max",
+		"/sys/fs/cgroup/slice/a/memory.events": "oom 1", "/sys/fs/cgroup/slice/a/cpu.stat": "usage_usec 1",
+	}
+	files["/proc/self/cgroup"] = "0::/slice/a\n"
+	read := func(name string) ([]byte, error) {
+		if value, ok := files[name]; ok {
+			return []byte(value), nil
+		}
+		return nil, errors.New("denied")
+	}
+	c := &Collector{ProcRoot: "/proc", CgroupRoot: "/sys/fs/cgroup", readFile: read, stat: func(string) (os.FileInfo, error) { return fakeInfo{}, nil }}
+	data, err := c.Collect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if *data.CgroupV2.MemoryEventsSampled || *data.CgroupV2.CPUStatSampled {
+		t.Fatalf("incomplete groups sampled: %+v", data.CgroupV2)
+	}
+	if len(data.Diagnostics) != 2 {
+		t.Fatalf("expected one diagnostic per failed group, got %+v", data.Diagnostics)
+	}
+}
+
+func TestDeltaRequiresSameSourceValidMonotonicCounters(t *testing.T) {
+	trueValue := true
+	finalMetric := model.CgroupV2{Available: true, Path: "/a", MemoryCurrentBytes: 0, MemoryEventsSampled: &trueValue, CPUStatSampled: &trueValue}
+	first := collect.Data{Snapshot: snapshot{source: "/a", oom: 100, oomKill: 20, usageUSec: 100, throttledUSec: 10, oomValid: true, cpuValid: true, metric: model.CgroupV2{Available: true, Path: "/a", MemoryEventsSampled: &trueValue, CPUStatSampled: &trueValue}}}
+	last := collect.Data{Snapshot: snapshot{source: "/a", oom: 103, oomKill: 21, usageUSec: 1000100, throttledUSec: 200010, oomValid: true, cpuValid: true, metric: finalMetric}}
+	got, err := (&Collector{}).Delta(first, last)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.CgroupV2.MemoryOOMDelta != 3 || got.CgroupV2.MemoryOOMKillDelta != 1 || got.CgroupV2.CPUUsageSecondsDelta != 1 || got.CgroupV2.CPUThrottledSecondsDelta != .2 || !*got.CgroupV2.MemoryEventsSampled {
+		t.Fatalf("valid deltas = %+v", got.CgroupV2)
+	}
+	report := model.Report{Metrics: model.Metrics{CPU: &model.CPU{}, CgroupV2: got.CgroupV2}}
+	analyze.Report(&report)
+	if findingByID(report, "cgroup-oom-kill") == nil || findingByID(report, "cgroup-cpu-throttling") == nil {
+		t.Fatalf("valid deltas must remain actionable: %+v", report.Findings)
+	}
+
+	finalMetric.MemoryCurrentBytes = 7
+	last.Snapshot = snapshot{source: "/b", metric: finalMetric}
+	got, err = (&Collector{}).Delta(first, last)
+	if err == nil || got.CgroupV2.MemoryOOMDelta != 0 || got.CgroupV2.MemoryCurrentBytes != 7 || *got.CgroupV2.MemoryEventsSampled {
+		t.Fatalf("source change = %+v err=%v", got.CgroupV2, err)
+	}
+
+	first.Snapshot = snapshot{source: "/a", oom: 100, oomKill: 20, usageUSec: 100, throttledUSec: 10, oomValid: false, cpuValid: false}
+	last.Snapshot = snapshot{source: "/a", oom: 200, oomKill: 120, usageUSec: 300, throttledUSec: 50, oomValid: true, cpuValid: true, metric: finalMetric}
+	got, err = (&Collector{}).Delta(first, last)
+	if err != nil || got.CgroupV2.MemoryOOMDelta != 0 || got.CgroupV2.CPUUsageSecondsDelta != 0 || *got.CgroupV2.CPUStatSampled {
+		t.Fatalf("invalid baseline = %+v err=%v", got.CgroupV2, err)
+	}
+	first.Snapshot = snapshot{source: "/a", oom: 10, oomKill: 10, usageUSec: 10, throttledUSec: 10, oomValid: true, cpuValid: true}
+	last.Snapshot = snapshot{source: "/a", oom: 9, oomKill: 9, usageUSec: 9, throttledUSec: 9, oomValid: true, cpuValid: true, metric: finalMetric}
+	got, err = (&Collector{}).Delta(first, last)
+	if err != nil || got.CgroupV2.MemoryOOMDelta != 0 || got.CgroupV2.CPUUsageSecondsDelta != 0 || *got.CgroupV2.MemoryEventsSampled || *got.CgroupV2.CPUStatSampled {
+		t.Fatalf("counter regression = %+v err=%v", got.CgroupV2, err)
+	}
+}
+
+func findingByID(report model.Report, id string) *model.Finding {
+	for i := range report.Findings {
+		if report.Findings[i].ID == id {
+			return &report.Findings[i]
+		}
+	}
+	return nil
+}
+
+func TestDeltaMissingBaselinePreservesFinalGauges(t *testing.T) {
+	valid := true
+	last := collect.Data{Snapshot: snapshot{source: "/a", metric: model.CgroupV2{Available: true, MemoryCurrentBytes: 0, MemoryCurrentValid: &valid, MemoryEventsSampled: &valid, CPUStatSampled: &valid}}, CgroupV2: &model.CgroupV2{Available: true, MemoryCurrentBytes: 0, MemoryCurrentValid: &valid}}
+	got, err := (&Collector{}).Delta(collect.Data{}, last)
+	if err == nil || got.CgroupV2 == nil || got.CgroupV2.MemoryCurrentBytes != 0 || got.CgroupV2.MemoryEventsSampled == nil || *got.CgroupV2.MemoryEventsSampled {
+		t.Fatalf("missing baseline = %+v err=%v", got.CgroupV2, err)
+	}
+}
+
+func TestDeltaMissingFinalIsUnavailable(t *testing.T) {
+	got, err := (&Collector{}).Delta(collect.Data{Snapshot: snapshot{source: "/a"}}, collect.Data{})
+	if err == nil || got.CgroupV2 == nil || got.CgroupV2.Available {
+		t.Fatalf("missing final = %+v err=%v", got.CgroupV2, err)
+	}
+}
+
+type fakeInfo struct{}
+
+func (fakeInfo) Name() string       { return "cgroup.controllers" }
+func (fakeInfo) Size() int64        { return 0 }
+func (fakeInfo) Mode() os.FileMode  { return 0 }
+func (fakeInfo) ModTime() time.Time { return time.Time{} }
+func (fakeInfo) IsDir() bool        { return false }
+func (fakeInfo) Sys() any           { return nil }

@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"sort"
@@ -54,7 +55,7 @@ func (c *Collector) Collect(parent context.Context) (collect.Data, error) {
 	}
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
-	raw, err := run(ctx, path, "status", "-P")
+	raw, err := run(ctx, path, "status", "-P", "-p")
 	if err != nil {
 		if parent.Err() != nil {
 			return collect.Data{}, parent.Err()
@@ -95,19 +96,22 @@ func (c *Collector) zfsInUse() bool {
 }
 
 // ParseStatus handles zpool's human-readable status output conservatively.
-// It only uses the root pool row for counters; leaf vdev counters are not
+// Pool row counters remain separate from affected-vdev evidence; rows are not
 // summed because mirrors and raidz would otherwise double-count failures.
 func ParseStatus(text string) []model.ZFSPool {
 	var pools []model.ZFSPool
 	var current *model.ZFSPool
 	inConfig := false
 	inScan := false
+	var vdevErrors []model.ZFSVdevError
 	finish := func() {
 		if current != nil {
+			current.VdevErrors = append(current.VdevErrors, vdevErrors...)
 			pools = append(pools, *current)
 			current = nil
 			inConfig = false
 			inScan = false
+			vdevErrors = nil
 		}
 	}
 	sc := bufio.NewScanner(strings.NewReader(text))
@@ -155,10 +159,25 @@ func ParseStatus(text string) []model.ZFSPool {
 		}
 		if inConfig {
 			f := strings.Fields(line)
-			if len(f) >= 5 && f[0] == current.Name && isState(f[1]) {
-				current.ReadErrors = parseUint(f[2])
-				current.WriteErrors = parseUint(f[3])
-				current.ChecksumErrors = parseUint(f[4])
+			if len(f) < 5 || !isState(f[1]) {
+				continue
+			}
+			read, readApprox, readOK := parseCounter(f[2])
+			write, writeApprox, writeOK := parseCounter(f[3])
+			checksum, checksumApprox, checksumOK := parseCounter(f[4])
+			if !readOK || !writeOK || !checksumOK {
+				continue
+			}
+			approximate := readApprox || writeApprox || checksumApprox
+			if f[0] == current.Name {
+				current.ReadErrors, current.WriteErrors, current.ChecksumErrors = read, write, checksum
+				current.Approximate = approximate
+				continue
+			}
+			if read > 0 || write > 0 || checksum > 0 {
+				// Preserve each affected vdev as evidence. Aggregate rows are
+				// never added to a total, avoiding mirror/raidz double counts.
+				vdevErrors = append(vdevErrors, model.ZFSVdevError{Name: f[0], State: strings.ToUpper(f[1]), ReadErrors: read, WriteErrors: write, ChecksumErrors: checksum, Approximate: approximate})
 			}
 		}
 	}
@@ -173,7 +192,39 @@ func isState(s string) bool {
 	}
 	return false
 }
-func parseUint(s string) uint64 { v, _ := strconv.ParseUint(s, 10, 64); return v }
+func parseCounter(s string) (uint64, bool, bool) {
+	if v, err := strconv.ParseUint(s, 10, 64); err == nil {
+		return v, false, true
+	}
+	if s == "" {
+		return 0, false, false
+	}
+	multiplier := uint64(1)
+	approximate := false
+	last := s[len(s)-1]
+	switch last {
+	case 'K', 'k':
+		multiplier, approximate = 1024, true
+	case 'M', 'm':
+		multiplier, approximate = 1024*1024, true
+	case 'G', 'g':
+		multiplier, approximate = 1024*1024*1024, true
+	case 'T', 't':
+		multiplier, approximate = 1024*1024*1024*1024, true
+	case 'P', 'p':
+		multiplier, approximate = 1024*1024*1024*1024*1024, true
+	case 'E', 'e':
+		multiplier, approximate = 1024*1024*1024*1024*1024*1024, true
+	default:
+		return 0, false, false
+	}
+	number := strings.TrimSpace(s[:len(s)-1])
+	v, err := strconv.ParseFloat(number, 64)
+	if err != nil || math.IsNaN(v) || math.IsInf(v, 0) || v < 0 || v*float64(multiplier) >= math.Exp2(64) {
+		return 0, false, false
+	}
+	return uint64(v * float64(multiplier)), approximate, true
+}
 func runCommand(ctx context.Context, name string, args ...string) ([]byte, error) {
 	return command.Output(ctx, name, args...)
 }

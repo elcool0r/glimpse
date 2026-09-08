@@ -34,7 +34,7 @@ CRIT  Failed systemd units
 - **Zero setup** — one binary, no daemon, no config file, no root required for most checks
 - **Fast** — a useful report in 5 seconds by default; `--duration 60s` for a deeper sample
 - **Broad coverage** — CPU, memory, disk I/O, filesystems, network, thermal, processes, systemd, kernel log events, security posture (SELinux/AppArmor, failed logins, kernel taint), RAID/LVM, ZFS, SMART/NVMe, containers (Docker/Podman), cgroup v2, and more
-- **Active network diagnostics** — DNS resolution (local *and* external resolver), gateway reachability, path MTU black-hole detection, and outbound HTTP/HTTPS checks, all opt-out rather than opt-in
+- **Active network diagnostics** — DNS resolution (local *and* external resolver), gateway reachability, bounded IPv4 DF probe observations, and outbound HTTP/HTTPS checks, all opt-out rather than opt-in
 - **Correlated, not noisy** — findings require multiple corroborating signals, with conservative, documented thresholds (see [`HEALTH-CHECKS.md`](HEALTH-CHECKS.md))
 - **Scriptable** — `--json` for a stable, versioned schema; meaningful exit codes for CI/cron
 - **Safe by design** — read-only, no destructive commands, bounded external command timeouts, sanitized terminal output
@@ -115,7 +115,7 @@ Several checks are active rather than passive — they send real traffic instead
 - **Gateway ping** to detect an unreachable, lossy, or high-latency default gateway
 - **External ICMP ping** to a fixed internet anchor, independent of the gateway — a healthy gateway only proves the local link works
 - **IPv6 ping** to an external anchor, but only when the host has a global IPv6 address configured; an IPv4-only host is not a fault and is skipped entirely
-- **Path MTU discovery** to catch a black-holed path (as opposed to a merely reduced-but-healthy MTU behind a VPN or PPPoE, which is normal and not flagged)
+- **IPv4 DF packet-size probes** report the largest tested size that received an echo reply and whether packet-too-big feedback was observed
 - **HTTP/HTTPS GET, forced over IPv4,** to catch the case where DNS and ICMP both work but web traffic specifically doesn't (captive portal, proxy, TLS interception, a firewall rule scoped to one protocol)
 
 All of the above are on by default and can be turned off together with `--disable-external-checks`.

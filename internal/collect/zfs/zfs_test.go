@@ -89,3 +89,60 @@ errors: No known data errors
 		t.Fatalf("%+v", pools)
 	}
 }
+
+func TestParseStatusRetainsLeafAndAggregateEvidenceWithoutSumming(t *testing.T) {
+	for _, layout := range []string{"mirror-0", "raidz1-0"} {
+		t.Run(layout, func(t *testing.T) {
+			pools := ParseStatus("pool: tank\n state: ONLINE\nconfig:\n" +
+				"        NAME        STATE     READ WRITE CKSUM\n" +
+				"        tank        ONLINE       0     0     0\n" +
+				"          " + layout + "  DEGRADED     5     0     0\n" +
+				"            /dev/sda ONLINE       5     0     0\n" +
+				"            /dev/sdb ONLINE       0     0     7\n" +
+				"errors: No known data errors\n")
+			if len(pools) != 1 || len(pools[0].VdevErrors) != 3 {
+				t.Fatalf("pool=%+v", pools)
+			}
+			if pools[0].ReadErrors != 0 || pools[0].WriteErrors != 0 || pools[0].ChecksumErrors != 0 {
+				t.Fatalf("pool row counters changed: %+v", pools[0])
+			}
+			if got := pools[0].VdevErrors; got[0].Name != layout || got[0].ReadErrors != 5 || got[1].Name != "/dev/sda" || got[1].ReadErrors != 5 || got[2].Name != "/dev/sdb" || got[2].ChecksumErrors != 7 {
+				t.Fatalf("vdev evidence changed: %+v", got)
+			}
+		})
+	}
+}
+
+func TestParseStatusScaledCountersAreNonzeroAndApproximate(t *testing.T) {
+	pools := ParseStatus("pool: tank\n state: ONLINE\nconfig:\n tank ONLINE 1.23K 0 0\nerrors: No known data errors\n")
+	if len(pools) != 1 || pools[0].ReadErrors == 0 || !pools[0].Approximate {
+		t.Fatalf("scaled counter lost: %+v", pools)
+	}
+	pools = ParseStatus("pool: tank\n state: ONLINE\nconfig:\n tank ONLINE 0 0 0\n /dev/sda ONLINE 0 0 1.23K\nerrors: No known data errors\n")
+	if len(pools) != 1 || len(pools[0].VdevErrors) != 1 || pools[0].VdevErrors[0].ChecksumErrors == 0 || !pools[0].VdevErrors[0].Approximate {
+		t.Fatalf("scaled leaf counter lost: %+v", pools)
+	}
+}
+
+func TestParseStatusCounterBoundaries(t *testing.T) {
+	max := "18446744073709551615"
+	if value, approximate, ok := parseCounter(max); !ok || approximate || value != ^uint64(0) {
+		t.Fatalf("max literal: value=%d approximate=%v ok=%v", value, approximate, ok)
+	}
+	for _, value := range []string{"NaN", "+Inf", "-Inf", "18446744073709551616K"} {
+		if parsed, _, ok := parseCounter(value); ok || parsed != 0 {
+			t.Fatalf("invalid counter %q parsed as %d (ok=%v)", value, parsed, ok)
+		}
+	}
+}
+
+func TestCollectRequestsLiteralStatusCounters(t *testing.T) {
+	var args []string
+	c := &Collector{lookPath: func(string) (string, error) { return "zpool", nil }, inUse: func() bool { return true }, run: func(_ context.Context, _ string, got ...string) ([]byte, error) {
+		args = got
+		return []byte("pool: tank\n state: ONLINE\nconfig:\n tank ONLINE 0 0 0\nerrors: No known data errors\n"), nil
+	}}
+	if _, err := c.Collect(context.Background()); err != nil || strings.Join(args, " ") != "status -P -p" {
+		t.Fatalf("args=%v err=%v", args, err)
+	}
+}

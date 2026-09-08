@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -28,7 +29,9 @@ func (c *Collector) Name() string { return "cgroup-v2" }
 
 type snapshot struct {
 	metric                                 model.CgroupV2
+	source                                 string
 	oom, oomKill, usageUSec, throttledUSec uint64
+	oomValid, cpuValid                     bool
 }
 
 func (c *Collector) Collect(ctx context.Context) (collect.Data, error) {
@@ -67,33 +70,97 @@ func (c *Collector) Collect(ctx context.Context) (collect.Data, error) {
 	}
 	dir := filepath.Join(root, filepath.Clean("/"+path))
 	// filepath.Join intentionally cannot escape root because path was normalized.
-	s := snapshot{metric: model.CgroupV2{Available: true, Path: path, Containerized: isContainerized(path)}}
-	s.metric.MemoryCurrentBytes = readUint(read, filepath.Join(dir, "memory.current"))
-	s.metric.MemoryMaxBytes = readLimit(read, filepath.Join(dir, "memory.max"))
-	s.metric.MemorySwapCurrentBytes = readUint(read, filepath.Join(dir, "memory.swap.current"))
-	s.metric.MemorySwapMaxBytes = readLimit(read, filepath.Join(dir, "memory.swap.max"))
-	s.metric.PIDsCurrent = readUint(read, filepath.Join(dir, "pids.current"))
-	s.metric.PIDsMax = readLimit(read, filepath.Join(dir, "pids.max"))
-	memEvents := ParseKeyValues(readText(read, filepath.Join(dir, "memory.events")))
-	s.oom, s.oomKill = memEvents["oom"], memEvents["oom_kill"]
-	cpuStat := ParseKeyValues(readText(read, filepath.Join(dir, "cpu.stat")))
-	s.usageUSec, s.throttledUSec = cpuStat["usage_usec"], cpuStat["throttled_usec"]
-	return collect.Data{CgroupV2: &s.metric, Snapshot: s}, nil
+	s := snapshot{metric: model.CgroupV2{Available: true, Path: path, Containerized: isContainerized(path)}, source: filepath.Clean(dir)}
+	var diagnostics []model.CollectionStatus
+	add := func(file string, detail error) {
+		diagnostics = append(diagnostics, model.CollectionStatus{Collector: c.Name(), Status: "unavailable", Detail: file + ": " + detail.Error()})
+	}
+	setUint := func(file string, dst *uint64, valid **bool) {
+		v, ok, err := readUint(read, filepath.Join(dir, file))
+		*valid = boolPtr(ok)
+		if ok {
+			*dst = v
+		} else {
+			add(file, err)
+		}
+	}
+	setLimit := func(file string, dst **uint64, valid **bool) {
+		v, ok, err := readLimit(read, filepath.Join(dir, file))
+		*valid = boolPtr(ok)
+		if ok {
+			*dst = v
+		} else {
+			add(file, err)
+		}
+	}
+	setUint("memory.current", &s.metric.MemoryCurrentBytes, &s.metric.MemoryCurrentValid)
+	setLimit("memory.max", &s.metric.MemoryMaxBytes, &s.metric.MemoryMaxValid)
+	setUint("memory.swap.current", &s.metric.MemorySwapCurrentBytes, &s.metric.MemorySwapCurrentValid)
+	setLimit("memory.swap.max", &s.metric.MemorySwapMaxBytes, &s.metric.MemorySwapMaxValid)
+	setUint("pids.current", &s.metric.PIDsCurrent, &s.metric.PIDsCurrentValid)
+	setLimit("pids.max", &s.metric.PIDsMax, &s.metric.PIDsMaxValid)
+	memEvents, ok, err := readRequired(read, filepath.Join(dir, "memory.events"), "oom", "oom_kill")
+	s.metric.MemoryEventsSampled = boolPtr(ok)
+	if ok {
+		s.oom, s.oomKill, s.oomValid = memEvents["oom"], memEvents["oom_kill"], true
+	} else {
+		add("memory.events", err)
+	}
+	cpuStat, ok, err := readRequired(read, filepath.Join(dir, "cpu.stat"), "usage_usec", "throttled_usec")
+	s.metric.CPUStatSampled = boolPtr(ok)
+	if ok {
+		s.usageUSec, s.throttledUSec, s.cpuValid = cpuStat["usage_usec"], cpuStat["throttled_usec"], true
+	} else {
+		add("cpu.stat", err)
+	}
+	return collect.Data{CgroupV2: &s.metric, Snapshot: s, Diagnostics: diagnostics}, nil
 }
 
 func (c *Collector) Delta(first, last collect.Data) (collect.Data, error) {
 	a, aok := first.Snapshot.(snapshot)
 	b, bok := last.Snapshot.(snapshot)
 	if !aok || !bok {
-		return last, nil
+		m := finalMetric(last)
+		return collect.Data{CgroupV2: m, Diagnostics: last.Diagnostics}, errors.New("cgroup-v2: missing sample boundary")
 	}
 	m := b.metric
-	m.MemoryOOMDelta = counterDelta(a.oom, b.oom)
-	m.MemoryOOMKillDelta = counterDelta(a.oomKill, b.oomKill)
-	m.CPUUsageSecondsDelta = float64(counterDelta(a.usageUSec, b.usageUSec)) / 1e6
-	m.CPUThrottledSecondsDelta = float64(counterDelta(a.throttledUSec, b.throttledUSec)) / 1e6
-	return collect.Data{CgroupV2: &m}, nil
+	if a.source != b.source {
+		setUnsampled(&m)
+		return collect.Data{CgroupV2: &m, Diagnostics: last.Diagnostics}, fmt.Errorf("cgroup-v2: source path changed from %q to %q", a.source, b.source)
+	}
+	if a.oomValid && b.oomValid && b.oom >= a.oom && b.oomKill >= a.oomKill {
+		m.MemoryOOMDelta, m.MemoryOOMKillDelta = b.oom-a.oom, b.oomKill-a.oomKill
+	} else {
+		m.MemoryOOMDelta, m.MemoryOOMKillDelta = 0, 0
+		m.MemoryEventsSampled = boolPtr(false)
+	}
+	if a.cpuValid && b.cpuValid && b.usageUSec >= a.usageUSec && b.throttledUSec >= a.throttledUSec {
+		m.CPUUsageSecondsDelta = float64(b.usageUSec-a.usageUSec) / 1e6
+		m.CPUThrottledSecondsDelta = float64(b.throttledUSec-a.throttledUSec) / 1e6
+	} else {
+		m.CPUUsageSecondsDelta, m.CPUThrottledSecondsDelta = 0, 0
+		m.CPUStatSampled = boolPtr(false)
+	}
+	return collect.Data{CgroupV2: &m, Diagnostics: last.Diagnostics}, nil
 }
+
+func finalMetric(last collect.Data) *model.CgroupV2 {
+	if last.CgroupV2 == nil {
+		return &model.CgroupV2{Available: false}
+	}
+	m := *last.CgroupV2
+	setUnsampled(&m)
+	return &m
+}
+
+func setUnsampled(m *model.CgroupV2) {
+	zero := uint64(0)
+	m.MemoryOOMDelta, m.MemoryOOMKillDelta = zero, zero
+	m.CPUUsageSecondsDelta, m.CPUThrottledSecondsDelta = 0, 0
+	m.MemoryEventsSampled, m.CPUStatSampled = boolPtr(false), boolPtr(false)
+}
+
+func boolPtr(v bool) *bool { return &v }
 
 func ParsePath(text string) (string, bool) {
 	for _, line := range strings.Split(text, "\n") {
@@ -119,27 +186,80 @@ func ParseKeyValues(text string) map[string]uint64 {
 	}
 	return out
 }
-func readText(read func(string) ([]byte, error), name string) string {
+func readText(read func(string) ([]byte, error), name string) (string, bool, error) {
 	b, e := read(name)
 	if e != nil {
-		return ""
+		return "", false, fmt.Errorf("read failed: %v", e)
 	}
-	return string(b)
+	return string(b), true, nil
 }
-func readUint(read func(string) ([]byte, error), name string) uint64 {
-	v := ParseKeyValues("x " + strings.TrimSpace(readText(read, name)))
-	return v["x"]
+func readUint(read func(string) ([]byte, error), name string) (uint64, bool, error) {
+	text, _, err := readText(read, name)
+	if err != nil {
+		return 0, false, err
+	}
+	v, err := strconv.ParseUint(strings.TrimSpace(text), 10, 64)
+	if err != nil {
+		return 0, false, fmt.Errorf("malformed value")
+	}
+	return v, true, nil
 }
-func readLimit(read func(string) ([]byte, error), name string) *uint64 {
-	text := strings.TrimSpace(readText(read, name))
-	if text == "" || text == "max" {
-		return nil
+func readLimit(read func(string) ([]byte, error), name string) (*uint64, bool, error) {
+	text, _, err := readText(read, name)
+	if err != nil {
+		return nil, false, err
 	}
-	v, e := strconv.ParseUint(text, 10, 64)
-	if e != nil {
-		return nil
+	text = strings.TrimSpace(text)
+	if text == "max" {
+		return nil, true, nil
 	}
-	return &v
+	v, err := strconv.ParseUint(text, 10, 64)
+	if err != nil {
+		return nil, false, fmt.Errorf("malformed value")
+	}
+	return &v, true, nil
+}
+
+func readRequired(read func(string) ([]byte, error), name string, required ...string) (map[string]uint64, bool, error) {
+	text, _, err := readText(read, name)
+	if err != nil {
+		return nil, false, err
+	}
+	values := map[string]uint64{}
+	for _, line := range strings.Split(text, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		if len(fields) != 2 {
+			if contains(required, fields[0]) {
+				return nil, false, fmt.Errorf("malformed value for %s", fields[0])
+			}
+			continue
+		}
+		v, parseErr := strconv.ParseUint(fields[1], 10, 64)
+		if parseErr != nil {
+			if contains(required, fields[0]) {
+				return nil, false, fmt.Errorf("malformed value for %s", fields[0])
+			}
+			continue
+		}
+		values[fields[0]] = v
+	}
+	for _, key := range required {
+		if _, ok := values[key]; !ok {
+			return nil, false, fmt.Errorf("missing required key %s", key)
+		}
+	}
+	return values, true, nil
+}
+func contains(items []string, want string) bool {
+	for _, item := range items {
+		if item == want {
+			return true
+		}
+	}
+	return false
 }
 func counterDelta(before, after uint64) uint64 {
 	if after < before {

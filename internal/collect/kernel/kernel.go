@@ -7,6 +7,7 @@ package kernel
 
 import (
 	"context"
+	"math"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -59,7 +60,6 @@ func (c *Collector) Collect(parent context.Context) (collect.Data, error) {
 	now := time.Now()
 	var diagnostics []model.CollectionStatus
 	var events []model.LogEvent
-	seen := make(map[string]struct{})
 
 	// Primary scan: broad kernel-ring-buffer coverage at warning-and-above
 	// priority. This is where oom/panic/oops/hardware/filesystem/nvme/io
@@ -71,7 +71,7 @@ func (c *Collector) Collect(parent context.Context) (collect.Data, error) {
 		}
 		return collect.Data{Kernel: &model.Kernel{Available: false}, Diagnostics: []model.CollectionStatus{{Status: "unavailable", Detail: runErr.Error()}}}, nil
 	} else {
-		events = appendNewEvents(events, seen, ParseEvents(string(output), now))
+		events = appendNewEvents(events, ParseEvents(string(output), now))
 	}
 
 	// Secondary scan: kernel-ring-buffer lines below warning priority that
@@ -85,7 +85,7 @@ func (c *Collector) Collect(parent context.Context) (collect.Data, error) {
 		}
 		diagnostics = append(diagnostics, model.CollectionStatus{Status: "unavailable", Detail: "grep(kernel): " + runErr.Error()})
 	} else {
-		events = appendNewEvents(events, seen, filterVirtualLinkEvents(ParseEvents(string(output), now)))
+		events = appendNewEvents(events, filterVirtualLinkEvents(ParseEvents(string(output), now)))
 	}
 
 	// Tertiary scan: ENOSPC is reported by the application that hit it, not
@@ -96,7 +96,7 @@ func (c *Collector) Collect(parent context.Context) (collect.Data, error) {
 		}
 		diagnostics = append(diagnostics, model.CollectionStatus{Status: "unavailable", Detail: "grep(enospc): " + runErr.Error()})
 	} else {
-		events = appendNewEvents(events, seen, ParseEvents(string(output), now))
+		events = appendNewEvents(events, ParseEvents(string(output), now))
 	}
 
 	return collect.Data{Kernel: &model.Kernel{Available: true, Events: events}, Diagnostics: diagnostics}, nil
@@ -112,19 +112,52 @@ func runBounded(parent context.Context, run func(context.Context, string, ...str
 // same key ParseEvents itself dedups within one scan) across the whole
 // collection, so the same incident spotted by two different scans is not
 // reported twice.
-func appendNewEvents(events []model.LogEvent, seen map[string]struct{}, found []model.LogEvent) []model.LogEvent {
+func appendNewEvents(events []model.LogEvent, found []model.LogEvent) []model.LogEvent {
 	for _, event := range found {
-		key := event.Kind
-		if key == "oom" || key == "cgroup_oom" {
-			key = "oom"
-		}
-		if _, exists := seen[key]; exists {
-			continue
-		}
-		seen[key] = struct{}{}
-		events = append(events, event)
+		events = mergeEvent(events, event)
 	}
 	return events
+}
+
+func canonicalEventKey(kind string) string {
+	if kind == "oom" || kind == "cgroup_oom" {
+		return "oom"
+	}
+	return kind
+}
+
+// newerEvent compares only source-provided ages. A known age is preferred to
+// an unknown one, and ties retain the first record encountered. This avoids
+// inventing a timestamp for output that did not provide one.
+func newerEvent(candidate, current model.LogEvent) bool {
+	candidateKnown := knownAge(candidate.AgeSeconds)
+	currentKnown := knownAge(current.AgeSeconds)
+	if candidateKnown != currentKnown {
+		return candidateKnown
+	}
+	if !candidateKnown {
+		return false
+	}
+	return *candidate.AgeSeconds < *current.AgeSeconds
+}
+
+func knownAge(age *float64) bool {
+	return age != nil && *age >= 0 && !math.IsNaN(*age) && !math.IsInf(*age, 0)
+}
+
+func mergeEvent(events []model.LogEvent, event model.LogEvent) []model.LogEvent {
+	key := canonicalEventKey(event.Kind)
+	for index := range events {
+		if canonicalEventKey(events[index].Kind) == key {
+			if newerEvent(event, events[index]) {
+				// Keep the first encounter position stable while replacing its
+				// evidence with the newest record.
+				events[index] = event
+			}
+			return events
+		}
+	}
+	return append(events, event)
 }
 
 // virtualInterfacePrefixes names software-created interfaces (container
@@ -184,7 +217,6 @@ func runCommand(ctx context.Context, name string, args ...string) ([]byte, error
 // one recorded hours ago; records without one leave the age unknown.
 func ParseEvents(output string, now time.Time) []model.LogEvent {
 	events := make([]model.LogEvent, 0)
-	seen := make(map[string]struct{})
 	for index, raw := range strings.Split(output, "\n") {
 		if index >= maxLines {
 			break
@@ -197,15 +229,7 @@ func ParseEvents(output string, now time.Time) []model.LogEvent {
 			// A single kernel incident commonly produces several matching log
 			// records. Keep concise, non-duplicative evidence so one event does
 			// not dominate the report or score.
-			key := kind
-			if kind == "oom" || kind == "cgroup_oom" {
-				key = "oom"
-			}
-			if _, exists := seen[key]; exists {
-				continue
-			}
-			seen[key] = struct{}{}
-			events = append(events, model.LogEvent{Kind: kind, Message: line, AgeSeconds: age})
+			events = mergeEvent(events, model.LogEvent{Kind: kind, Message: line, AgeSeconds: age})
 		}
 	}
 	return events
@@ -221,11 +245,11 @@ func splitTimestamp(line string, now time.Time) (string, *float64) {
 		return line, nil
 	}
 	seconds, err := strconv.ParseFloat(stamp, 64)
-	if err != nil || seconds <= 0 {
+	if err != nil || !isFinite(seconds) || seconds <= 0 {
 		return line, nil
 	}
 	age := now.Sub(time.Unix(int64(seconds), 0)).Seconds()
-	if age < 0 {
+	if !isFinite(age) || age < 0 {
 		age = 0
 	}
 	// Drop "<host> <identifier>[<pid>]: " so the retained message is the
@@ -238,6 +262,10 @@ func splitTimestamp(line string, now time.Time) (string, *float64) {
 		return "", nil
 	}
 	return rest, &age
+}
+
+func isFinite(value float64) bool {
+	return !math.IsNaN(value) && !math.IsInf(value, 0)
 }
 
 func eventKind(line string) string {

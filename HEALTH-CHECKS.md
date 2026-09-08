@@ -49,7 +49,7 @@ styling.
 | Resource limits (`/proc/sys`, `/proc/sys/fs`, conntrack) | Current/max values are available in verbose output. The task count from `/proc/loadavg` counts threads and is compared against the lower of `threads-max` and `pid_max`, not against `pid_max` alone. Inotify limits are reported as capacity facts; the kernel exposes no global watch count, so there is no usage rule for them | File descriptors, tasks, or conntrack ≥90% used | ≥98% used |
 | Connection tracking drops (`/proc/net/stat/nf_conntrack`) | Per-CPU drop, early-drop, and failed-insert counters are summed and sampled over the window. Columns are read by header name, so a kernel that adds or removes one does not shift the others. This is independent of table utilization: a burst can drop packets while the steady-state count still looks calm | Any drop, early drop, or failed insert during the sample | None |
 | Socket table ceilings (`/proc/sys/net/ipv4/tcp_max_tw_buckets`, `tcp_max_orphans`) | The kernel publishes an explicit ceiling for each table, which is what makes a “large” socket count judgeable at all. Where a ceiling cannot be read, no rule is applied rather than an invented threshold | TIME_WAIT or orphaned sockets ≥90% of their ceiling | None |
-| cgroup v2 (`/sys/fs/cgroup`) | Current limits and sampled deltas | Memory allocation OOM events; CPU throttling ≥10% of at least 0.1 s CPU use; PIDs ≥95%; container memory ≥95% with corroborating pressure | OOM-kill events in the current cgroup |
+| cgroup v2 (`/sys/fs/cgroup`) | Current limits and sampled deltas. Each source retains read validity: a measured zero, an unlimited (`max`) limit, and an unreadable value remain distinct. Deltas require valid, monotonic observations of the same cgroup at both sample boundaries | Memory allocation OOM events; CPU throttling ≥10% of at least 0.1 s CPU use; PIDs ≥95%; container memory ≥95% with corroborating pressure | OOM-kill events in the current cgroup |
 
 ## Storage and hardware integrations
 
@@ -65,6 +65,14 @@ styling.
 Swap entries such as `/swap.img none swap sw 0 0` are intentionally excluded
 from persistent-mount warnings because `none` is a pseudo mount point.
 
+ZFS checks request literal counters and retain error evidence from both the
+pool row and affected vdev rows. These rows are not summed across mirror or
+RAIDZ layers. Legacy scaled counters are identified as approximate.
+
+Kernel event deduplication retains the newest timestamped record of each
+kind across the bounded scans, with OOM and cgroup OOM sharing one group.
+Records without a usable timestamp keep an unknown age.
+
 ## Containers
 
 Docker and Podman checks use local CLI/API access only. Every discovered
@@ -72,6 +80,11 @@ container is eligible for state and last-hour log inspection; bounded command
 output and a shared time budget protect the host from a hung runtime. The
 limits are implementation safeguards, not a claim that only a small sample was
 checked.
+
+Sampled restart counts use the runtime inspection object's top-level
+`RestartCount`. Successful log reads retain both stdout and stderr within one
+shared byte limit. Failed log commands remain collection diagnostics and do
+not contribute application-failure evidence.
 
 | Check | Informational result | Warning default | Critical / error default |
 | --- | --- | --- | --- |
@@ -131,7 +144,7 @@ them are on by default; `--disable-external-checks` turns them off.
 | Gateway ping (`internal/collect/gatewayping`) | Sent/received counts and average latency of a small ICMP echo series to the default gateway, run via the system `ping` binary (bounded, timed out, output parsed regardless of exit code since ping exits nonzero on any loss). A host without a `ping` binary reports the check unavailable rather than failing or warning. Skipped entirely when no default route is configured | Majority packet loss (≥50%), or average latency ≥200ms (a same-segment gateway is normally single-digit milliseconds) | No reply at all, or average latency ≥500ms |
 | External ICMP ping (`internal/collect/icmpcheck`) | Sent/received counts and average latency of a ping series to `1.1.1.1`, independent of the default gateway -- a healthy gateway only proves the local link works | Majority packet loss (≥50%), or average latency ≥300ms | No reply at all, or average latency ≥800ms |
 | IPv6 ping (`internal/collect/ipv6check`) | Same as the external ICMP check, but over IPv6 to a Cloudflare anchor. Skipped entirely unless `/proc/net/if_inet6` shows a global-scope address; an IPv4-only host is not a fault | Majority packet loss (≥50%) | No reply at all, despite this host having a global IPv6 address configured |
-| Path MTU discovery (`internal/collect/pathmtu`) | An ordinary baseline ping to `1.1.1.1`, then a descending series of non-fragmentable pings (`ping -M do -s <size>`, 1472 down to 548 bytes), reporting the largest size that got through. The full 1500-byte ceiling working is quiet; a smaller size getting through is a reduced but working path MTU, normal and healthy with PPPoE, VPNs, or tunnels when path MTU discovery (PMTUD) is working. Skipped entirely when the anchor host is unreachable at all (a connectivity fact the gateway/DNS/ICMP checks already cover) or when the local `ping` does not support `-M do` | None | No size at all got through despite the baseline succeeding: PMTUD itself is not working (commonly because the ICMP "fragmentation needed" replies it depends on are filtered), which stalls large transfers while small traffic and pings work fine |
+| IPv4 DF packet-size probes (`internal/collect/pathmtu`) | An ordinary baseline ping to `1.1.1.1`, then a descending series of IPv4 DF pings (`ping -M do -s <size>`, 1472 down to 548-byte payloads), recording the largest tested packet size that received an echo reply. Raw stdout and stderr are bounded together, and narrowly recognized `frag needed` or `message too long` text records packet-too-big feedback separately. A reply below the 1500-byte ceiling is informational and quiet by default. The check is skipped when the anchor does not answer the baseline or local `ping` lacks `-M do` | None | The baseline replies, but no tested IPv4 DF size from 1500 down to 576 bytes receives an echo reply. The warning states separately whether packet-too-big feedback was observed; absence of that text does not identify why replies were absent |
 | HTTP/HTTPS GET (`internal/collect/httpcheck`) | A GET to `http://example.com/` and to `https://example.com/` succeeding (any status code, since this tests reachability, not content) is quiet; latency and status code are shown in verbose output. Connections are forced over IPv4, so a firewall rule scoped to IPv4 (the common way to test this with plain `iptables`) cannot be silently bypassed by an IPv6 path. Every failure combination (HTTP only, HTTPS only, or both) is reported here, at informational severity, because an intentionally restricted host (firewall, proxy, air-gapped network) produces the identical signal to a genuine fault | None; never escalated past informational | None |
 
 ## Local file-descriptor checks
