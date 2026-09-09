@@ -264,13 +264,17 @@ func (TCPCollector) Delta(first, last collect.Data) (collect.Data, error) {
 		// Counter deltas stay zero so no retransmission or overflow rule fires.
 		return tcpFinalGauges(after), fmt.Errorf("tcp: invalid first snapshot")
 	}
+	if before.At.IsZero() || after.At.IsZero() || !after.At.After(before.At) {
+		return tcpFinalGauges(after), fmt.Errorf("tcp: invalid sampling interval")
+	}
 	delta := func(protocol, field string) uint64 {
 		return counterDelta(protocolValue(before.SNMP, protocol, field), protocolValue(after.SNMP, protocol, field))
 	}
 	extended := func(field string) uint64 {
 		return counterDelta(protocolValue(before.NetStat, "TcpExt", field), protocolValue(after.NetStat, "TcpExt", field))
 	}
-	tcp := &model.TCP{SegmentsIn: delta("Tcp", "InSegs"), SegmentsOut: delta("Tcp", "OutSegs"), RetransmittedSegments: delta("Tcp", "RetransSegs"), ActiveOpens: delta("Tcp", "ActiveOpens"), PassiveOpens: delta("Tcp", "PassiveOpens"), AttemptFails: delta("Tcp", "AttemptFails"), EstablishmentResets: delta("Tcp", "EstabResets"), ListenOverflows: extended("ListenOverflows"), ListenDrops: extended("ListenDrops"), UDPInErrors: delta("Udp", "InErrors"), IPReassemblyFailures: delta("Ip", "ReasmFails"), IPFragmentationFailures: delta("Ip", "FragFails"), CurrentEstablished: protocolValue(after.SNMP, "Tcp", "CurrEstab"), TimeWaitSockets: socketValue(after.SockStat, "TCP", "tw"), OrphanSockets: socketValue(after.SockStat, "TCP", "orphan")}
+	sampled := true
+	tcp := &model.TCP{Sampled: &sampled, SegmentsIn: delta("Tcp", "InSegs"), SegmentsOut: delta("Tcp", "OutSegs"), RetransmittedSegments: delta("Tcp", "RetransSegs"), ActiveOpens: delta("Tcp", "ActiveOpens"), PassiveOpens: delta("Tcp", "PassiveOpens"), AttemptFails: delta("Tcp", "AttemptFails"), EstablishmentResets: delta("Tcp", "EstabResets"), ListenOverflows: extended("ListenOverflows"), ListenDrops: extended("ListenDrops"), UDPInErrors: delta("Udp", "InErrors"), IPReassemblyFailures: delta("Ip", "ReasmFails"), IPFragmentationFailures: delta("Ip", "FragFails"), CurrentEstablished: protocolValue(after.SNMP, "Tcp", "CurrEstab"), TimeWaitSockets: socketValue(after.SockStat, "TCP", "tw"), OrphanSockets: socketValue(after.SockStat, "TCP", "orphan")}
 	// Conntrack needs both boundaries: without a baseline the only honest
 	// answer is that no interval was observed, not that nothing was dropped.
 	var conntrack *model.Conntrack
@@ -286,7 +290,9 @@ func (TCPCollector) Delta(first, last collect.Data) (collect.Data, error) {
 
 // tcpFinalGauges retains the current socket counts when no interval is available.
 func tcpFinalGauges(last TCPSnapshot) collect.Data {
+	sampled := false
 	return collect.Data{TCP: &model.TCP{
+		Sampled:            &sampled,
 		CurrentEstablished: protocolValue(last.SNMP, "Tcp", "CurrEstab"),
 		TimeWaitSockets:    socketValue(last.SockStat, "TCP", "tw"),
 		OrphanSockets:      socketValue(last.SockStat, "TCP", "orphan"),

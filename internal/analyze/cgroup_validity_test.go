@@ -22,3 +22,30 @@ func TestCgroupExplicitInvalidSamplesSuppressFindings(t *testing.T) {
 		}
 	}
 }
+
+func TestCgroupMemoryLimitUsesOnlyLocalPressureOrLocalEvents(t *testing.T) {
+	max := uint64(100)
+	valid := true
+	localZero := model.PressureResource{}
+	report := model.Report{Metrics: model.Metrics{
+		CPU:      &model.CPU{},
+		Pressure: &model.Pressure{Memory: model.PressureResource{SomeAvg10: 25}},
+		CgroupV2: &model.CgroupV2{Available: true, MemoryCurrentBytes: 96, MemoryCurrentValid: &valid, MemoryMaxBytes: &max, MemoryMaxValid: &valid, MemoryPressureValid: &valid, MemoryPressure: &localZero},
+	}}
+	Report(&report)
+	if findingByID(report, "cgroup-memory-limit") != nil {
+		t.Fatalf("host PSI must not be attributed to the cgroup: %#v", report.Findings)
+	}
+	report.Metrics.Pressure.Memory.SomeAvg10 = 0
+	report.Metrics.CgroupV2.MemoryPressure.SomeAvg10 = 1.25
+	Report(&report)
+	if findingByID(report, "cgroup-memory-limit") == nil {
+		t.Fatalf("local cgroup PSI must be evaluated independently: %#v", report.Findings)
+	}
+	invalid := false
+	report.Metrics.CgroupV2.MemoryPressureValid = &invalid
+	Report(&report)
+	if findingByID(report, "cgroup-memory-limit") != nil {
+		t.Fatalf("invalid local PSI created a cgroup finding: %#v", report.Findings)
+	}
+}

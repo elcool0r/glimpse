@@ -2,6 +2,7 @@ package memory
 
 import (
 	"context"
+	"encoding/json"
 	"github.com/elcool0r/glimpse/internal/collect"
 	"github.com/elcool0r/glimpse/internal/model"
 	"os"
@@ -21,8 +22,18 @@ func TestParseMemInfo(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Total != 1024*1024 || got.Used() != 624*1024 || got.SwapUsed() != 40*1024 {
+	if got.Total != 1024*1024 || !got.AvailableValid || got.Used() != 624*1024 || got.SwapUsed() != 40*1024 {
 		t.Fatalf("unexpected meminfo: %#v", got)
+	}
+}
+
+func TestParseMemInfoMissingAvailableRemainsUnknown(t *testing.T) {
+	got, err := ParseMemInfo(strings.NewReader("MemTotal: 1000 kB\nMemFree: 500 kB\nCached: 400 kB\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AvailableValid || got.Available != 0 {
+		t.Fatalf("missing MemAvailable became measured: %#v", got)
 	}
 }
 
@@ -112,5 +123,34 @@ func TestMalformedOptionalPSIPreservesCore(t *testing.T) {
 	got, err := (Collector{ProcRoot: root}).Collect(context.Background())
 	if err == nil || got.Memory == nil || got.Snapshot == nil {
 		t.Fatalf("lost core facts: %+v %v", got, err)
+	}
+}
+
+func TestCollectMarksMissingMemAvailableUnavailable(t *testing.T) {
+	root := t.TempDir()
+	for name, contents := range map[string]string{
+		"meminfo": "MemTotal: 4096 kB\nMemFree: 3000 kB\n",
+		"vmstat":  "pswpin 0\npswpout 0\n",
+	} {
+		path := filepath.Join(root, name)
+		if err := os.WriteFile(path, []byte(contents), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := (Collector{ProcRoot: root}).Collect(context.Background())
+	if err != nil || got.Memory == nil || got.Memory.AvailableValid == nil || *got.Memory.AvailableValid {
+		t.Fatalf("missing availability was not marked unavailable: %+v, %v", got, err)
+	}
+	encoded, marshalErr := json.Marshal(got.Memory)
+	if marshalErr != nil || !strings.Contains(string(encoded), `"available_valid":false`) {
+		t.Fatalf("unavailable MemAvailable JSON=%s err=%v", encoded, marshalErr)
+	}
+}
+
+func TestTrendsSkipUnknownMemAvailable(t *testing.T) {
+	unknown := false
+	trends := (Collector{}).Trends([]collect.Data{{Memory: &model.Memory{AvailableValid: &unknown, AvailableFraction: 0}}, {Memory: &model.Memory{AvailableFraction: .5}}})
+	if len(trends) == 0 || len(trends[0].Values) != 1 || trends[0].Values[0] != .5 {
+		t.Fatalf("availability trend included unknown value: %#v", trends)
 	}
 }

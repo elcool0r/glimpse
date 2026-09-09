@@ -168,10 +168,13 @@ func TestWriteUsesMetricSampleDurationsForRates(t *testing.T) {
 
 func TestUnsampledCPUDoesNotRenderAsIdle(t *testing.T) {
 	sampled := false
-	var output bytes.Buffer
-	Write(&output, model.Report{Metrics: model.Metrics{CPU: &model.CPU{Sampled: &sampled, Load1: 2}}}, Options{})
-	if !strings.Contains(output.String(), "utilization unavailable") || strings.Contains(output.String(), "0% avg") {
-		t.Fatalf("unsampled CPU rendered as idle: %s", output.String())
+	for _, options := range []Options{{}, {Quiet: true}, {Verbose: true}} {
+		var output bytes.Buffer
+		Write(&output, model.Report{Metrics: model.Metrics{CPU: &model.CPU{Sampled: &sampled, Load1: 2}}}, options)
+		text := output.String()
+		if !strings.Contains(text, "utilization unavailable") || !strings.Contains(text, "I/O wait unavailable") || strings.Contains(text, "0% avg") || strings.Contains(text, "I/O wait 0.0%") || strings.Contains(text, "-50%") {
+			t.Fatalf("unsampled CPU rendered as idle: %s", text)
+		}
 	}
 }
 
@@ -206,7 +209,7 @@ func TestContainerSummaryExplainsBoundedLogCheck(t *testing.T) {
 	Write(&output, model.Report{Metrics: model.Metrics{Containers: []model.ContainerRuntime{{
 		Runtime: "docker", Containers: []model.Container{{State: "running"}}, LogsChecked: 1, LogCandidates: 2, LogCheckLimited: true,
 	}}}}, Options{})
-	if !strings.Contains(output.String(), "Containers OK  docker") || !strings.Contains(output.String(), "logs: 1/2 checked (time limit)") {
+	if !strings.Contains(output.String(), "Containers INFO  docker") || !strings.Contains(output.String(), "logs: 1/2 checked (time limit)") {
 		t.Fatal(output.String())
 	}
 }
@@ -364,6 +367,74 @@ func TestTopRAMShownOnMemoryFindingWithoutVerbose(t *testing.T) {
 	Write(&output, report, Options{})
 	if !strings.Contains(output.String(), "Top RAM") || !strings.Contains(output.String(), "leaky") {
 		t.Fatal(output.String())
+	}
+}
+
+func TestMemoryWithoutMemAvailableRendersUnavailableInsteadOfZero(t *testing.T) {
+	unknown := false
+	var output bytes.Buffer
+	Write(&output, model.Report{Metrics: model.Metrics{Memory: &model.Memory{
+		AvailableValid: &unknown, TotalBytes: 1 << 30, SwapTotalBytes: 2 << 30, SwapFreeBytes: 1 << 30,
+	}}}, Options{})
+	got := output.String()
+	if !strings.Contains(got, "MemAvailable unavailable") || strings.Contains(got, "0.0% available") {
+		t.Fatal(got)
+	}
+}
+
+func TestTopRAMDoesNotDeduplicateHiddenCPUProcesses(t *testing.T) {
+	report := model.Report{
+		Metrics: model.Metrics{Processes: &model.Processes{
+			TopCPU: []model.Process{
+				{PID: 1, Command: "cpu-1"}, {PID: 2, Command: "cpu-2"},
+				{PID: 3, Command: "cpu-3"}, {PID: 4, Command: "cpu-4"},
+			},
+			TopRSS: []model.Process{
+				{PID: 1, Command: "ram-1"}, {PID: 2, Command: "ram-2"},
+				{PID: 3, Command: "ram-3"}, {PID: 4, Command: "ram-4"},
+				{PID: 5, Command: "ram-5"},
+			},
+		}},
+		Findings: []model.Finding{{Category: "memory", Severity: model.SeverityWarning, Title: "Memory pressure observed"}},
+	}
+	var output bytes.Buffer
+	Write(&output, report, Options{})
+	text := output.String()
+	if strings.Contains(text, "Top CPU") {
+		t.Fatal(text)
+	}
+	for _, want := range []string{"ram-1", "ram-2", "ram-3"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("missing %q from memory-only ranking:\n%s", want, text)
+		}
+	}
+}
+
+func TestTopRAMOnlyDeduplicatesDisplayedCPUProcesses(t *testing.T) {
+	report := model.Report{
+		Metrics: model.Metrics{Processes: &model.Processes{
+			TopCPU: []model.Process{
+				{PID: 1, Command: "cpu-1"}, {PID: 2, Command: "cpu-2"},
+				{PID: 3, Command: "cpu-3"}, {PID: 4, Command: "cpu-4"},
+			},
+			TopRSS: []model.Process{
+				{PID: 1, Command: "ram-1"}, {PID: 2, Command: "ram-2"},
+				{PID: 3, Command: "ram-3"}, {PID: 4, Command: "ram-4"},
+				{PID: 5, Command: "ram-5"},
+			},
+		}},
+		Findings: []model.Finding{
+			{Category: "cpu", Severity: model.SeverityWarning, Title: "CPU contention"},
+			{Category: "memory", Severity: model.SeverityWarning, Title: "Memory pressure observed"},
+		},
+	}
+	var output bytes.Buffer
+	Write(&output, report, Options{})
+	text := output.String()
+	for _, want := range []string{"cpu-1", "cpu-2", "cpu-3", "ram-4", "ram-5"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("missing %q when rankings overlap:\n%s", want, text)
+		}
 	}
 }
 
@@ -526,6 +597,53 @@ func TestNetworkAndTCPBadgesReflectTheirOwnFindings(t *testing.T) {
 	}
 }
 
+func TestUnsampledIntervalsRenderAsUnavailableInEveryTerminalMode(t *testing.T) {
+	unsampled := false
+	report := model.Report{
+		Host:                  model.Host{Hostname: "host"},
+		SampleDurationSeconds: 60,
+		Metrics: model.Metrics{
+			Disks:   []model.Disk{{Name: "sda", Sampled: &unsampled, Utilization: .99, ReadBytes: 60 << 20, InFlight: 3}},
+			Network: []model.Network{{Name: "eth0", Sampled: &unsampled, RXBytes: 60 << 20, TXBytes: 60 << 20}},
+			TCP:     &model.TCP{Sampled: &unsampled, RetransmittedSegments: 4, SegmentsOut: 100, ListenDrops: 2, CurrentEstablished: 3},
+		},
+	}
+	for _, options := range []Options{{ASCII: true}, {ASCII: true, Quiet: true}, {ASCII: true, Verbose: true}} {
+		var out strings.Builder
+		Write(&out, report, options)
+		text := out.String()
+		for _, want := range []string{"Disk UNKNOWN", "sampled I/O unavailable", "Network UNKNOWN", "sampled traffic unavailable", "TCP UNKNOWN", "sampled TCP activity unavailable"} {
+			if !strings.Contains(text, want) {
+				t.Fatalf("%+v output missing %q:\n%s", options, want, text)
+			}
+		}
+		for _, forbidden := range []string{"0% busy", "0 B/s", "0 retransmits / 0 outbound"} {
+			if strings.Contains(text, forbidden) {
+				t.Fatalf("%+v output invented sampled activity %q:\n%s", options, forbidden, text)
+			}
+		}
+	}
+}
+
+func TestMixedIntervalValidityUsesSampledRowsAndDisclosesFinalOnlyRows(t *testing.T) {
+	unsampled, sampled := false, true
+	report := model.Report{Host: model.Host{Hostname: "host"}, SampleDurationSeconds: 60, Metrics: model.Metrics{
+		Disks:   []model.Disk{{Name: "sda", Sampled: &sampled, SampleDurationSeconds: 60, ReadBytes: 60 << 20}, {Name: "sdb", Sampled: &unsampled, ReadBytes: 60 << 20}},
+		Network: []model.Network{{Name: "eth0", Sampled: &sampled, SampleDurationSeconds: 60, RXBytes: 60 << 20}, {Name: "eth1", Sampled: &unsampled, RXBytes: 60 << 20}},
+	}}
+	var out strings.Builder
+	Write(&out, report, Options{ASCII: true, Verbose: true})
+	text := out.String()
+	for _, want := range []string{"Disk UNKNOWN", "Network UNKNOWN", "1 final gauges only", "sdb UNKNOWN  sampled I/O unavailable", "eth1 UNKNOWN  sampled traffic unavailable"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("mixed validity output missing %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "sdb 0% busy") || strings.Contains(text, "eth1 RX 0 B/s") {
+		t.Fatalf("mixed validity rendered an unsampled rate:\n%s", text)
+	}
+}
+
 // --quiet drops rows that are fully healthy (OK) but keeps anything with
 // something to say, plus the Details section and host header.
 func TestQuietHidesOnlyOKRows(t *testing.T) {
@@ -571,5 +689,126 @@ func TestQuietWithoutIssuesStillShowsHeaderAndNoFindingsLine(t *testing.T) {
 	}
 	if !strings.Contains(text, "No actionable findings") {
 		t.Errorf("quiet output should still state that nothing actionable was found:\n%s", text)
+	}
+}
+
+func TestUnknownAssessmentStatesCoverageReasonInEveryTerminalMode(t *testing.T) {
+	sampled := false
+	tests := []struct {
+		name   string
+		report model.Report
+		want   string
+	}{
+		{
+			name: "interrupted sampling takes precedence",
+			report: model.Report{
+				Score:      model.Score{Status: model.SeverityUnknown, Label: "INSUFFICIENT DATA"},
+				Collection: []model.CollectionStatus{{Collector: "sampling", Status: "error", Detail: "context deadline exceeded"}},
+			},
+			want: "Sampling was interrupted; the health assessment is incomplete.",
+		},
+		{
+			name: "missing core coverage",
+			report: model.Report{
+				Score: model.Score{Status: model.SeverityUnknown, Label: "INSUFFICIENT DATA"},
+				Metrics: model.Metrics{
+					CPU:    &model.CPU{Sampled: &sampled},
+					Memory: &model.Memory{TotalBytes: 1},
+				},
+			},
+			want: "No usable CPU, memory, or filesystem data was collected.",
+		},
+		{
+			name: "other insufficient coverage",
+			report: model.Report{
+				Score: model.Score{Status: model.SeverityUnknown, Label: "INSUFFICIENT DATA"},
+				Metrics: model.Metrics{
+					CPU:         &model.CPU{},
+					Memory:      &model.Memory{TotalBytes: 1},
+					Filesystems: []model.Filesystem{{MountPoint: "/", TotalBytes: 1}},
+				},
+			},
+			want: "The collected signals are insufficient for a health assessment.",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, options := range []Options{{ASCII: true}, {ASCII: true, Quiet: true}, {ASCII: true, Verbose: true}} {
+				var out strings.Builder
+				Write(&out, tt.report, options)
+				text := out.String()
+				if !strings.Contains(strings.Join(strings.Fields(text), " "), "Assessment UNKNOWN INSUFFICIENT DATA: "+tt.want) {
+					t.Fatalf("unknown assessment missing from %+v output:\n%s", options, text)
+				}
+				if strings.Contains(text, "No actionable findings from the collected signals.") {
+					t.Fatalf("unknown assessment must not use the healthy fallback:\n%s", text)
+				}
+			}
+		})
+	}
+}
+
+func TestUnknownAssessmentKeepsConcreteFindings(t *testing.T) {
+	report := model.Report{
+		Score: model.Score{Status: model.SeverityUnknown, Label: "INSUFFICIENT DATA"},
+		Findings: []model.Finding{{
+			ID:       "disk-contention-sda",
+			Severity: model.SeverityWarning,
+			Title:    "Disk contention",
+			Summary:  "sda stayed busy during the sample.",
+		}},
+	}
+	var out strings.Builder
+	Write(&out, report, Options{ASCII: true})
+	text := out.String()
+	compact := strings.Join(strings.Fields(text), " ")
+	for _, want := range []string{"Assessment UNKNOWN INSUFFICIENT DATA", "WARN Disk contention", "sda stayed busy during the sample."} {
+		if !strings.Contains(compact, want) {
+			t.Fatalf("unknown assessment hid concrete finding %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestUnknownAssessmentUsesSharedUnknownColor(t *testing.T) {
+	report := model.Report{Score: model.Score{Status: model.SeverityUnknown, Label: "INSUFFICIENT DATA"}}
+	var out strings.Builder
+	Write(&out, report, Options{Color: true, ASCII: true})
+	text := out.String()
+	if !strings.Contains(text, "\x1b[1;35mAssessment\x1b[0m") || !strings.Contains(text, "\x1b[35mUNKNOWN\x1b[0m") {
+		t.Fatalf("unknown assessment did not use shared UNKNOWN colors:\n%s", text)
+	}
+}
+
+func TestAssessmentCoverageReasonRecognizesEveryMissingCoreInput(t *testing.T) {
+	sampled := true
+	valid := model.Metrics{
+		CPU:         &model.CPU{Sampled: &sampled},
+		Memory:      &model.Memory{TotalBytes: 1},
+		Filesystems: []model.Filesystem{{MountPoint: "/", TotalBytes: 1}},
+	}
+	want := "No usable CPU, memory, or filesystem data was collected."
+	tests := []struct {
+		name    string
+		metrics model.Metrics
+	}{
+		{"CPU missing", func() model.Metrics { m := valid; m.CPU = nil; return m }()},
+		{"CPU unsampled", func() model.Metrics {
+			m := valid
+			unsampled := false
+			m.CPU = &model.CPU{Sampled: &unsampled}
+			return m
+		}()},
+		{"memory missing", func() model.Metrics { m := valid; m.Memory = nil; return m }()},
+		{"memory total unavailable", func() model.Metrics { m := valid; m.Memory = &model.Memory{}; return m }()},
+		{"filesystems missing", func() model.Metrics { m := valid; m.Filesystems = nil; return m }()},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := assessmentCoverageReason(model.Report{Metrics: tt.metrics}); got != want {
+				t.Fatalf("coverage reason = %q, want %q", got, want)
+			}
+		})
 	}
 }

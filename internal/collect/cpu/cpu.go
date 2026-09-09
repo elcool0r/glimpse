@@ -36,7 +36,7 @@ func (c Collector) Collect(ctx context.Context) (collect.Data, error) {
 		return collect.Data{}, err
 	}
 	sampled := false
-	data := collect.Data{Snapshot: snapshot, CPU: &model.CPU{Sampled: &sampled, Load1: snapshot.Load.One, Load5: snapshot.Load.Five, Load15: snapshot.Load.Fifteen, Runnable: int(snapshot.Stat.Runnable), Blocked: int(snapshot.Stat.Blocked)}}
+	data := collect.Data{Snapshot: snapshot, CPU: &model.CPU{Sampled: &sampled, HostCPUCount: len(snapshot.Stat.PerCPU), Load1: snapshot.Load.One, Load5: snapshot.Load.Five, Load15: snapshot.Load.Fifteen, Runnable: int(snapshot.Stat.Runnable), Blocked: int(snapshot.Stat.Blocked)}}
 	if snapshot.Pressure != nil {
 		data.Pressure = &model.Pressure{CPU: toModelPressure(*snapshot.Pressure)}
 	}
@@ -62,7 +62,7 @@ func (Collector) Delta(first, last collect.Data) (collect.Data, error) {
 		return finalGauges(last), err
 	}
 	sampled := true
-	data := collect.Data{CPU: &model.CPU{Sampled: &sampled, Utilization: delta.Utilization, User: delta.User, System: delta.System, IOWait: delta.IOWait, Steal: delta.Steal, Load1: delta.Load.One, Load5: delta.Load.Five, Load15: delta.Load.Fifteen, Runnable: int(delta.Runnable), Blocked: int(delta.Blocked)}}
+	data := collect.Data{CPU: &model.CPU{Sampled: &sampled, HostCPUCount: len(end.Stat.PerCPU), Utilization: delta.Utilization, User: delta.User, System: delta.System, IOWait: delta.IOWait, Steal: delta.Steal, Load1: delta.Load.One, Load5: delta.Load.Five, Load15: delta.Load.Fifteen, Runnable: int(delta.Runnable), Blocked: int(delta.Blocked)}}
 	if delta.Pressure != nil {
 		data.Pressure = &model.Pressure{CPU: toModelPressure(*delta.Pressure)}
 	}
@@ -211,7 +211,7 @@ func ParseStat(r io.Reader) (Stat, error) {
 				out.Blocked = v
 			}
 		default:
-			if strings.HasPrefix(fields[0], "cpu") {
+			if isPerCPUName(fields[0]) {
 				v, err := parseTimes(fields)
 				if err != nil {
 					return Stat{}, err
@@ -227,6 +227,18 @@ func ParseStat(r io.Reader) (Stat, error) {
 		return Stat{}, errors.New("proc stat: missing cpu line")
 	}
 	return out, nil
+}
+
+func isPerCPUName(name string) bool {
+	if !strings.HasPrefix(name, "cpu") || len(name) == len("cpu") {
+		return false
+	}
+	for _, r := range name[len("cpu"):] {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func parseTimes(fields []string) (Times, error) {
@@ -388,22 +400,46 @@ func ReadSnapshot(procRoot string) (Snapshot, error) {
 	return out, nil
 }
 
-// Between derives deltas. A counter reset yields zero for that counter.
+// Between derives a coherent CPU-time interval. A regression in any component
+// makes the aggregate interval unreliable, including Linux's permitted
+// iowait regression, so callers retain final gauges instead of inventing rates.
 func Between(start, end Snapshot) (Delta, error) {
 	if !end.At.After(start.At) {
 		return Delta{}, errors.New("cpu sample timestamps are not increasing")
 	}
-	total := counterDelta(start.Stat.Total.Total(), end.Stat.Total.Total())
-	if total == 0 {
+	deltas, ok := timesDelta(start.Stat.Total, end.Stat.Total)
+	if !ok {
+		return Delta{}, errors.New("cpu time component regressed")
+	}
+	total, ok := sumTimes(deltas)
+	if !ok || total == 0 {
 		return Delta{}, errors.New("cpu CPU time did not advance")
 	}
 	d := Delta{Duration: end.At.Sub(start.At), ContextSwitches: counterDelta(start.Stat.ContextSwitches, end.Stat.ContextSwitches), Interrupts: counterDelta(start.Stat.Interrupts, end.Stat.Interrupts), SoftInterrupts: counterDelta(start.Stat.SoftInterrupts, end.Stat.SoftInterrupts), Runnable: end.Stat.Runnable, Blocked: end.Stat.Blocked, Load: end.Load, Pressure: end.Pressure}
-	d.Utilization = 1 - ratio(counterDelta(start.Stat.Total.Idle, end.Stat.Total.Idle), total)
-	d.User = ratio(counterDelta(start.Stat.Total.User, end.Stat.Total.User)+counterDelta(start.Stat.Total.Nice, end.Stat.Total.Nice), total)
-	d.System = ratio(counterDelta(start.Stat.Total.System, end.Stat.Total.System)+counterDelta(start.Stat.Total.IRQ, end.Stat.Total.IRQ)+counterDelta(start.Stat.Total.SoftIRQ, end.Stat.Total.SoftIRQ), total)
-	d.IOWait = ratio(counterDelta(start.Stat.Total.IOWait, end.Stat.Total.IOWait), total)
-	d.Steal = ratio(counterDelta(start.Stat.Total.Steal, end.Stat.Total.Steal), total)
+	d.Utilization = 1 - ratio(deltas.Idle, total)
+	d.User = ratio(deltas.User+deltas.Nice, total)
+	d.System = ratio(deltas.System+deltas.IRQ+deltas.SoftIRQ, total)
+	d.IOWait = ratio(deltas.IOWait, total)
+	d.Steal = ratio(deltas.Steal, total)
 	return d, nil
+}
+
+func timesDelta(start, end Times) (Times, bool) {
+	if end.User < start.User || end.Nice < start.Nice || end.System < start.System || end.Idle < start.Idle || end.IOWait < start.IOWait || end.IRQ < start.IRQ || end.SoftIRQ < start.SoftIRQ || end.Steal < start.Steal {
+		return Times{}, false
+	}
+	return Times{User: end.User - start.User, Nice: end.Nice - start.Nice, System: end.System - start.System, Idle: end.Idle - start.Idle, IOWait: end.IOWait - start.IOWait, IRQ: end.IRQ - start.IRQ, SoftIRQ: end.SoftIRQ - start.SoftIRQ, Steal: end.Steal - start.Steal}, true
+}
+
+func sumTimes(t Times) (uint64, bool) {
+	var total uint64
+	for _, value := range []uint64{t.User, t.Nice, t.System, t.Idle, t.IOWait, t.IRQ, t.SoftIRQ, t.Steal} {
+		if ^uint64(0)-total < value {
+			return 0, false
+		}
+		total += value
+	}
+	return total, true
 }
 
 func counterDelta(start, end uint64) uint64 {

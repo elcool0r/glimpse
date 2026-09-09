@@ -43,6 +43,37 @@ func TestDefaultGatewayEmptyWithoutGatewayRoute(t *testing.T) {
 	}
 }
 
+func TestDefaultGatewayRequiresUsableZeroMaskRoute(t *testing.T) {
+	table := "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n" +
+		// A split default must not be mistaken for the full default route.
+		"tun0\t00000000\t0101A8C0\t0003\t0\t0\t1\t00000080\t0\t0\t0\n" +
+		// A route that is not UP and an all-zero gateway are unusable too.
+		"eth1\t00000000\t0201A8C0\t0002\t0\t0\t1\t00000000\t0\t0\t0\n" +
+		"eth2\t00000000\t00000000\t0003\t0\t0\t1\t00000000\t0\t0\t0\n"
+	if got := defaultGateway(table); got != "" {
+		t.Fatalf("defaultGateway = %q, want empty", got)
+	}
+}
+
+func TestDefaultGatewaySelectsLowestMetricAndKeepsEqualMetricOrder(t *testing.T) {
+	table := "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n" +
+		"eth-backup\t00000000\t0201A8C0\t0003\t0\t0\t200\t00000000\t0\t0\t0\n" +
+		"eth-primary\t00000000\t0101A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0\n" +
+		"eth-equal\t00000000\t0301A8C0\t0003\t0\t0\t100\t00000000\t0\t0\t0\n"
+	if got := defaultGateway(table); got != "192.168.1.1" {
+		t.Fatalf("defaultGateway = %q, want lowest metric first route", got)
+	}
+}
+
+func TestDefaultGatewaySkipsIncompleteOrMalformedRoutes(t *testing.T) {
+	table := "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\tMTU\tWindow\tIRTT\n" +
+		"eth0\t00000000\t0101A8C0\t0003\t0\t0\tnot-a-number\t00000000\t0\t0\t0\n" +
+		"eth1\t00000000\t0101A8C0\t0003\t0\t0\t100\n"
+	if got := defaultGateway(table); got != "" {
+		t.Fatalf("defaultGateway = %q, want empty", got)
+	}
+}
+
 func TestCollectSkipsWithoutDefaultGateway(t *testing.T) {
 	c := &Collector{
 		readFile: fakeReadFile("Iface\tDestination\tGateway\tFlags\n", nil),

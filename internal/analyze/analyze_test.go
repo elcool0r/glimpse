@@ -35,6 +35,22 @@ func TestDiskContentionRequiresCorrelatedSignals(t *testing.T) {
 	}
 }
 
+func TestCPUContentionUsesHostProcStatCPUCount(t *testing.T) {
+	report := model.Report{Host: model.Host{CPUCount: 8}, Metrics: model.Metrics{
+		CPU:      &model.CPU{Utilization: .95, Load1: 2},
+		Pressure: &model.Pressure{CPU: model.PressureResource{SomeAvg10: 6}},
+	}}
+	Report(&report)
+	if hasFinding(report, "cpu-contention") {
+		t.Fatalf("host load must be normalized by the eight proc-stat CPUs: %#v", report.Findings)
+	}
+	report.Host.CPUCount = 1
+	Report(&report)
+	if !hasFinding(report, "cpu-contention") {
+		t.Fatalf("control case must demonstrate affinity-sized normalization would differ: %#v", report.Findings)
+	}
+}
+
 func TestDiskContentionEvidenceMatchesOnlyCorroboratingSignal(t *testing.T) {
 	report := model.Report{Metrics: model.Metrics{
 		CPU:   &model.CPU{Blocked: 1},
@@ -196,23 +212,40 @@ func TestZombieFindingNamesProcessAndParent(t *testing.T) {
 	t.Fatalf("expected zombie finding: %#v", report.Findings)
 }
 
-func TestStuckProcessFindingNamesProcessAndParent(t *testing.T) {
-	report := model.Report{Metrics: model.Metrics{CPU: &model.CPU{}, Processes: &model.Processes{StuckProcesses: []model.Process{{PID: 91, ParentPID: 12, Command: "tail", State: "D"}}}}}
-	Report(&report)
-	found := findingByID(report, "process-stuck-uninterruptible")
-	if found == nil || !contains(found.Summary, "PID 91 (tail), parent PID 12") || found.Severity != model.SeverityWarning {
-		t.Fatalf("expected a warning naming the stuck process: %#v", report.Findings)
+func TestEndpointDStateFindingIsInformationalForOneOrThreeProcesses(t *testing.T) {
+	for _, count := range []int{1, 3} {
+		processes := make([]model.Process, count)
+		for i := range processes {
+			processes[i] = model.Process{PID: i + 1, ParentPID: 12, Command: "reader", State: "D"}
+		}
+		report := model.Report{Metrics: model.Metrics{CPU: &model.CPU{}, Processes: &model.Processes{StuckProcesses: processes}}}
+		Report(&report)
+		found := findingByID(report, "process-stuck-uninterruptible")
+		if found == nil || found.Severity != model.SeverityInfo || found.ScoreImpact != 0 {
+			t.Fatalf("count=%d: expected informational zero-impact finding: %#v", count, report.Findings)
+		}
+		if found.DiagnosticCommand != "ps aux | grep -E ' D ' && lsof -p <pid> 2>/dev/null" {
+			t.Fatalf("count=%d: diagnostic command changed: %#v", count, found)
+		}
 	}
 }
 
-func TestStuckProcessFindingEscalatesWithMultipleProcesses(t *testing.T) {
-	report := model.Report{Metrics: model.Metrics{CPU: &model.CPU{}, Processes: &model.Processes{StuckProcesses: []model.Process{
-		{PID: 1, Command: "a", State: "D"}, {PID: 2, Command: "b", State: "D"}, {PID: 3, Command: "c", State: "D"},
-	}}}}
+// The same endpoint data is compatible with D→R→D. The finding must state
+// that evidence limit rather than describing continuous residency.
+func TestEndpointDStateFindingIsHonestAboutDToRunningToD(t *testing.T) {
+	report := model.Report{Metrics: model.Metrics{CPU: &model.CPU{}, Processes: &model.Processes{StuckProcesses: []model.Process{{PID: 91, ParentPID: 12, Command: "tail", State: "D"}}}}}
 	Report(&report)
 	found := findingByID(report, "process-stuck-uninterruptible")
-	if found == nil || found.Severity != model.SeverityCritical {
-		t.Fatalf("expected critical severity for 3+ stuck processes: %#v", report.Findings)
+	if found == nil || !contains(found.Summary, "PID 91 (tail), parent PID 12") || !contains(found.Summary, "observed in D state at both sampling boundaries") {
+		t.Fatalf("endpoint evidence is imprecise: %#v", report.Findings)
+	}
+	if !contains(found.Summary, "do not establish continuous D-state residency") {
+		t.Fatalf("D→R→D limitation is missing: %q", found.Summary)
+	}
+	for _, unsupported := range []string{"stuck", "stayed", "entire", "cannot be killed"} {
+		if contains(strings.ToLower(found.Title+" "+found.Summary), unsupported) {
+			t.Fatalf("finding makes unsupported %q claim: title=%q summary=%q", unsupported, found.Title, found.Summary)
+		}
 	}
 }
 
@@ -317,6 +350,23 @@ func TestNetworkRequiresVolumeAndRatio(t *testing.T) {
 		Report(&r)
 		if got := r.Score.Status == model.SeverityWarning; got != tt.warn {
 			t.Fatalf("%+v -> %+v", tt, r.Score)
+		}
+	}
+}
+
+func TestExplicitlyUnsampledIntervalCountersDoNotCreateFindings(t *testing.T) {
+	unsampled := false
+	report := model.Report{Host: model.Host{CPUCount: 1}, Metrics: model.Metrics{
+		CPU:      &model.CPU{IOWait: .20, Blocked: 2},
+		Pressure: &model.Pressure{IO: model.PressureResource{SomeAvg10: 5}},
+		Disks:    []model.Disk{{Name: "sda", Sampled: &unsampled, Utilization: .99, AverageQueueDepth: 8, AverageLatencyMillis: 100}},
+		Network:  []model.Network{{Name: "eth0", Sampled: &unsampled, RXPackets: 1000, RXDropped: 500, RXFrameErrors: 10, TXCarrierErrors: 10, Collisions: 10, Duplex: "full"}},
+		TCP:      &model.TCP{Sampled: &unsampled, SegmentsOut: 1000, RetransmittedSegments: 200, ListenDrops: 5, ActiveOpens: 100, AttemptFails: 50},
+	}}
+	Report(&report)
+	for _, id := range []string{"disk-contention-sda", "network-eth0-RX-drops", "network-eth0-link-errors", "network-eth0-collisions", "tcp-retransmits", "tcp-listen-overflow", "tcp-connect-failures"} {
+		if hasFinding(report, id) {
+			t.Fatalf("explicitly unsampled counters produced %s: %#v", id, report.Findings)
 		}
 	}
 }

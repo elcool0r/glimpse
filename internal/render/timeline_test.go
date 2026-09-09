@@ -229,6 +229,24 @@ func TestTimelineExcludesGenericContainerLogNoise(t *testing.T) {
 	}
 }
 
+func TestTimelinePlacesTimestampedContainerIncidentAtItsHistoricalTime(t *testing.T) {
+	now := localNoonToday(t)
+	age := ageSeconds(30 * time.Minute)
+	report := model.Report{
+		GeneratedAt: now,
+		Metrics: model.Metrics{Containers: []model.ContainerRuntime{{Runtime: "docker", Containers: []model.Container{{
+			Name: "web", LogEvents: []model.LogEvent{{Kind: "panic", Message: "panic: boom", AgeSeconds: age}},
+		}}}}},
+	}
+	events := collectTimelineEvents(report)
+	if len(events) != 1 || !events[0].at.Equal(now.Add(-30*time.Minute)) {
+		t.Fatalf("expected a 30-minute-old container event, got %#v", events)
+	}
+	if !strings.Contains(events[0].label, "panic: boom") {
+		t.Fatalf("timeline label lost container incident: %#v", events)
+	}
+}
+
 func TestTimelineIncludesRebootFromHostBootTime(t *testing.T) {
 	now := localNoonToday(t)
 	bootTime := now.Add(-3 * time.Hour)

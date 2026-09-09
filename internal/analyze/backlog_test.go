@@ -43,3 +43,15 @@ func TestNetworkStateDoesNotWarnWhenRoutesWereNotChecked(t *testing.T) {
 		t.Fatalf("unexpected finding without route coverage: %#v", findings)
 	}
 }
+
+func TestMemoryBacklogFindingsSkipUnknownAvailability(t *testing.T) {
+	unknown := false
+	swappiness := uint64(90)
+	findings := memoryBacklogFindings(&model.Memory{
+		AvailableValid: &unknown, AvailableFraction: 0, Swappiness: &swappiness,
+		SwapInBytes: 1, PageFaults: 200000, MajorFaults: 2000,
+	}, &model.Pressure{Memory: model.PressureResource{SomeAvg10: 5}})
+	if len(findings) != 0 {
+		t.Fatalf("unknown MemAvailable produced availability finding: %#v", findings)
+	}
+}

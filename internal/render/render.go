@@ -69,17 +69,26 @@ func Write(w io.Writer, r model.Report, o Options) {
 	writeWrapped(w, width, "", metadata(strings.Join(nonEmpty(r.Host.OS, r.Host.Kernel, fmt.Sprintf("%d CPUs", r.Host.CPUCount), fmt.Sprintf("sampled %.0fs", r.SampleDurationSeconds)), separator), o.Color))
 	fmt.Fprintln(w)
 	writeWrapped(w, width, "", sectionHeader("Overview", o.Color))
+	if r.Score.Status == model.SeverityUnknown {
+		writeWrapped(w, width, "", metricSeverity("Assessment", model.SeverityUnknown, "INSUFFICIENT DATA: "+assessmentCoverageReason(r)))
+	}
 	if c := r.Metrics.CPU; c != nil {
 		severity := sectionSeverity(r.Findings, "cpu")
+		if c.Sampled != nil && !*c.Sampled && severity == model.SeverityOK {
+			severity = model.SeverityUnknown
+		}
 		if !quietSkip(severity) {
-			writeWrapped(w, width, "", metricSeverity("CPU", severity, fmt.Sprintf("%s%sload %.2f%sI/O wait %.1f%%", cpuUtilization(c), separator, c.Load1, separator, c.IOWait*100)))
+			writeWrapped(w, width, "", metricSeverity("CPU", severity, fmt.Sprintf("%s%sload %.2f%s%s", cpuUtilization(c), separator, c.Load1, separator, cpuIOWait(c))))
 			note("cpu")
 		}
 	}
 	if m := r.Metrics.Memory; m != nil {
 		severity := sectionSeverity(r.Findings, "memory")
+		if !memoryAvailable(m) && severity == model.SeverityOK {
+			severity = model.SeverityUnknown
+		}
 		if !quietSkip(severity) {
-			writeWrapped(w, width, "", metricSeverity("Memory", severity, fmt.Sprintf("%.1f%% available (%s / %s)%sswap %s / %s used", m.AvailableFraction*100, size(m.AvailableBytes), size(m.TotalBytes), separator, size(swapUsed(m)), size(m.SwapTotalBytes))))
+			writeWrapped(w, width, "", metricSeverity("Memory", severity, memorySummary(m, separator)))
 			note("memory")
 		}
 	}
@@ -104,22 +113,28 @@ func Write(w io.Writer, r model.Report, o Options) {
 		}
 	}
 	if len(r.Metrics.Disks) > 0 {
-		busiest := busiestDisk(r.Metrics.Disks)
-		duration := busiest.SampleDurationSeconds
-		if duration <= 0 {
-			duration = r.SampleDurationSeconds
-		}
-		severity := sectionSeverity(r.Findings, "disk")
+		sampled, unavailable := sampledDisks(r.Metrics.Disks)
+		severity := partialSampleSeverity(sectionSeverity(r.Findings, "disk"), len(sampled), unavailable)
 		if !quietSkip(severity) {
-			writeWrapped(w, width, "", metricSeverity("Disk", severity, fmt.Sprintf("%d %s%s%s %.0f%% busy%s%s/s", len(r.Metrics.Disks), diskKind(r.Metrics.Disks), separator, cleanText(busiest.Name), busiest.Utilization*100, separator, sizePerSecond(busiest.ReadBytes+busiest.WriteBytes, duration))))
+			if len(sampled) == 0 {
+				writeWrapped(w, width, "", metricSeverity("Disk", severity, fmt.Sprintf("%d %s%ssampled I/O unavailable", len(r.Metrics.Disks), diskKind(r.Metrics.Disks), separator)))
+			} else {
+				busiest := busiestDisk(sampled)
+				detail := fmt.Sprintf("%d %s%s%s %.0f%% busy%s%s/s", len(r.Metrics.Disks), diskKind(r.Metrics.Disks), separator, cleanText(busiest.Name), busiest.Utilization*100, separator, sizePerSecond(busiest.ReadBytes+busiest.WriteBytes, busiest.SampleDurationSeconds))
+				if unavailable > 0 {
+					detail += fmt.Sprintf("%s%d final gauges only", separator, unavailable)
+				}
+				writeWrapped(w, width, "", metricSeverity("Disk", severity, detail))
+			}
 			if o.Verbose {
 				for _, disk := range r.Metrics.Disks {
-					diskDuration := disk.SampleDurationSeconds
-					if diskDuration <= 0 {
-						diskDuration = r.SampleDurationSeconds
-					}
 					diskSeverity := findingSeverity(r.Findings, "disk-contention-"+disk.Name)
-					detail := fmt.Sprintf("%.0f%% busy%s%s/s", disk.Utilization*100, separator, sizePerSecond(disk.ReadBytes+disk.WriteBytes, diskDuration))
+					detail := "sampled I/O unavailable"
+					if intervalSampled(disk.Sampled) {
+						detail = fmt.Sprintf("%.0f%% busy%s%s/s", disk.Utilization*100, separator, sizePerSecond(disk.ReadBytes+disk.WriteBytes, disk.SampleDurationSeconds))
+					} else {
+						diskSeverity = model.SeverityUnknown
+					}
 					checkLine(w, width, "    ", cleanText(disk.Name), diskSeverity, o.Color, detail)
 				}
 			}
@@ -127,22 +142,28 @@ func Write(w io.Writer, r model.Report, o Options) {
 		}
 	}
 	if len(r.Metrics.Network) > 0 {
-		busiest := busiestNetwork(r.Metrics.Network)
-		duration := busiest.SampleDurationSeconds
-		if duration <= 0 {
-			duration = r.SampleDurationSeconds
-		}
-		netSeverity := maxSeverity(findingSeverityByPrefix(r.Findings, "network", "network-"), findingSeverity(r.Findings, "conntrack-drops"))
+		sampled, unavailable := sampledNetworks(r.Metrics.Network)
+		netSeverity := partialSampleSeverity(maxSeverity(findingSeverityByPrefix(r.Findings, "network", "network-"), findingSeverity(r.Findings, "conntrack-drops")), len(sampled), unavailable)
 		if !quietSkip(netSeverity) {
-			writeWrapped(w, width, "", metricSeverity("Network", netSeverity, fmt.Sprintf("%d interfaces%s%s%s RX %s/s%sTX %s/s", len(r.Metrics.Network), separator, cleanText(busiest.Name), linkSummary(busiest), sizePerSecond(busiest.RXBytes, duration), separator, sizePerSecond(busiest.TXBytes, duration))))
+			if len(sampled) == 0 {
+				writeWrapped(w, width, "", metricSeverity("Network", netSeverity, fmt.Sprintf("%d interfaces%ssampled traffic unavailable", len(r.Metrics.Network), separator)))
+			} else {
+				busiest := busiestNetwork(sampled)
+				detail := fmt.Sprintf("%d interfaces%s%s%s RX %s/s%sTX %s/s", len(r.Metrics.Network), separator, cleanText(busiest.Name), linkSummary(busiest), sizePerSecond(busiest.RXBytes, busiest.SampleDurationSeconds), separator, sizePerSecond(busiest.TXBytes, busiest.SampleDurationSeconds))
+				if unavailable > 0 {
+					detail += fmt.Sprintf("%s%d final gauges only", separator, unavailable)
+				}
+				writeWrapped(w, width, "", metricSeverity("Network", netSeverity, detail))
+			}
 			if o.Verbose {
 				for _, iface := range r.Metrics.Network {
-					ifaceDuration := iface.SampleDurationSeconds
-					if ifaceDuration <= 0 {
-						ifaceDuration = r.SampleDurationSeconds
-					}
 					severity := findingSeverityByPrefix(r.Findings, "network", "network-"+iface.Name+"-")
-					detail := fmt.Sprintf("RX %s/s%sTX %s/s%s", sizePerSecond(iface.RXBytes, ifaceDuration), separator, sizePerSecond(iface.TXBytes, ifaceDuration), linkSummary(iface))
+					detail := "sampled traffic unavailable"
+					if intervalSampled(iface.Sampled) {
+						detail = fmt.Sprintf("RX %s/s%sTX %s/s%s", sizePerSecond(iface.RXBytes, iface.SampleDurationSeconds), separator, sizePerSecond(iface.TXBytes, iface.SampleDurationSeconds), linkSummary(iface))
+					} else {
+						severity = model.SeverityUnknown
+					}
 					checkLine(w, width, "    ", cleanText(iface.Name), severity, o.Color, strings.TrimSuffix(detail, " "))
 				}
 			}
@@ -163,8 +184,16 @@ func Write(w io.Writer, r model.Report, o Options) {
 	}
 	if s := r.Metrics.Systemd; s != nil && s.Available {
 		severity := sectionSeverity(r.Findings, "services")
+		coverageLimited := s.ServiceUnitScanLimited || s.ServiceUnitsInspected < s.ServiceUnitsDiscovered
+		if coverageLimited && severity == model.SeverityOK {
+			severity = model.SeverityInfo
+		}
 		if !quietSkip(severity) {
-			writeWrapped(w, width, "", metricSeverity("Services", severity, fmt.Sprintf("%d failed units", len(s.FailedUnits))))
+			detail := fmt.Sprintf("%d failed units", len(s.FailedUnits))
+			if coverageLimited {
+				detail += fmt.Sprintf("%sinspection %d/%d (unit inspection limit)", separator, s.ServiceUnitsInspected, s.ServiceUnitsDiscovered)
+			}
+			writeWrapped(w, width, "", metricSeverity("Services", severity, detail))
 			if o.Verbose {
 				for _, unit := range s.FailedUnits {
 					checkLine(w, width, "    ", cleanText(unit), model.SeverityCritical, o.Color, "failed")
@@ -182,22 +211,35 @@ func Write(w io.Writer, r model.Report, o Options) {
 	}
 	if tcp := r.Metrics.TCP; tcp != nil {
 		tcpSeverity := findingSeverityByPrefix(r.Findings, "network", "tcp-")
+		if !intervalSampled(tcp.Sampled) && tcpSeverity == model.SeverityOK {
+			tcpSeverity = model.SeverityUnknown
+		}
 		if !quietSkip(tcpSeverity) {
-			writeWrapped(w, width, "", metricSeverity("TCP", tcpSeverity, fmt.Sprintf("%d retransmits / %d outbound%s%d listen drops", tcp.RetransmittedSegments, tcp.SegmentsOut, separator, tcp.ListenOverflows+tcp.ListenDrops)))
+			if !intervalSampled(tcp.Sampled) {
+				writeWrapped(w, width, "", metricSeverity("TCP", tcpSeverity, fmt.Sprintf("sampled TCP activity unavailable%s%d established", separator, tcp.CurrentEstablished)))
+			} else {
+				writeWrapped(w, width, "", metricSeverity("TCP", tcpSeverity, fmt.Sprintf("%d retransmits / %d outbound%s%d listen drops", tcp.RetransmittedSegments, tcp.SegmentsOut, separator, tcp.ListenOverflows+tcp.ListenDrops)))
+			}
 			if o.Verbose {
-				checkLine(w, width, "    ", "Retransmits", findingSeverity(r.Findings, "tcp-retransmits"), o.Color, fmt.Sprintf("%d of %d outbound", tcp.RetransmittedSegments, tcp.SegmentsOut))
-				checkLine(w, width, "    ", "Listen queue", findingSeverity(r.Findings, "tcp-listen-overflow"), o.Color, fmt.Sprintf("%d overflow%s%d drops", tcp.ListenOverflows, separator, tcp.ListenDrops))
-				checkLine(w, width, "    ", "Connection attempts", findingSeverity(r.Findings, "tcp-connect-failures"), o.Color, fmt.Sprintf("%d of %d failed", tcp.AttemptFails, tcp.ActiveOpens+tcp.PassiveOpens))
-				udpSeverity := model.SeverityOK
-				if tcp.UDPInErrors > 0 {
-					udpSeverity = model.SeverityInfo
+				if !intervalSampled(tcp.Sampled) {
+					checkLine(w, width, "    ", "Sampled activity", model.SeverityUnknown, o.Color, "unavailable; final socket gauges only")
+				} else {
+					checkLine(w, width, "    ", "Retransmits", findingSeverity(r.Findings, "tcp-retransmits"), o.Color, fmt.Sprintf("%d of %d outbound", tcp.RetransmittedSegments, tcp.SegmentsOut))
+					checkLine(w, width, "    ", "Listen queue", findingSeverity(r.Findings, "tcp-listen-overflow"), o.Color, fmt.Sprintf("%d overflow%s%d drops", tcp.ListenOverflows, separator, tcp.ListenDrops))
+					checkLine(w, width, "    ", "Connection attempts", findingSeverity(r.Findings, "tcp-connect-failures"), o.Color, fmt.Sprintf("%d of %d failed", tcp.AttemptFails, tcp.ActiveOpens+tcp.PassiveOpens))
 				}
-				checkLine(w, width, "    ", "UDP errors", udpSeverity, o.Color, fmt.Sprintf("%d", tcp.UDPInErrors))
-				ipSeverity := model.SeverityOK
-				if tcp.IPReassemblyFailures > 0 || tcp.IPFragmentationFailures > 0 {
-					ipSeverity = model.SeverityInfo
+				if intervalSampled(tcp.Sampled) {
+					udpSeverity := model.SeverityOK
+					if tcp.UDPInErrors > 0 {
+						udpSeverity = model.SeverityInfo
+					}
+					checkLine(w, width, "    ", "UDP errors", udpSeverity, o.Color, fmt.Sprintf("%d", tcp.UDPInErrors))
+					ipSeverity := model.SeverityOK
+					if tcp.IPReassemblyFailures > 0 || tcp.IPFragmentationFailures > 0 {
+						ipSeverity = model.SeverityInfo
+					}
+					checkLine(w, width, "    ", "IP reassembly/fragmentation", ipSeverity, o.Color, fmt.Sprintf("reassembly %d%sfragmentation %d", tcp.IPReassemblyFailures, separator, tcp.IPFragmentationFailures))
 				}
-				checkLine(w, width, "    ", "IP reassembly/fragmentation", ipSeverity, o.Color, fmt.Sprintf("reassembly %d%sfragmentation %d", tcp.IPReassemblyFailures, separator, tcp.IPFragmentationFailures))
 				if resources := r.Metrics.Resources; resources != nil {
 					if resources.TimeWaitMaximum > 0 {
 						checkLine(w, width, "    ", "TIME_WAIT table", findingSeverity(r.Findings, "tcp-time-wait-saturation"), o.Color, fmt.Sprintf("%d/%d", tcp.TimeWaitSockets, resources.TimeWaitMaximum))
@@ -249,7 +291,8 @@ func Write(w io.Writer, r model.Report, o Options) {
 		// --verbose.
 		cpuSeverity := sectionSeverity(r.Findings, "cpu")
 		memSeverity := sectionSeverity(r.Findings, "memory")
-		if (o.Verbose && !o.Quiet) || severityRank(processSeverity) >= severityRank(model.SeverityWarning) || severityRank(cpuSeverity) >= severityRank(model.SeverityWarning) {
+		showTopCPU := (o.Verbose && !o.Quiet) || severityRank(processSeverity) >= severityRank(model.SeverityWarning) || severityRank(cpuSeverity) >= severityRank(model.SeverityWarning)
+		if showTopCPU {
 			topCPUSeverity := processSeverity
 			if severityRank(cpuSeverity) > severityRank(topCPUSeverity) {
 				topCPUSeverity = cpuSeverity
@@ -261,11 +304,16 @@ func Write(w io.Writer, r model.Report, o Options) {
 			if severityRank(memSeverity) > severityRank(topRAMSeverity) {
 				topRAMSeverity = memSeverity
 			}
-			renderProcesses(w, width, sectionLabel("Top RAM", topRAMSeverity, o.Color), withoutPIDs(p.TopRSS, p.TopCPU), separator, p.CPUSampled)
+			var displayedCPU []model.Process
+			if showTopCPU {
+				displayedCPU = displayedProcesses(p.TopCPU)
+			}
+			renderProcesses(w, width, sectionLabel("Top RAM", topRAMSeverity, o.Color), withoutPIDs(p.TopRSS, displayedCPU), separator, p.CPUSampled)
 		}
 	}
 	renderIntegrations(w, width, r, separator, o.Color, o.Verbose, o.Quiet)
-	if o.Events || o.EventsAll || r.Score.Status == model.SeverityCritical {
+	hasTimestampedWarning := hasWarningOrCriticalWithTimestamp(r.Findings)
+	if o.Events || o.EventsAll || r.Score.Status == model.SeverityCritical || hasTimestampedWarning {
 		renderTimeline(w, width, r, o.Color, o.EventsAll)
 	}
 	infoFindings := compactInformationalFindings(r.Findings)
@@ -300,8 +348,14 @@ func Write(w io.Writer, r model.Report, o Options) {
 			if f.Suggestion != "" {
 				writeWrapped(w, width, "    ", formatSuggestion(f.Suggestion, o.Color))
 			}
+			if f.EventTime != nil {
+				writeWrapped(w, width, "    ", metadata(fmt.Sprintf("Event: %s", f.EventTime.Local().Format("2006-01-02 15:04:05")), o.Color))
+			}
+			if f.DiagnosticCommand != "" {
+				writeWrapped(w, width, "    ", diagnosticCommand(f.DiagnosticCommand, o.Color))
+			}
 		}
-	} else if len(infoFindings) == 0 {
+	} else if r.Score.Status != model.SeverityUnknown && len(infoFindings) == 0 {
 		fmt.Fprintln(w)
 		writeWrapped(w, width, "", "No actionable findings from the collected signals.")
 	}
@@ -310,6 +364,25 @@ func Write(w io.Writer, r model.Report, o Options) {
 			writeWrapped(w, width, "", fmt.Sprintf("%s  %s", badge(model.SeverityInfo, o.Color), highlightContainerName(cleanText(finding.Title), o.Color)))
 		}
 	}
+}
+
+// assessmentCoverageReason explains an unknown assessment without attempting
+// to turn collection diagnostics into health findings. The analyzer is the
+// authority for Score.Status; this only gives its terminal verdict a concise,
+// stable reason.
+func assessmentCoverageReason(r model.Report) string {
+	for _, status := range r.Collection {
+		if status.Collector == "sampling" && status.Status == "error" {
+			return "Sampling was interrupted; the health assessment is incomplete."
+		}
+	}
+
+	cpu := r.Metrics.CPU
+	if cpu == nil || cpu.Sampled != nil && !*cpu.Sampled || r.Metrics.Memory == nil || r.Metrics.Memory.TotalBytes == 0 || len(r.Metrics.Filesystems) == 0 {
+		return "No usable CPU, memory, or filesystem data was collected."
+	}
+
+	return "The collected signals are insufficient for a health assessment."
 }
 
 // collectionSeverity maps a collector's raw status string to a display
@@ -412,6 +485,15 @@ func metadata(text string, color bool) string {
 	return "\x1b[34m" + text + "\x1b[0m"
 }
 
+func diagnosticCommand(cmd string, color bool) string {
+	label := "Diagnostic: "
+	if !color {
+		return label + cmd
+	}
+	// Cyan (36) for the label, default text for the command
+	return "\x1b[36m" + label + "\x1b[0m" + cmd
+}
+
 func severityColorCode(severity model.Severity) string {
 	code := "35"
 	switch severity {
@@ -443,6 +525,15 @@ func badge(severity model.Severity, color bool) string {
 		return text
 	}
 	return "\x1b[" + severityColorCode(severity) + "m" + text + "\x1b[0m"
+}
+
+func hasWarningOrCriticalWithTimestamp(findings []model.Finding) bool {
+	for _, f := range findings {
+		if (f.Severity == model.SeverityWarning || f.Severity == model.SeverityCritical) && f.EventTime != nil {
+			return true
+		}
+	}
+	return false
 }
 
 func actionableFindings(findings []model.Finding) []model.Finding {
@@ -561,6 +652,17 @@ func withoutPIDs(processes, alreadyShown []model.Process) []model.Process {
 		}
 	}
 	return result
+}
+
+const processDisplayLimit = 3
+
+// displayedProcesses returns precisely the entries renderProcesses emits. It
+// keeps deduplication aligned with the visible CPU ranking.
+func displayedProcesses(processes []model.Process) []model.Process {
+	if len(processes) <= processDisplayLimit {
+		return processes
+	}
+	return processes[:processDisplayLimit]
 }
 
 // size scales to the largest unit that keeps the number readable. Rendering
@@ -698,6 +800,56 @@ func busiestNetwork(interfaces []model.Network) model.Network {
 	return busiest
 }
 
+// intervalSampled keeps reports produced before R10 compatible: only an
+// explicit false means the counter interval was unavailable.
+func intervalSampled(sampled *bool) bool { return sampled == nil || *sampled }
+
+// memoryAvailable keeps reports encoded before R21 compatible: only an
+// explicit false means MemAvailable was unavailable.
+func memoryAvailable(memory *model.Memory) bool {
+	return memory.AvailableValid == nil || *memory.AvailableValid
+}
+
+func memorySummary(memory *model.Memory, separator string) string {
+	if !memoryAvailable(memory) {
+		return fmt.Sprintf("MemAvailable unavailable%sswap %s / %s used", separator, size(swapUsed(memory)), size(memory.SwapTotalBytes))
+	}
+	return fmt.Sprintf("%.1f%% available (%s / %s)%sswap %s / %s used", memory.AvailableFraction*100, size(memory.AvailableBytes), size(memory.TotalBytes), separator, size(swapUsed(memory)), size(memory.SwapTotalBytes))
+}
+
+func sampledDisks(disks []model.Disk) ([]model.Disk, int) {
+	sampled := make([]model.Disk, 0, len(disks))
+	unavailable := 0
+	for _, disk := range disks {
+		if intervalSampled(disk.Sampled) {
+			sampled = append(sampled, disk)
+		} else {
+			unavailable++
+		}
+	}
+	return sampled, unavailable
+}
+
+func sampledNetworks(interfaces []model.Network) ([]model.Network, int) {
+	sampled := make([]model.Network, 0, len(interfaces))
+	unavailable := 0
+	for _, iface := range interfaces {
+		if intervalSampled(iface.Sampled) {
+			sampled = append(sampled, iface)
+		} else {
+			unavailable++
+		}
+	}
+	return sampled, unavailable
+}
+
+func partialSampleSeverity(severity model.Severity, sampled, unavailable int) model.Severity {
+	if unavailable == 0 || severity != model.SeverityOK || sampled == 0 && unavailable == 0 {
+		return severity
+	}
+	return model.SeverityUnknown
+}
+
 func timeSyncStatus(sync *model.TimeSync) string {
 	if sync.Synchronized == nil {
 		return cleanText(sync.Service) + " status unavailable"
@@ -799,10 +951,7 @@ func renderProcesses(w io.Writer, width int, label string, processes []model.Pro
 	if len(processes) == 0 {
 		return
 	}
-	limit := len(processes)
-	if limit > 3 {
-		limit = 3
-	}
+	limit := len(displayedProcesses(processes))
 	writeWrapped(w, width, "", label+separator+"processes (CPU: % of one core; RAM: resident/RSS)")
 	for _, p := range processes[:limit] {
 		cpu := fmt.Sprintf("%.1f%%", p.CPUFraction*100)
@@ -925,6 +1074,13 @@ func cpuUtilization(c *model.CPU) string {
 		return "utilization unavailable"
 	}
 	return fmt.Sprintf("%.0f%% avg", c.Utilization*100)
+}
+
+func cpuIOWait(c *model.CPU) string {
+	if c.Sampled != nil && !*c.Sampled {
+		return "I/O wait unavailable"
+	}
+	return fmt.Sprintf("I/O wait %.1f%%", c.IOWait*100)
 }
 
 func swapUsed(m *model.Memory) uint64 {

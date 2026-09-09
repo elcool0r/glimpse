@@ -42,23 +42,30 @@ func (Collector) Delta(first, last collect.Data) (collect.Data, error) {
 		// with zero counters and no sample interval rather than discarding it.
 		return finalGauges(after), errors.New("network: invalid first snapshot")
 	}
+	if before.At.IsZero() || after.At.IsZero() || !after.At.After(before.At) {
+		return finalGauges(after), errors.New("network: invalid sampling interval")
+	}
 	previous := make(map[string]Counters, len(before.Interfaces))
 	for _, iface := range before.Interfaces {
 		previous[iface.Name] = iface.Counters
 	}
 	duration := sampleSeconds(before.At, after.At)
 	metrics := make([]model.Network, 0, len(after.Interfaces))
+	sampled := true
+	unsampled := false
 	for _, iface := range after.Interfaces {
-		// A newly created interface has no sampling baseline. Reporting its
-		// lifetime counters as a delta would create a false network warning.
-		// Omit it for this window and include it once a complete interval is
-		// available.
+		// A newly created interface has no sampling baseline. Retain its link
+		// gauges without presenting lifetime counters as a sampled delta.
 		baseline, exists := previous[iface.Name]
 		if !exists {
+			entry := linkFacts(iface)
+			entry.Sampled = &unsampled
+			metrics = append(metrics, entry)
 			continue
 		}
 		delta := Delta(baseline, iface.Counters)
 		entry := linkFacts(iface)
+		entry.Sampled = &sampled
 		entry.SampleDurationSeconds = duration
 		entry.RXBytes, entry.TXBytes = delta.RXBytes, delta.TXBytes
 		entry.RXPackets, entry.TXPackets = delta.RXPackets, delta.TXPackets
@@ -77,8 +84,11 @@ func (Collector) Delta(first, last collect.Data) (collect.Data, error) {
 // nor rendering can mistake them for observed activity.
 func finalGauges(last Snapshot) collect.Data {
 	metrics := make([]model.Network, 0, len(last.Interfaces))
+	sampled := false
 	for _, iface := range last.Interfaces {
-		metrics = append(metrics, linkFacts(iface))
+		entry := linkFacts(iface)
+		entry.Sampled = &sampled
+		metrics = append(metrics, entry)
 	}
 	return collect.Data{Network: metrics}
 }

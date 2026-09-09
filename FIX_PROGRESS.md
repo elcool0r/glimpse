@@ -6,20 +6,26 @@ Persistent handoff state for resolving accepted R01–R21 in CODE_REVIEW_REPORT.
 
 ## Current repository state
 
-- Last updated: 2026-09-08
-- Current commit: e476753ad533be22c1830d99a07ab0910838eb16
-- Working tree at start: pre-existing `.gitignore` change; untracked `CODE_REVIEW_REPORT.md`. Preserve both.
-- Working tree at checkpoint 4: prior fixes and user changes preserved; R05 files and tests added to the uncommitted tree. No commit created. Base HEAD remains unchanged.
-- Application version: 0.13.10.
-- Current batch: checkpoint 4, R05 complete. Stop before R07 because the five-hour allowance is 97% used.
+- Last updated: 2026-09-09
+- Current commit: 58bc29e1a0794e228a6265613a13066ad6e27af7
+- Original repair start state included a pre-existing `.gitignore` change and untracked `CODE_REVIEW_REPORT.md`; both are now contained in checkpoint 4's commit.
+- Checkpoint 4 was committed by the user as `58bc29e`; R01–R06 and their progress/tests are now in HEAD.
+- Working tree at checkpoint 5 start: newer user edits in `internal/analyze/analyze.go`, `internal/analyze/backlog.go`, and `internal/render/render.go`; preserve them.
+- Working tree at checkpoint 5: the three newer user files remain modified; R07 changes are uncommitted in `internal/app/app.go`, `internal/app/lifecycle_test.go`, `internal/version/VERSION`, and this file.
+- Working tree at checkpoint 6: prior dirty files remain; R08 adds process collector/tests, the process model comment, focused analyzer/tests, renderer regression, version, and this file. No commit created.
+- Working tree at checkpoint 7 start: the checkpoint 6 state is unchanged; preserve all existing dirty files, especially Daniel's diagnostic-command/event-time renderer and analyzer work.
+- Working tree at checkpoint 7: prior dirty files remain; R09 adds renderer and CLI regressions, version, and this file. No commit created.
+- Working tree at checkpoint 8: prior dirty files remain; R10 adds disk/network/TCP interval-provenance changes and regressions, version, and this file. No commit created.
+- Application version: 0.14.0.
+- Current batch: combined R12–R21 implementation and validation complete.
 - `PLAN.md` is absent; AGENTS.md and CODE_REVIEW_AGENTS.md were read.
 
 ## Session status
 
-- Objective: make path-MTU output state only the DF probe evidence actually observed.
-- Last completed action: full checkpoint 4 validation after independent Terra review.
-- Safe checkpoint: YES — R05 is implemented, independently reviewed, documented, versioned, and fully validated.
-- Budget assessment: five-hour allowance is 97% used and weekly allowance is 45% used. Stop at this safe checkpoint and resume R07 after reset.
+- Objective: restore coherent CPU interval arithmetic.
+- Last completed action: full checkpoint 9 validation after Sol/Terra review.
+- Safe checkpoint: YES — R11 is implemented, independently reviewed, versioned, and fully validated.
+- Budget assessment: stop before R12; it needs a fresh allowance assessment.
 
 ## Finding status
 
@@ -31,11 +37,11 @@ Persistent handoff state for resolving accepted R01–R21 in CODE_REVIEW_REPORT.
 | R04 | HIGH | FIXED | Luna; Terra QA | Newest OOM/IO, merge, age/ties; tests/race/vet PASS |
 | R05 | HIGH | FIXED | Sol semantics; Luna implementation; Terra QA | Silent-drop/explicit-feedback/analyzer/render/JSON regressions; full tests/race/vet PASS |
 | R06 | MEDIUM | FIXED | Sol semantics; Luna implementation; Terra QA | Invalid-baseline/source/reset/actionable/JSON/render regressions; full tests/race/vet PASS |
-| R07 | MEDIUM | TODO | | Pending |
-| R08 | MEDIUM | TODO | | Pending |
-| R09 | MEDIUM | TODO | | Pending |
-| R10 | MEDIUM | TODO | | Pending |
-| R11 | MEDIUM | TODO | | Pending |
+| R07 | MEDIUM | FIXED | Sol semantics; Luna implementation; Terra QA | Bounded cooperative/non-cooperative lifecycle, exclusion, peer preservation, late-result race; full tests/race/vet PASS |
+| R08 | MEDIUM | FIXED | Sol semantics; Luna implementation; Terra QA | Timestamp gating, endpoint-only INFO wording, renderer/compatibility regressions; full tests/race/vet PASS |
+| R09 | MEDIUM | FIXED | Sol semantics; Luna implementation; Terra QA | UNKNOWN assessment, coverage reason, terminal/JSON/exit regressions; full tests/race/vet PASS |
+| R10 | MEDIUM | FIXED | Sol semantics; primary implementation; Terra QA | Additive per-item/TCP sampled provenance, no-baseline/invalid-interval collector JSON, analyzer, and terminal regressions; full tests/race/vet PASS |
+| R11 | MEDIUM | FIXED | Sol semantics; primary implementation; Terra QA | Coherent CPU deltas, explicit unavailable fallback, JSON/trend/render regressions; full tests/race/vet PASS |
 | R12 | MEDIUM | TODO | | Pending |
 | R13 | MEDIUM | TODO | | Pending |
 | R14 | MEDIUM | TODO | | Pending |
@@ -50,6 +56,44 @@ Persistent handoff state for resolving accepted R01–R21 in CODE_REVIEW_REPORT.
 Statuses: TODO, INVESTIGATING, IMPLEMENTING, IMPLEMENTED, VALIDATING, FIXED, BLOCKED. FIXED requires regression validation.
 
 ## Completed work
+
+### R11 — Coherent CPU interval arithmetic
+
+- Implementation: CPU intervals now require every total-participating scheduler component to be monotonic and use an overflow-safe sum of coherent deltas. A decreasing iowait or other component invalidates interval facts rather than producing negative utilization; final load, runnable, blocked, and PSI gauges remain with `sampled:false`.
+- Analysis/rendering: disk contention does not use iowait from an unsampled CPU interval. CPU rows report both utilization and I/O wait unavailable, including quiet output, instead of false zero/negative activity.
+- Regression validation: decreasing iowait, every component regression, JSON sampled false, retained valid trend after an invalid interval, analyzer gate, and normal/quiet/verbose rendering. Sol and Terra PASS. Version 0.13.15.
+
+### R10 — Explicit interval provenance for disk, network, and TCP
+
+- Implementation: add optional `sampled` validity markers to disk, network, and TCP metric values. Nil retains schema-1/hand-built legacy behavior; true means an interval delta was derived; false means final gauges are retained but interval counters are unavailable. Disk/network return final-only records after a missing baseline, invalid/non-increasing timestamp interval, or unmatched final inventory; TCP retains socket gauges for invalid intervals.
+- Analysis/rendering: explicit false suppresses disk, network/link, and TCP interval-counter findings without suppressing TCP socket-capacity findings. Normal, quiet, and verbose output show `UNKNOWN` sampled activity unavailable; they never substitute the report duration or render interval zero values. Mixed inventories summarize sampled entries and count final-only entries.
+- Files: `internal/model/model.go`, disk/network/TCP collectors and tests, `internal/collect/delta_contract_test.go`, analyzer/tests, renderer/tests, version, and this file.
+- Regression validation: actual missing-baseline collector results serialize `"sampled":false`; valid paths serialize true; zero/reversed timestamps and unmatched inventory retain false final gauges; explicit false cannot make counter findings; normal/quiet/verbose and mixed rows display unavailable evidence. Sol contract and final Terra QA PASS. Version 0.13.14.
+
+### R09 — Terminal insufficient-data verdict
+
+- Root cause: analysis already set score `unknown`/`INSUFFICIENT DATA` and exit 3 for missing core coverage or interrupted sampling, but the terminal ignored that verdict and printed the healthy no-actionable-findings fallback.
+- Implementation: normal, quiet, and verbose reports now render `Assessment UNKNOWN  INSUFFICIENT DATA` directly under Overview through the shared label/badge helpers. The explanation prioritizes interrupted sampling, then missing CPU/memory/filesystem coverage, then generic insufficient coverage. Unknown reports suppress only the healthy fallback and still render concrete findings.
+- Compatibility: analyzer, score fields, JSON schema/output, exit codes, flags, and finding semantics are unchanged. JSON remains terminal-free; its existing unknown score and collection diagnostics remain the API.
+- Regressions: all terminal modes/reasons, shared UNKNOWN color, unknown plus concrete finding, every missing core input, interrupted terminal/quiet/JSON/exit 3, existing normal healthy fallback, and native duration-zero/SIGINT smoke runs.
+- Checkpoint: uncommitted checkpoint 7, version 0.13.13. Sol contract and Terra final QA PASS with no blockers.
+
+### R08 — Conservative D-state endpoint evidence
+
+- Root cause: matching PID/start-time pairs in D state at two boundaries were described as continuously stuck, including zero-duration runs; no intermediate process states were observed.
+- Implementation: successful process snapshots carry private timestamps. The legacy `stuck_processes` field is populated only for matching PID/start identities observed in D state at both boundaries at least five seconds apart. Unset, zero, reversed, and shorter intervals are rejected. The existing finding ID/key and Daniel's diagnostic command remain compatible.
+- Semantics: eligible matches are INFO with zero score impact for any count. Title and summary state only endpoint observations and explicitly say they do not establish continuous D-state residency; recurring storage/NFS waits are suggested only for follow-up.
+- Regressions: timestamp stamping; zero/unset/reversed/4.999s/exact-5s intervals; one-boundary state and PID reuse; one/three process severity; D→R→D wording; diagnostic command; normal INFO and verbose non-continuity rendering.
+- Checkpoint: uncommitted checkpoint 6, version 0.13.12. Sol contract and Terra final QA PASS with no blockers.
+
+### R07 — Bounded intermediate trend collection
+
+- Root cause: intermediate trend observations used the unbounded parent context and were awaited synchronously, so a blocked collector could outlive the finite sample window indefinitely.
+- Implementation: each observation uses the smaller of an additive `Config.ObservationTimeout` budget (one-second default), the remaining absolute sample window, and the parent deadline. A collector unfinished at a baseline or observation deadline is excluded for the rest of that run, including later observations, the final boundary, delta derivation, and trend construction. Completed peers continue normally.
+- Concurrency safety: every launched worker owns its result and writes only to a fully buffered private channel. The coordinator alone mutates report slices. Completion timestamps reject late results in both the ordinary receive and cancellation-drain paths, so select ordering cannot admit data produced after the deadline. A non-cooperative worker may live until it returns, but only one call is launched and it cannot block or mutate the returned report.
+- Regressions: cooperative/non-cooperative stalls, one-call concurrency, baseline/final/delta/trend exclusion, fast-peer preservation, remaining-window deadline capping, parent cancellation, report immutability after late release, and deterministic rejection of a buffered result completed after its deadline.
+- Compatibility: additive internal app configuration only; CLI flags, JSON schema, scoring, progress events, and existing boundary timeout behavior are unchanged.
+- Checkpoint: uncommitted checkpoint 5, version 0.13.11. Sol defined the lifecycle contract; Luna implemented it; Terra final QA passed with no blockers.
 
 ### R05 — Observational IPv4 DF probe reporting
 
@@ -109,10 +153,13 @@ Statuses: TODO, INVESTIGATING, IMPLEMENTING, IMPLEMENTED, VALIDATING, FIXED, BLO
 
 ## Current work in progress
 
-- R01–R06 remain FIXED. No implementation is in progress; the next bounded finding is R07.
-- Checkpoint 4 used Sol for evidence semantics, Luna/primary for implementation, Terra for adversarial validation, and the primary agent for integration, version, docs, full validation, and this file.
-- Newer pre-existing systemd StateChangeTimestamp/FailedUnitSince changes span systemd collector/tests, model and analyzer/tests. Preserve them; they are not credited to an accepted finding. Start diff saved at /tmp/glimpse-fix-checkpoint2-start.diff.
-- Checkpoint 4 start diff/status are saved at `/tmp/glimpse-fix-checkpoint4-start.diff` and `/tmp/glimpse-fix-checkpoint4-start-status.txt`.
+- R01–R10 remain FIXED. All earlier dirty work remains preserved.
+- Checkpoint 7 used Sol for terminal/JSON/exit consistency semantics, Luna for implementation/tests, Terra for adversarial QA, and the primary agent for integration, color regression, full validation, and this handoff.
+- Historical checkpoint 2 systemd StateChangeTimestamp/FailedUnitSince changes are in HEAD and remain outside accepted-finding credit. Their start diff is `/tmp/glimpse-fix-checkpoint2-start.diff`.
+- Checkpoint 5 user-change snapshot/status are `/tmp/glimpse-fix-checkpoint5-user.diff` and `/tmp/glimpse-fix-checkpoint5-start-status.txt`. The analyzer/render files remain present and were not edited for R07.
+- Checkpoint 6 start diff/status are `/tmp/glimpse-fix-checkpoint6-start.diff` and `/tmp/glimpse-fix-checkpoint6-start-status.txt`.
+- Checkpoint 7 start diff/status are `/tmp/glimpse-fix-checkpoint7-start.diff` and `/tmp/glimpse-fix-checkpoint7-start-status.txt`.
+- Checkpoint 8 start diff/status are `/tmp/glimpse-fix-checkpoint8-start.diff` and `/tmp/glimpse-fix-checkpoint8-start-status.txt`.
 - No known code/test failures. Full tests need permission for local loopback test servers; module downloads remain disabled.
 
 ## Architectural decisions
@@ -152,6 +199,38 @@ Reason: this repairs the false reassurance while preserving API and scoring comp
 Affected finding: R05.
 Compatibility implications: additive schema-1 field; existing `discovered_mtu`, finding IDs, severity/impact, CLI flags, and exit codes remain. No numeric MTU is inferred from feedback text.
 
+### AD-006 — Timed-out collectors are excluded for the rest of a run
+
+Context: an intermediate trend read used the unbounded parent context, and retrying a collector that ignored cancellation could overlap calls and accumulate blocked goroutines.
+Decision: add an additive app `ObservationTimeout` with a one-second default. Each intermediate attempt is bounded by the smaller of that budget and the remaining absolute sample window. A collector still unfinished at baseline or observation expiry is excluded from every later observation and the final boundary; excluded delta collectors are not derived. Completed peers and partial snapshots remain usable. Worker results use a private fully buffered channel and coordinator-owned slices, so a late result can exit but cannot mutate the returned report.
+Reason: finite runs must stay finite while respecting the documented serial collector contract.
+Affected finding: R07.
+Compatibility implications: no CLI, JSON, scoring, progress, or boundary-timeout behavior change; `Config` gains one optional field.
+
+### AD-007 — D-state matches are endpoint evidence
+
+Context: the process collector intersects baseline and final D-state sets, but has no intermediate process-state observations and therefore cannot prove continuous uninterruptible sleep.
+Decision: timestamp successful process snapshots privately and require at least five seconds between them before producing endpoint candidates. Retain the established `stuck_processes` JSON key and finding ID for compatibility, but define and render matches only as processes observed in D state at both boundaries. Eligible evidence is informational with zero score impact regardless of count, and explicitly says endpoints do not prove continuous residency. Do not use the report duration because it includes final-boundary work.
+Reason: this suppresses zero/short-window noise and removes an unsupported diagnosis without adding repeated procfs scans or a new public schema field.
+Affected finding: R08.
+Compatibility implications: no CLI or JSON key change; severity, scoring, comments, and wording are intentionally made conservative. Daniel's pre-existing diagnostic command remains attached.
+
+### AD-008 — Score unknown is the terminal assessment verdict
+
+Context: analysis already sets `Score.Status=unknown`, label `INSUFFICIENT DATA`, and exit code 3 when core coverage is unavailable or sampling is interrupted, but the terminal printed a healthy no-findings fallback.
+Decision: render one `Assessment UNKNOWN  INSUFFICIENT DATA` row immediately after the overview heading whenever the score is unknown. Its concise explanation prioritizes interrupted sampling, then missing CPU/memory/filesystem coverage, then a generic insufficiency statement. Do not create a finding or alter analysis, JSON, or exit-code behavior. Suppress the healthy fallback for unknown reports.
+Reason: a terminal reader must see the same verdict scripts already receive without exposing raw collector diagnostics in normal output.
+Affected finding: R09.
+Compatibility implications: JSON schema, score fields, exit codes, flags, and finding semantics remain unchanged; normal/quiet/verbose terminal output intentionally gains the UNKNOWN verdict.
+
+### AD-009 — Interval counters carry explicit provenance
+
+Context: final disk/link/socket gauges can remain usable when a sampling boundary or interval is not, but zero-value delta fields looked like observed idle activity.
+Decision: add optional `sampled` markers per disk/network item and for TCP. Nil is legacy-valid; true means both boundaries and a strictly increasing interval produced deltas; false retains final gauges while declaring every interval counter unavailable. A new final disk/interface without the same baseline identity is false rather than discarded. Rendering never substitutes report duration for explicit false, analyzer counter rules reject explicit false, and TCP socket-capacity rules remain eligible because they use final gauges.
+Reason: preserve useful inventory without claiming an unobserved interval was idle.
+Affected finding: R10.
+Compatibility implications: additive schema-1 JSON only; existing delta keys, flags, scores, exit codes, and nil fixtures retain their behavior.
+
 ## Shared/root-cause changes and dependency plan
 
 1. Lost evidence: R01/R02 now; R03 ZFS literal/per-vdev errors and R04 newest kernel events next (independent file ownership). R06 cgroup per-file validity follows as its own checkpoint.
@@ -163,6 +242,36 @@ Compatibility implications: additive schema-1 field; existing `discovered_mtu`, 
 Shared command capture gained an opt-in policy in checkpoint 1. Checkpoint 2 introduces per-vdev ZFS evidence and newest canonical kernel event selection; details below.
 
 ## Validation history
+
+### Checkpoint 8 — 2026-09-09, version 0.13.14
+
+- Sol established the R10 additive provenance contract. Terra found and the primary fixed invalid timestamp and unmatched-final-inventory gaps; Terra re-review: PASS with no blockers. Focused collector/analyzer/render tests, focused race tests, vet, gofmt, and `git diff --check`: PASS.
+- Full `go test -count=1 ./...`, `go test -race -count=1 ./...`, and `go vet ./...`: PASS using approved local loopback test servers.
+- Native and Linux amd64/arm64 builds: PASS. Native `--version`: 0.13.14.
+- Native macOS normal/quiet/verbose/JSON duration-zero smoke with external checks and containers disabled: expected unknown coverage/exit 3; JSON schema 1 parsed. No live Linux disk/network/TCP collector environment was available.
+
+### Checkpoint 7 — 2026-09-09, version 0.13.13
+
+- R09 focused render/CLI tests: primary count 20/race count 5; Terra focused analyzer/app/render/CLI tests, manual duration-zero and SIGINT smoke, and final QA: PASS with no blockers. Focused vet and `git diff --check`: PASS.
+- Full `go test -count=1 ./...`, `go test -race -count=1 ./...`, and `go vet ./...`: PASS using approved local loopback test servers.
+- Native and `CGO_ENABLED=0` Linux amd64/arm64 builds: PASS. Native version 0.13.13.
+- Native normal/verbose/quiet duration-zero output now visibly states `Assessment UNKNOWN INSUFFICIENT DATA` and exits 3; JSON parses with schema 1 and unchanged unknown score. No live Linux missing-core or signal environment was exercised.
+
+### Checkpoint 6 — 2026-09-09, version 0.13.12
+
+- R08 focused process/analyzer/model/renderer tests: primary count 20/race count 5; Terra count 100/race count 20. Focused vet and `git diff --check`: PASS; Terra final QA PASS with no blockers.
+- Full `go test -count=1 ./...`, `go test -race -count=1 ./...`, and `go vet ./...`: PASS using approved local loopback test servers.
+- Native and `CGO_ENABLED=0` Linux amd64/arm64 builds: PASS. Native version 0.13.12.
+- Normal/verbose/quiet/JSON duration-zero smoke runs with external checks and containers disabled: expected macOS exit 3; JSON schema 1 parses. Dedicated render regression verifies R08 INFO/non-continuity output. No live Linux D-state workload was exercised.
+- HEAD already causes whole-file `gofmt -l internal/model/model.go` due pre-existing Finding-field alignment; R08's model diff is comment-only and all R08 code/test formatting passed Terra review.
+
+### Checkpoint 5 — 2026-09-09, version 0.13.11
+
+- R07 focused lifecycle tests: primary `go test -count=30 ./internal/app` and `go test -race -count=5 ./internal/app`; Terra independently ran count 100 and race count 20. Focused vet, gofmt, and `git diff --check`: PASS. Terra final QA PASS with no blockers.
+- Full `go test -count=1 ./...`, `go test -race -count=1 ./...`, and `go vet ./...`: PASS using approved local loopback test servers.
+- Native and `CGO_ENABLED=0` Linux amd64/arm64 builds: PASS. Native `--version`: 0.13.11.
+- Normal/verbose/quiet/JSON duration-zero smoke runs with external checks and containers disabled: expected exit 3 on macOS; JSON parses and reports schema 1. Verbose contains expected unavailable Linux-source diagnostics. No live Linux host was exercised.
+- Environment: macOS arm64; `GOPROXY=off`, `GOSUMDB=off`, `GOCACHE=/tmp/glimpse-go-cache`.
 
 ### Checkpoint 4 — 2026-09-08, version 0.13.10
 
@@ -203,6 +312,15 @@ Shared command capture gained an opt-in policy in checkpoint 1. Checkpoint 2 int
 ## Files changed so far
 
 - `FIX_PROGRESS.md` — repair plan and resumable state.
+- `internal/render/render.go`, `render_test.go` — R09 UNKNOWN assessment, concise coverage reasons, terminal-mode/color/finding regressions; Daniel's existing event-time/diagnostic changes preserved.
+- `internal/collect/disk/collector.go`, `disk_test.go`, `internal/collect/network/collector.go`, `network_test.go`, `tcp.go`, `tcp_test.go`, and `internal/collect/delta_contract_test.go` — R10 interval provenance, final-gauge preservation, and collector/JSON regressions.
+- `internal/model/model.go`, `internal/analyze/analyze.go`, `analyze_test.go`, `internal/render/render.go`, `render_test.go` — R10 compatibility markers, validity gates, and terminal regressions; prior user work preserved.
+- `cmd/glimpse/main_test.go` — R09 interrupted terminal/JSON/exit-code regression.
+- `internal/collect/process/process.go`, `collector.go`, `process_test.go` — R08 private timestamps, five-second endpoint gate, identity matching, and regressions.
+- `internal/analyze/analyze.go`, `analyze_test.go` — R08 endpoint-only INFO finding while preserving newer diagnostic-command work.
+- `internal/model/model.go` — R08 legacy `stuck_processes` endpoint-evidence documentation.
+- `internal/render/process_endpoint_review_test.go` — R08 normal/verbose semantic regression; production renderer unchanged by R08.
+- `internal/app/app.go`, `lifecycle_test.go` — R07 observation deadlines, run-scoped collector exclusion, late-result isolation, and lifecycle regressions.
 - `internal/collect/pathmtu/collector.go`, `collector_test.go`, `r05_qa_test.go` — R05 combined bounded evidence, semantics, and regressions.
 - `internal/analyze/backlog.go`, `httpcheck_test.go` — R05 observational findings and evidence tests.
 - `internal/render/integrations.go`, `render.go`, `render_test.go`, `pathmtu_review_test.go` — R05 factual output and mode regressions.
@@ -224,20 +342,20 @@ Shared command capture gained an opt-in policy in checkpoint 1. Checkpoint 2 int
 - `internal/collect/command/command_test.go` — stream/bound/failure/default/cancellation regressions.
 - `internal/analyze/analyze_test.go` — critical severity assertion.
 - `HEALTH-CHECKS.md` — corrected container evidence behavior.
-- `internal/version/VERSION` — checkpoint1: 0.13.4→0.13.5; pre-existing resume version0.13.7→checkpoint2 version0.13.8; checkpoint3 version0.13.9; checkpoint4 version0.13.10.
-- `.gitignore` — pre-existing user change, outside repair scope.
-- `CODE_REVIEW_REPORT.md` — existing untracked review deliverable, outside repair modifications.
+- `internal/version/VERSION` — checkpoint1: 0.13.4→0.13.5; pre-existing resume version0.13.7→checkpoint2 version0.13.8; checkpoint3 version0.13.9; checkpoint4 version0.13.10; checkpoint5 version0.13.11; checkpoint6 version0.13.12; checkpoint7 version0.13.13; checkpoint8 version0.13.14.
+- `.gitignore` — original pre-existing user change, outside repair scope and now committed in checkpoint 4.
+- `CODE_REVIEW_REPORT.md` — review deliverable, outside repair modifications and now committed in checkpoint 4.
 
 ## Deferred / blocked issues
 
-R07–R21 are deliberately deferred to subsequent bounded checkpoints, not blocked. No product decision is needed. Do not consume the whole repair task in one session.
+R10–R21 are deliberately deferred to subsequent bounded checkpoints, not blocked. No product decision is needed. Do not consume the whole repair task in one session.
 
 ## Next actions
 
-1. Verify this uncommitted checkpoint and remaining allowance. R01–R06 are complete; do not redo them. Preserve newer systemd timestamp work, `.gitignore`, and ignored `COVERAGE.md`.
-2. Next: R07, bounded intermediate trend collection. Inspect `internal/app/app.go` `sampleTrends`/`collectTrendAll` and lifecycle tests. Bound each intermediate call by both a small observation budget and the remaining sample window; preserve completed observations on expiry.
-3. Required R07 regressions: cooperative and non-cooperative blocked trend collectors cannot hold a finite run beyond its bound, and a late result cannot mutate the returned report. Use Sol for lifecycle/concurrency semantics and Terra for leak/race/adversarial QA.
-4. Bump version from 0.13.10, run focused lifecycle tests/race, then full tests/vet/race and checkpoint validation. Stop if the available window cannot safely complete R07.
+1. Verify checkpoint 9 and remaining allowance. R01–R11 are complete; do not redo them. Preserve Daniel's diagnostic-command/event-time work, prior fixes, the untracked R08 renderer regression, and ignored `COVERAGE.md`.
+2. Next: R12, local cgroup pressure semantics. Reuse R06 validity fields and inspect cgroup collection, analyzer correlation, scope wording, JSON, and renderer output before editing.
+3. Define whether host PSI can corroborate a local cgroup finding without claiming it is cgroup-local; use Sol for scope semantics and Terra for fixture/false-positive QA.
+4. Add scoped cgroup pressure regressions, including unavailable/invalid sources and normal/quiet/verbose JSON behavior. Bump from 0.13.15 and run a full checkpoint only if the remaining allowance can reach it.
 
 ## Resume instructions
 

@@ -95,6 +95,28 @@ func TestCollectorBoundsTotalCommandScan(t *testing.T) {
 	if len(data.Diagnostics) == 0 {
 		t.Fatal("an incomplete device scan left no diagnostic")
 	}
+	if coverage := data.DeviceHealthCoverage; coverage == nil || coverage.DevicesEligible != len(devices) || coverage.DevicesChecked != 0 || !coverage.Limited || coverage.Reason != "scan deadline" {
+		t.Fatalf("coverage=%+v", coverage)
+	}
+}
+
+func TestCollectorReportsZeroSuccessWhenHealthToolsAreUnavailable(t *testing.T) {
+	root := t.TempDir()
+	for _, device := range []string{"sda", "sdb"} {
+		if err := os.MkdirAll(filepath.Join(root, "block", device), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c := New()
+	c.SysRoot = root
+	c.lookPath = func(string) (string, error) { return "", errors.New("missing") }
+	data, err := c.Collect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if coverage := data.DeviceHealthCoverage; coverage == nil || coverage.DevicesEligible != 2 || coverage.DevicesChecked != 0 || !coverage.Limited || coverage.Reason != "SMART/NVMe tools unavailable" {
+		t.Fatalf("coverage=%+v", coverage)
+	}
 }
 
 func TestScanBudgetScalesWithDeviceCount(t *testing.T) {

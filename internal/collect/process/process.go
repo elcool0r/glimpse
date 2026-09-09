@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 )
 
 type Process struct {
@@ -25,6 +26,7 @@ type Process struct {
 	CPUAvailable   bool
 }
 type Snapshot struct {
+	At                time.Time
 	Processes         int
 	Running           int
 	Sleeping          int
@@ -144,6 +146,7 @@ func Collect(ctx context.Context, procRoot string, limit int) (Snapshot, error) 
 		}
 		all = append(all, p)
 	}
+	summary.At = time.Now()
 	summary.TopCPU = top(all, limit, func(p Process) uint64 { return p.CPUTimeTicks })
 	summary.TopRSS = top(all, limit, func(p Process) uint64 { return p.RSSBytes })
 	summary.all = all

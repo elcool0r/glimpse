@@ -45,42 +45,46 @@ type Host struct {
 // /proc/pressure. Counters are deltas for the sampling window unless
 // documented as a current gauge.
 type Metrics struct {
-	CPU             *CPU               `json:"cpu,omitempty"`
-	Memory          *Memory            `json:"memory,omitempty"`
-	Pressure        *Pressure          `json:"pressure,omitempty"`
-	Filesystems     []Filesystem       `json:"filesystems,omitempty"`
-	Network         []Network          `json:"network,omitempty"`
-	Thermal         []Thermal          `json:"thermal,omitempty"`
-	Processes       *Processes         `json:"processes,omitempty"`
-	Systemd         *Systemd           `json:"systemd,omitempty"`
-	Kernel          *Kernel            `json:"kernel,omitempty"`
-	Disks           []Disk             `json:"disks,omitempty"`
-	TCP             *TCP               `json:"tcp,omitempty"`
-	Conntrack       *Conntrack         `json:"conntrack,omitempty"`
-	DeviceHealth    []DeviceHealth     `json:"device_health,omitempty"`
-	TimeSync        *TimeSync          `json:"time_sync,omitempty"`
-	Resources       *Resources         `json:"resources,omitempty"`
-	Privileges      *Privileges        `json:"privileges,omitempty"`
-	CgroupV2        *CgroupV2          `json:"cgroup_v2,omitempty"`
-	Containers      []ContainerRuntime `json:"containers,omitempty"`
-	ZFSPools        []ZFSPool          `json:"zfs_pools,omitempty"`
-	SoftwareRAID    []SoftwareRAID     `json:"software_raid,omitempty"`
-	LVM             *LVM               `json:"lvm,omitempty"`
-	MountChecks     []MountCheck       `json:"mount_checks,omitempty"`
-	Security        *Security          `json:"security,omitempty"`
-	NetworkState    *NetworkState      `json:"network_state,omitempty"`
-	DNSResolution   *DNSResolution     `json:"dns_resolution,omitempty"`
-	GatewayCheck    *GatewayCheck      `json:"gateway_check,omitempty"`
-	PathMTUCheck    *PathMTUCheck      `json:"path_mtu_check,omitempty"`
-	HTTPCheck       *HTTPCheck         `json:"http_check,omitempty"`
-	ICMPCheck       *ICMPCheck         `json:"icmp_check,omitempty"`
-	IPv6Check       *IPv6Check         `json:"ipv6_check,omitempty"`
-	DeletedFiles    *DeletedFiles      `json:"deleted_files,omitempty"`
-	Hardware        *HardwareErrors    `json:"hardware_errors,omitempty"`
-	Trends          []Trend            `json:"trends,omitempty"`
-	PackageActivity []PackageActivity  `json:"package_activity,omitempty"`
-	Logins          []LoginEvent       `json:"logins,omitempty"`
-	SudoCommands    []SudoEvent        `json:"sudo_commands,omitempty"`
+	CPU          *CPU           `json:"cpu,omitempty"`
+	Memory       *Memory        `json:"memory,omitempty"`
+	Pressure     *Pressure      `json:"pressure,omitempty"`
+	Filesystems  []Filesystem   `json:"filesystems,omitempty"`
+	Network      []Network      `json:"network,omitempty"`
+	Thermal      []Thermal      `json:"thermal,omitempty"`
+	Processes    *Processes     `json:"processes,omitempty"`
+	Systemd      *Systemd       `json:"systemd,omitempty"`
+	Kernel       *Kernel        `json:"kernel,omitempty"`
+	Disks        []Disk         `json:"disks,omitempty"`
+	TCP          *TCP           `json:"tcp,omitempty"`
+	Conntrack    *Conntrack     `json:"conntrack,omitempty"`
+	DeviceHealth []DeviceHealth `json:"device_health,omitempty"`
+	// DeviceHealthCoverage describes how much of the physical-device
+	// inventory was actually probed. It is collection coverage, not a health
+	// verdict, so partial scans remain informational.
+	DeviceHealthCoverage *DeviceHealthCoverage `json:"device_health_coverage,omitempty"`
+	TimeSync             *TimeSync             `json:"time_sync,omitempty"`
+	Resources            *Resources            `json:"resources,omitempty"`
+	Privileges           *Privileges           `json:"privileges,omitempty"`
+	CgroupV2             *CgroupV2             `json:"cgroup_v2,omitempty"`
+	Containers           []ContainerRuntime    `json:"containers,omitempty"`
+	ZFSPools             []ZFSPool             `json:"zfs_pools,omitempty"`
+	SoftwareRAID         []SoftwareRAID        `json:"software_raid,omitempty"`
+	LVM                  *LVM                  `json:"lvm,omitempty"`
+	MountChecks          []MountCheck          `json:"mount_checks,omitempty"`
+	Security             *Security             `json:"security,omitempty"`
+	NetworkState         *NetworkState         `json:"network_state,omitempty"`
+	DNSResolution        *DNSResolution        `json:"dns_resolution,omitempty"`
+	GatewayCheck         *GatewayCheck         `json:"gateway_check,omitempty"`
+	PathMTUCheck         *PathMTUCheck         `json:"path_mtu_check,omitempty"`
+	HTTPCheck            *HTTPCheck            `json:"http_check,omitempty"`
+	ICMPCheck            *ICMPCheck            `json:"icmp_check,omitempty"`
+	IPv6Check            *IPv6Check            `json:"ipv6_check,omitempty"`
+	DeletedFiles         *DeletedFiles         `json:"deleted_files,omitempty"`
+	Hardware             *HardwareErrors       `json:"hardware_errors,omitempty"`
+	Trends               []Trend               `json:"trends,omitempty"`
+	PackageActivity      []PackageActivity     `json:"package_activity,omitempty"`
+	Logins               []LoginEvent          `json:"logins,omitempty"`
+	SudoCommands         []SudoEvent           `json:"sudo_commands,omitempty"`
 }
 
 // PackageActivity is one bounded, timestamped package-manager transaction --
@@ -121,22 +125,29 @@ type SudoEvent struct {
 
 type CPU struct {
 	// Sampled is false when gauges are valid but counter deltas are unavailable.
-	Sampled     *bool   `json:"sampled,omitempty"`
-	Utilization float64 `json:"utilization"`
-	User        float64 `json:"user"`
-	System      float64 `json:"system"`
-	IOWait      float64 `json:"iowait"`
-	Steal       float64 `json:"steal"`
-	Load1       float64 `json:"load1"`
-	Load5       float64 `json:"load5"`
-	Load15      float64 `json:"load15"`
-	Runnable    int     `json:"runnable,omitempty"`
-	Blocked     int     `json:"blocked,omitempty"`
+	Sampled *bool `json:"sampled,omitempty"`
+	// HostCPUCount is derived from the same /proc/stat population as the
+	// aggregate CPU counters and load. It lets app prefer host-wide scope over
+	// the process's affinity-limited runtime CPU count.
+	HostCPUCount int     `json:"host_cpu_count,omitempty"`
+	Utilization  float64 `json:"utilization"`
+	User         float64 `json:"user"`
+	System       float64 `json:"system"`
+	IOWait       float64 `json:"iowait"`
+	Steal        float64 `json:"steal"`
+	Load1        float64 `json:"load1"`
+	Load5        float64 `json:"load5"`
+	Load15       float64 `json:"load15"`
+	Runnable     int     `json:"runnable,omitempty"`
+	Blocked      int     `json:"blocked,omitempty"`
 }
 
 type Memory struct {
 	// Sampled is false when gauges are valid but counter deltas are unavailable.
-	Sampled           *bool   `json:"sampled,omitempty"`
+	Sampled *bool `json:"sampled,omitempty"`
+	// AvailableValid is false when /proc/meminfo did not provide MemAvailable.
+	// Nil retains compatibility with reports produced before this marker.
+	AvailableValid    *bool   `json:"available_valid,omitempty"`
 	TotalBytes        uint64  `json:"total_bytes"`
 	AvailableBytes    uint64  `json:"available_bytes"`
 	SwapTotalBytes    uint64  `json:"swap_total_bytes"`
@@ -173,6 +184,9 @@ type Filesystem struct {
 }
 
 type Network struct {
+	// Sampled distinguishes interval counters from the final link gauges.
+	// Nil retains compatibility with reports produced before this marker.
+	Sampled               *bool   `json:"sampled,omitempty"`
 	SampleDurationSeconds float64 `json:"sample_duration_seconds,omitempty"`
 	Name                  string  `json:"name"`
 	Operational           string  `json:"operational_state,omitempty"`
@@ -412,11 +426,9 @@ type Processes struct {
 	Running int `json:"running"`
 	Blocked int `json:"blocked"`
 	Zombies int `json:"zombies"`
-	// StuckProcesses lists processes observed in uninterruptible sleep (D
-	// state) at both the baseline and final sampling boundary -- a single
-	// point-in-time D state is common and usually transient (a brief disk or
-	// NFS wait), so only a process the kernel still had blocked across the
-	// entire sample window is reported here.
+	// StuckProcesses is a legacy JSON field containing processes observed in
+	// uninterruptible sleep (D state) at both sampling boundaries. Endpoint
+	// observations do not establish the process state between them.
 	StuckProcesses  []Process `json:"stuck_processes,omitempty"`
 	ZombieProcesses []Process `json:"zombie_processes,omitempty"`
 	TopCPU          []Process `json:"top_cpu,omitempty"`
@@ -499,6 +511,9 @@ type HardwareErrorController struct {
 // Disk values are normalized from /proc/diskstats for the sampling window.
 // Throughput and operation counts are deltas; in_flight is a final gauge.
 type Disk struct {
+	// Sampled distinguishes interval counters from the final device gauges.
+	// Nil retains compatibility with reports produced before this marker.
+	Sampled               *bool   `json:"sampled,omitempty"`
 	SampleDurationSeconds float64 `json:"sample_duration_seconds,omitempty"`
 	Name                  string  `json:"name"`
 	Rotational            bool    `json:"rotational,omitempty"`
@@ -518,6 +533,9 @@ type Disk struct {
 // TCP combines sampled protocol counters with current socket gauges. All
 // fields ending in Delta are changes observed in the sampling window.
 type TCP struct {
+	// Sampled applies to every counter delta below. Socket counts remain final
+	// gauges and are valid when this is false. Nil retains legacy behavior.
+	Sampled               *bool  `json:"sampled,omitempty"`
 	SegmentsIn            uint64 `json:"segments_in_delta"`
 	SegmentsOut           uint64 `json:"segments_out_delta"`
 	RetransmittedSegments uint64 `json:"retransmitted_segments_delta"`
@@ -554,6 +572,17 @@ type DeviceHealth struct {
 	Uncorrectable      uint64   `json:"uncorrectable_sectors,omitempty"`
 	ReallocatedSectors uint64   `json:"reallocated_sectors,omitempty"`
 	Notes              []string `json:"notes,omitempty"`
+}
+
+// DeviceHealthCoverage distinguishes a clean device-health sweep from one
+// that only reached a subset of eligible physical devices. Reason names the
+// concrete limiter (for example "scan deadline" or "smartctl unavailable")
+// without exposing command diagnostics in the normal report.
+type DeviceHealthCoverage struct {
+	DevicesEligible int    `json:"devices_eligible"`
+	DevicesChecked  int    `json:"devices_checked"`
+	Limited         bool   `json:"limited,omitempty"`
+	Reason          string `json:"reason,omitempty"`
 }
 
 type TimeSync struct {
@@ -650,24 +679,28 @@ type CgroupV2 struct {
 	// The validity pointers are additive schema-v1 fields. Nil preserves the
 	// legacy meaning used by hand-built reports and older JSON; collectors set
 	// them explicitly for every observation.
-	MemoryCurrentValid       *bool   `json:"memory_current_valid,omitempty"`
-	MemoryMaxValid           *bool   `json:"memory_max_valid,omitempty"`
-	MemorySwapCurrentValid   *bool   `json:"memory_swap_current_valid,omitempty"`
-	MemorySwapMaxValid       *bool   `json:"memory_swap_max_valid,omitempty"`
-	PIDsCurrentValid         *bool   `json:"pids_current_valid,omitempty"`
-	PIDsMaxValid             *bool   `json:"pids_max_valid,omitempty"`
-	MemoryEventsSampled      *bool   `json:"memory_events_sampled,omitempty"`
-	CPUStatSampled           *bool   `json:"cpu_stat_sampled,omitempty"`
-	MemoryCurrentBytes       uint64  `json:"memory_current_bytes,omitempty"`
-	MemoryMaxBytes           *uint64 `json:"memory_max_bytes,omitempty"`
-	MemorySwapCurrentBytes   uint64  `json:"memory_swap_current_bytes,omitempty"`
-	MemorySwapMaxBytes       *uint64 `json:"memory_swap_max_bytes,omitempty"`
-	MemoryOOMDelta           uint64  `json:"memory_oom_delta,omitempty"`
-	MemoryOOMKillDelta       uint64  `json:"memory_oom_kill_delta,omitempty"`
-	CPUUsageSecondsDelta     float64 `json:"cpu_usage_seconds_delta,omitempty"`
-	CPUThrottledSecondsDelta float64 `json:"cpu_throttled_seconds_delta,omitempty"`
-	PIDsCurrent              uint64  `json:"pids_current,omitempty"`
-	PIDsMax                  *uint64 `json:"pids_max,omitempty"`
+	MemoryCurrentValid     *bool `json:"memory_current_valid,omitempty"`
+	MemoryMaxValid         *bool `json:"memory_max_valid,omitempty"`
+	MemorySwapCurrentValid *bool `json:"memory_swap_current_valid,omitempty"`
+	MemorySwapMaxValid     *bool `json:"memory_swap_max_valid,omitempty"`
+	PIDsCurrentValid       *bool `json:"pids_current_valid,omitempty"`
+	PIDsMaxValid           *bool `json:"pids_max_valid,omitempty"`
+	MemoryEventsSampled    *bool `json:"memory_events_sampled,omitempty"`
+	CPUStatSampled         *bool `json:"cpu_stat_sampled,omitempty"`
+	// MemoryPressure is PSI read from this cgroup's memory.pressure file. It
+	// must never be confused with host-level /proc/pressure/memory.
+	MemoryPressureValid      *bool             `json:"memory_pressure_valid,omitempty"`
+	MemoryPressure           *PressureResource `json:"memory_pressure,omitempty"`
+	MemoryCurrentBytes       uint64            `json:"memory_current_bytes,omitempty"`
+	MemoryMaxBytes           *uint64           `json:"memory_max_bytes,omitempty"`
+	MemorySwapCurrentBytes   uint64            `json:"memory_swap_current_bytes,omitempty"`
+	MemorySwapMaxBytes       *uint64           `json:"memory_swap_max_bytes,omitempty"`
+	MemoryOOMDelta           uint64            `json:"memory_oom_delta,omitempty"`
+	MemoryOOMKillDelta       uint64            `json:"memory_oom_kill_delta,omitempty"`
+	CPUUsageSecondsDelta     float64           `json:"cpu_usage_seconds_delta,omitempty"`
+	CPUThrottledSecondsDelta float64           `json:"cpu_throttled_seconds_delta,omitempty"`
+	PIDsCurrent              uint64            `json:"pids_current,omitempty"`
+	PIDsMax                  *uint64           `json:"pids_max,omitempty"`
 }
 
 // ContainerRuntime is an optional, runtime-scoped observation. A missing
@@ -802,16 +835,16 @@ type Evidence struct {
 }
 
 type Finding struct {
-	ID                  string     `json:"id"`
-	Severity            Severity   `json:"severity"`
-	Category            string     `json:"category"`
-	Title               string     `json:"title"`
-	Summary             string     `json:"summary"`
-	Evidence            []Evidence `json:"evidence,omitempty"`
-	Suggestion          string     `json:"suggestion,omitempty"`
-	DiagnosticCommand   string     `json:"diagnostic_command,omitempty"`
-	EventTime           *time.Time `json:"event_time,omitempty"`
-	ScoreImpact         int        `json:"score_impact"`
+	ID                string     `json:"id"`
+	Severity          Severity   `json:"severity"`
+	Category          string     `json:"category"`
+	Title             string     `json:"title"`
+	Summary           string     `json:"summary"`
+	Evidence          []Evidence `json:"evidence,omitempty"`
+	Suggestion        string     `json:"suggestion,omitempty"`
+	DiagnosticCommand string     `json:"diagnostic_command,omitempty"`
+	EventTime         *time.Time `json:"event_time,omitempty"`
+	ScoreImpact       int        `json:"score_impact"`
 }
 
 type Score struct {

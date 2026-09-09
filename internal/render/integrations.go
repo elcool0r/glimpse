@@ -60,10 +60,17 @@ func renderIntegrations(w io.Writer, width int, r model.Report, separator string
 			}
 			severity = maxSeverity(severity, findingSeverityByPrefix(r.Findings, "containers", "container-"+runtime.Runtime+"-"+name+"-"))
 		}
+		coverageLimited := runtime.ContainerInspectionLimited || runtime.ContainersInspected < runtime.ContainersDiscovered || runtime.LogCheckLimited || runtime.LogsChecked < runtime.LogCandidates
+		if coverageLimited && severity == model.SeverityOK {
+			severity = model.SeverityInfo
+		}
 		text := fmt.Sprintf("%s %s  %s%s%d running", sectionLabel("Containers", severity, color), badge(severity, color), cleanText(runtime.Runtime), separator, running)
-		if runtime.LogsChecked > 0 {
+		if runtime.ContainerInspectionLimited || runtime.ContainersInspected < runtime.ContainersDiscovered {
+			text += fmt.Sprintf("%sinspect: %d/%d (inspection limit)", separator, runtime.ContainersInspected, runtime.ContainersDiscovered)
+		}
+		if runtime.LogCandidates > 0 {
 			text += fmt.Sprintf("%slogs: %d/%d checked", separator, runtime.LogsChecked, runtime.LogCandidates)
-			if runtime.LogCheckLimited {
+			if runtime.LogCheckLimited || runtime.LogsChecked < runtime.LogCandidates {
 				text += " (time limit)"
 			}
 		}
@@ -271,7 +278,7 @@ func renderIntegrations(w io.Writer, width int, r model.Report, separator string
 	}
 	note("storage")
 
-	if len(m.DeviceHealth) > 0 {
+	if len(m.DeviceHealth) > 0 || m.DeviceHealthCoverage != nil && m.DeviceHealthCoverage.DevicesEligible > 0 {
 		// Device health had no default-report row at all, so a scan that ran
 		// out of time and skipped most disks looked identical to a clean sweep.
 		severity := model.SeverityOK
@@ -283,7 +290,18 @@ func renderIntegrations(w io.Writer, width int, r model.Report, separator string
 			}
 			severity = maxSeverity(severity, findingSeverity(r.Findings, "device-health-"+device.Device, "device-wear-"+device.Device))
 		}
+		coverage := m.DeviceHealthCoverage
+		coverageLimited := coverage != nil && (coverage.Limited || coverage.DevicesChecked < coverage.DevicesEligible)
+		if coverageLimited && severity == model.SeverityOK {
+			severity = model.SeverityInfo
+		}
 		text := fmt.Sprintf("%s %s  %d device(s) checked", sectionLabel("Devices", severity, color), badge(severity, color), len(m.DeviceHealth))
+		if coverage != nil && coverage.DevicesEligible > 0 {
+			text = fmt.Sprintf("%s %s  %d/%d device(s) checked", sectionLabel("Devices", severity, color), badge(severity, color), coverage.DevicesChecked, coverage.DevicesEligible)
+			if coverageLimited && coverage.Reason != "" {
+				text += fmt.Sprintf(" (%s)", cleanText(coverage.Reason))
+			}
+		}
 		if attention > 0 {
 			text += fmt.Sprintf("%s%d needing attention", separator, attention)
 		}
@@ -378,9 +396,9 @@ func renderIntegrations(w io.Writer, width int, r model.Report, separator string
 	if resolution := m.DNSResolution; resolution != nil && resolution.Available {
 		localSeverity := model.SeverityOK
 		if resolution.Local != nil {
-			localSeverity = findingSeverity(r.Findings, "dns-resolution-failed", "dns-resolution-local-failed")
+			localSeverity = findingSeverity(r.Findings, "dns-resolution-failed", "dns-resolution-local-failed", "dns-resolution-local-slow")
 		}
-		externalSeverity := findingSeverity(r.Findings, "dns-resolution-failed", "dns-resolution-external-failed")
+		externalSeverity := findingSeverity(r.Findings, "dns-resolution-failed", "dns-resolution-external-failed", "dns-resolution-external-slow")
 		severity := localSeverity
 		if severityRank(externalSeverity) > severityRank(severity) {
 			severity = externalSeverity
@@ -414,11 +432,11 @@ func renderIntegrations(w io.Writer, width int, r model.Report, separator string
 	note("dns-resolution")
 
 	if check := m.GatewayCheck; check != nil && check.Available {
-		severity := findingSeverity(r.Findings, "gateway-unreachable", "gateway-packet-loss")
+		severity := findingSeverity(r.Findings, "gateway-unreachable", "gateway-packet-loss", "gateway-high-latency")
 		if !skip(severity) {
 			writeWrapped(w, width, "", fmt.Sprintf("%s %s  %s%s%d/%d replies%s%.0f%% loss", sectionLabel("Gateway", severity, color), badge(severity, color), cleanText(check.Gateway), separator, check.Received, check.Sent, separator, check.PacketLossPct))
 			if verbose && check.Received > 0 {
-				checkLine(w, width, "    ", "Latency", model.SeverityOK, color, fmt.Sprintf("%.1fms average", check.AvgLatencyMillis))
+				checkLine(w, width, "    ", "Latency", severity, color, fmt.Sprintf("%.1fms average", check.AvgLatencyMillis))
 			}
 		}
 	}
@@ -536,10 +554,33 @@ func renderIntegrations(w io.Writer, width int, r model.Report, separator string
 
 	if df := m.DeletedFiles; df != nil && df.Available {
 		severity := findingSeverity(r.Findings, "deleted-files-open")
+		eligible := df.ProcessesEligible
+		if eligible == 0 {
+			eligible = df.ProcessesScanned + df.ProcessesSkipped
+		}
+		coverageLimited := df.ProcessScanLimited || df.ProcessesSkipped > 0
+		if coverageLimited && severity == model.SeverityOK {
+			severity = model.SeverityInfo
+		}
 		if !skip(severity) {
-			writeWrapped(w, width, "", fmt.Sprintf("%s %s  %s across %d unique file(s)%s%d process(es) holding", sectionLabel("Deleted files", severity, color), badge(severity, color), size(df.TotalBytes), df.UniqueFiles, separator, df.ProcessesHolding))
+			text := fmt.Sprintf("%s %s  %s across %d unique file(s)%s%d process(es) holding", sectionLabel("Deleted files", severity, color), badge(severity, color), size(df.TotalBytes), df.UniqueFiles, separator, df.ProcessesHolding)
+			if coverageLimited {
+				reasons := make([]string, 0, 2)
+				if df.ProcessScanLimited {
+					reasons = append(reasons, "process limit")
+				}
+				if df.ProcessesSkipped > 0 {
+					reasons = append(reasons, "permission")
+				}
+				text += fmt.Sprintf("%scoverage %d/%d checked (%s)", separator, df.ProcessesScanned, eligible, strings.Join(reasons, ", "))
+			}
+			writeWrapped(w, width, "", text)
 			if verbose {
-				checkLine(w, width, "    ", "Coverage", model.SeverityOK, color, fmt.Sprintf("%d process(es) scanned%s%d skipped (permission)%s%d total reference(s)", df.ProcessesScanned, separator, df.ProcessesSkipped, separator, df.TotalReferences))
+				coverageSeverity := model.SeverityOK
+				if coverageLimited {
+					coverageSeverity = model.SeverityInfo
+				}
+				checkLine(w, width, "    ", "Coverage", coverageSeverity, color, fmt.Sprintf("%d/%d process(es) checked%s%d skipped (permission)%s%d total reference(s)", df.ProcessesScanned, eligible, separator, df.ProcessesSkipped, separator, df.TotalReferences))
 				if df.LargestHolderBytes > 0 {
 					label := df.LargestHolderCommand
 					if label == "" {

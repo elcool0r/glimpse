@@ -30,11 +30,12 @@ func memoryBacklogFindings(memory *model.Memory, pressure *model.Pressure) []mod
 		return nil
 	}
 	var findings []model.Finding
-	if memory.Swappiness != nil && *memory.Swappiness >= 80 && memory.AvailableFraction < .10 && (memory.SwapInBytes > 0 || pressure != nil && pressure.Memory.SomeAvg10 >= 1) {
+	if memoryAvailable(memory) && memory.Swappiness != nil && *memory.Swappiness >= 80 && memory.AvailableFraction < .10 && (memory.SwapInBytes > 0 || pressure != nil && pressure.Memory.SomeAvg10 >= 1) {
 		findings = append(findings, finding("memory-swappiness", model.SeverityInfo, "memory", "High swappiness during memory pressure", fmt.Sprintf("vm.swappiness is %d while MemAvailable is %.1f%% and swap or memory pressure was observed.", *memory.Swappiness, memory.AvailableFraction*100), "Review swappiness alongside workload latency and memory policy before changing it.", 0))
 	}
-	if memory.PageFaults >= 100000 && memory.MajorFaults >= 1000 && memory.AvailableFraction < .15 {
-		findings = append(findings, finding("memory-fault-pressure", model.SeverityWarning, "memory", "Memory fault pressure observed", fmt.Sprintf("The sample recorded %d page faults and %d major faults while only %.1f%% of memory was available.", memory.PageFaults, memory.MajorFaults, memory.AvailableFraction*100), "Inspect memory pressure, swap activity, and the largest memory consumers.", 8))
+	if memoryAvailable(memory) && memory.PageFaults >= 100000 && memory.MajorFaults >= 1000 && memory.AvailableFraction < .15 {
+		cmd := "ps aux --sort=-%mem | head -11 && vmstat 1 3 | tail -2"
+		findings = append(findings, findingWithDiagnostic("memory-fault-pressure", model.SeverityWarning, "memory", "Memory fault pressure observed", fmt.Sprintf("The sample recorded %d page faults and %d major faults while only %.1f%% of memory was available.", memory.PageFaults, memory.MajorFaults, memory.AvailableFraction*100), "Inspect memory pressure, swap activity, and the largest memory consumers.", cmd, 8))
 	}
 	return findings
 }
@@ -44,7 +45,7 @@ func storageBacklogFindings(raids []model.SoftwareRAID, lvm *model.LVM, mounts [
 	for _, raid := range raids {
 		state := strings.ToLower(strings.TrimSpace(raid.State))
 		if state != "active" && state != "clean" {
-			findings = append(findings, finding("raid-"+raid.Device, model.SeverityCritical, "storage", "Software RAID is degraded", fmt.Sprintf("%s reports state %s.", raid.Device, raid.State), "Inspect /proc/mdstat and repair or replace the affected member devices.", 25))
+			findings = append(findings, findingWithDiagnostic("raid-"+raid.Device, model.SeverityCritical, "storage", "Software RAID is degraded", fmt.Sprintf("%s reports state %s.", raid.Device, raid.State), "Inspect /proc/mdstat and repair or replace the affected member devices.", "cat /proc/mdstat", 25))
 		} else if raid.ResyncProgress != "" {
 			findings = append(findings, finding("raid-resync-"+raid.Device, model.SeverityInfo, "storage", "Software RAID is rebuilding", fmt.Sprintf("%s has an active recovery or resync operation.", raid.Device), "Allow the rebuild to finish and verify the array returns to a clean state.", 0))
 		}
@@ -54,12 +55,14 @@ func storageBacklogFindings(raids []model.SoftwareRAID, lvm *model.LVM, mounts [
 		// rendering both read its verdict, so there is one reading of them.
 		for _, vg := range lvm.VolumeGroups {
 			if vg.NeedsReview {
-				findings = append(findings, finding("lvm-vg-"+vg.Name, model.SeverityWarning, "storage", "LVM volume group needs review", fmt.Sprintf("Volume group %s is %s (attributes %q).", vg.Name, vg.ReviewReason, vg.Attr), "Inspect the volume group with vgs and verify it is writable and complete.", 12))
+				cmd := fmt.Sprintf("vgs -a %s 2>/dev/null", vg.Name)
+				findings = append(findings, findingWithDiagnostic("lvm-vg-"+vg.Name, model.SeverityWarning, "storage", "LVM volume group needs review", fmt.Sprintf("Volume group %s is %s (attributes %q).", vg.Name, vg.ReviewReason, vg.Attr), "Inspect the volume group with vgs and verify it is writable and complete.", cmd, 12))
 			}
 		}
 		for _, lv := range lvm.LogicalVolumes {
 			if lv.NeedsReview {
-				findings = append(findings, finding("lvm-lv-"+lv.Group+"-"+lv.Name, model.SeverityWarning, "storage", "LVM logical volume needs review", fmt.Sprintf("Logical volume %s/%s is %s (attributes %q).", lv.Group, lv.Name, lv.ReviewReason, lv.Attr), "Inspect the logical volume with lvs and verify it is active and complete.", 12))
+				cmd := fmt.Sprintf("lvs -a %s/%s 2>/dev/null", lv.Group, lv.Name)
+				findings = append(findings, findingWithDiagnostic("lvm-lv-"+lv.Group+"-"+lv.Name, model.SeverityWarning, "storage", "LVM logical volume needs review", fmt.Sprintf("Logical volume %s/%s is %s (attributes %q).", lv.Group, lv.Name, lv.ReviewReason, lv.Attr), "Inspect the logical volume with lvs and verify it is active and complete.", cmd, 12))
 			}
 		}
 	}
@@ -67,7 +70,8 @@ func storageBacklogFindings(raids []model.SoftwareRAID, lvm *model.LVM, mounts [
 		if !mount.ActiveKnown || mount.Active || mountHasOption(mount, "nofail") || mountHasOption(mount, "noauto") {
 			continue
 		}
-		findings = append(findings, finding("mount-missing-"+mount.MountPoint, model.SeverityWarning, "storage", "Persistent mount is unavailable", fmt.Sprintf("%s is listed in /etc/fstab but is not currently mounted.", mount.MountPoint), "Verify the device, filesystem, and intended mount policy before mounting it.", 10))
+		cmd := fmt.Sprintf("cat /etc/fstab | grep %s && lsblk", mount.MountPoint)
+		findings = append(findings, findingWithDiagnostic("mount-missing-"+mount.MountPoint, model.SeverityWarning, "storage", "Persistent mount is unavailable", fmt.Sprintf("%s is listed in /etc/fstab but is not currently mounted.", mount.MountPoint), "Verify the device, filesystem, and intended mount policy before mounting it.", cmd, 10))
 	}
 	return findings
 }
@@ -100,16 +104,20 @@ func securityBacklogFindings(s *model.Security) []model.Finding {
 		if *s.FailedAuthAttempts >= failedAuthWarning {
 			severity, impact = model.SeverityWarning, 8
 		}
-		findings = append(findings, finding("security-failed-auth", severity, "security", "Failed authentication attempts", fmt.Sprintf("The authentication journal for %s contains %d failed authentication event(s).", window, *s.FailedAuthAttempts), "Review source addresses, exposed services, and authentication policy in the system journal.", impact))
+		cmd := "journalctl SYSLOG_IDENTIFIER=sshd PRIORITY=3..5 --since '24 hours ago' 2>/dev/null | grep -E 'Invalid|Failed|Denied'"
+		findings = append(findings, findingWithDiagnostic("security-failed-auth", severity, "security", "Failed authentication attempts", fmt.Sprintf("The authentication journal for %s contains %d failed authentication event(s).", window, *s.FailedAuthAttempts), "Review source addresses, exposed services, and authentication policy in the system journal.", cmd, impact))
 	}
 	if s.SELinuxDenials != nil && *s.SELinuxDenials > 0 {
-		findings = append(findings, finding("security-selinux-denials", model.SeverityWarning, "security", "SELinux denials observed", fmt.Sprintf("The kernel journal for %s contains %d SELinux denial event(s).", window, *s.SELinuxDenials), "Review the denied operation and policy before changing enforcement mode.", 8))
+		cmd := "journalctl --since '24 hours ago' 2>/dev/null | grep -i 'selinux.*denied'"
+		findings = append(findings, findingWithDiagnostic("security-selinux-denials", model.SeverityWarning, "security", "SELinux denials observed", fmt.Sprintf("The kernel journal for %s contains %d SELinux denial event(s).", window, *s.SELinuxDenials), "Review the denied operation and policy before changing enforcement mode.", cmd, 8))
 	}
 	if s.AppArmorDenials != nil && *s.AppArmorDenials > 0 {
-		findings = append(findings, finding("security-apparmor-denials", model.SeverityWarning, "security", "AppArmor denials observed", fmt.Sprintf("The kernel journal for %s contains %d AppArmor denial event(s).", window, *s.AppArmorDenials), "Review the affected profile and denied operation before changing policy.", 8))
+		cmd := "journalctl --since '24 hours ago' 2>/dev/null | grep -i 'apparmor.*denied'"
+		findings = append(findings, findingWithDiagnostic("security-apparmor-denials", model.SeverityWarning, "security", "AppArmor denials observed", fmt.Sprintf("The kernel journal for %s contains %d AppArmor denial event(s).", window, *s.AppArmorDenials), "Review the affected profile and denied operation before changing policy.", cmd, 8))
 	}
 	if s.CoreDumps != nil && *s.CoreDumps > 0 {
-		findings = append(findings, finding("security-core-dumps", model.SeverityWarning, "security", "Recent core dumps found", fmt.Sprintf("The recent crash window contains %d core dump(s).", *s.CoreDumps), "Inspect coredumpctl and the affected service stack for the root cause.", 10))
+		cmd := "coredumpctl list --since '24 hours ago' 2>/dev/null"
+		findings = append(findings, findingWithDiagnostic("security-core-dumps", model.SeverityWarning, "security", "Recent core dumps found", fmt.Sprintf("The recent crash window contains %d core dump(s).", *s.CoreDumps), "Inspect coredumpctl and the affected service stack for the root cause.", cmd, 10))
 	}
 	if len(s.CrashArtifacts) > 0 {
 		// /var/crash is an unbounded directory that nothing clears on its own.
@@ -144,18 +152,20 @@ func dnsFindings(state *model.NetworkState, systemd *model.Systemd) []model.Find
 	}
 	dns := state.DNS
 	if len(dns.Nameservers) == 0 {
-		return []model.Finding{finding("dns-no-nameserver", model.SeverityWarning, "network", "No DNS nameserver configured",
+		cmd := "cat /etc/resolv.conf && resolvectl status 2>/dev/null | head -10"
+		return []model.Finding{findingWithDiagnostic("dns-no-nameserver", model.SeverityWarning, "network", "No DNS nameserver configured",
 			"The resolver configuration lists no nameserver, so name resolution can only use static entries.",
-			"Confirm that this host resolves names through /etc/hosts by design, or restore the expected nameserver configuration.", 12)}
+			"Confirm that this host resolves names through /etc/hosts by design, or restore the expected nameserver configuration.", cmd, 12)}
 	}
 	// Pointing only at the stub delegates all resolution to systemd-resolved.
 	// That is a normal arrangement on its own, so it is reported only when the
 	// service it depends on has actually failed -- then DNS is provably broken
 	// rather than merely dependent.
 	if dns.StubResolver && systemd != nil && systemd.Available && resolvedFailed(systemd.FailedUnits) {
-		return []model.Finding{finding("dns-stub-resolver-failed", model.SeverityCritical, "network", "DNS stub resolver is configured but its service failed",
+		cmd := "systemctl status systemd-resolved && resolvectl status 2>/dev/null"
+		return []model.Finding{findingWithDiagnostic("dns-stub-resolver-failed", model.SeverityCritical, "network", "DNS stub resolver is configured but its service failed",
 			"Every configured nameserver is the local systemd-resolved stub, and systemd-resolved is in a failed state.",
-			"Inspect systemd-resolved and restart it; until it runs, this host cannot resolve names.", 20)}
+			"Inspect systemd-resolved and restart it; until it runs, this host cannot resolve names.", cmd, 20)}
 	}
 	return nil
 }
@@ -183,16 +193,19 @@ func dnsResolutionFindings(resolution *model.DNSResolution) []model.Finding {
 		if localAttempted {
 			detail = fmt.Sprintf("Resolving %s failed against both the local nameserver (%s) and the external resolver (%s).", resolution.Local.Domain, resolution.Local.Server, resolution.External.Server)
 		}
-		return []model.Finding{finding("dns-resolution-failed", model.SeverityCritical, "network", "DNS resolution is not working",
-			detail, "Inspect the resolver configuration, local DNS service, and network path to any DNS server.", 25)}
+		cmd := fmt.Sprintf("dig @%s %s +short || getent hosts %s", resolution.External.Server, resolution.External.Domain, resolution.External.Domain)
+		return []model.Finding{findingWithDiagnostic("dns-resolution-failed", model.SeverityCritical, "network", "DNS resolution is not working",
+			detail, "Inspect the resolver configuration, local DNS service, and network path to any DNS server.", cmd, 25)}
 	case localAttempted && !localOK:
-		return []model.Finding{finding("dns-resolution-local-failed", model.SeverityWarning, "network", "Local DNS server is not resolving names",
+		cmd := fmt.Sprintf("dig @%s %s +short", resolution.Local.Server, resolution.Local.Domain)
+		return []model.Finding{findingWithDiagnostic("dns-resolution-local-failed", model.SeverityWarning, "network", "Local DNS server is not resolving names",
 			fmt.Sprintf("Resolving %s against the configured nameserver (%s) failed, but the same query succeeded against %s.", resolution.Local.Domain, resolution.Local.Server, resolution.External.Server),
-			"Inspect the local DNS server or forwarder; clients depending on it cannot resolve names.", 15)}
+			"Inspect the local DNS server or forwarder; clients depending on it cannot resolve names.", cmd, 15)}
 	case externalAttempted && !externalOK:
-		return []model.Finding{finding("dns-resolution-external-failed", model.SeverityInfo, "network", "External DNS server unreachable",
+		cmd := fmt.Sprintf("dig @%s %s +short", resolution.External.Server, resolution.External.Domain)
+		return []model.Finding{findingWithDiagnostic("dns-resolution-external-failed", model.SeverityInfo, "network", "External DNS server unreachable",
 			fmt.Sprintf("Resolving %s against %s failed, though the configured nameserver resolves it. This tests direct DNS access to that external resolver only.", resolution.External.Domain, resolution.External.Server),
-			"Confirm whether direct DNS to this resolver is intentionally restricted; if not, inspect the network path and firewall rules for UDP/TCP 53.", 0)}
+			"Confirm whether direct DNS to this resolver is intentionally restricted; if not, inspect the network path and firewall rules for UDP/TCP 53.", cmd, 0)}
 	}
 	return dnsLatencyFindings(resolution)
 }
@@ -254,24 +267,27 @@ func gatewayFindings(check *model.GatewayCheck) []model.Finding {
 		return nil
 	}
 	if check.Received == 0 {
-		return []model.Finding{finding("gateway-unreachable", model.SeverityCritical, "network", "Default gateway is not responding",
+		cmd := fmt.Sprintf("ip route show | grep default && ping -c 5 %s", check.Gateway)
+		return []model.Finding{findingWithDiagnostic("gateway-unreachable", model.SeverityCritical, "network", "Default gateway is not responding",
 			fmt.Sprintf("All %d ICMP echo requests to the default gateway (%s) went unanswered.", check.Sent, check.Gateway),
-			"Inspect the local network link, switch/router, and default gateway configuration.", 20)}
+			"Inspect the local network link, switch/router, and default gateway configuration.", cmd, 20)}
 	}
 	var findings []model.Finding
 	if check.PacketLossPct >= 50 {
-		findings = append(findings, finding("gateway-packet-loss", model.SeverityWarning, "network", "Default gateway is dropping pings",
+		cmd := fmt.Sprintf("mtr -c 10 %s 2>/dev/null || ping -c 10 %s", check.Gateway, check.Gateway)
+		findings = append(findings, findingWithDiagnostic("gateway-packet-loss", model.SeverityWarning, "network", "Default gateway is dropping pings",
 			fmt.Sprintf("%.0f%% of ICMP echo requests to the default gateway (%s) were lost (%d of %d).", check.PacketLossPct, check.Gateway, check.Sent-check.Received, check.Sent),
-			"Inspect the local network link and gateway health.", 10))
+			"Inspect the local network link and gateway health.", cmd, 10))
 	}
 	if check.AvgLatencyMillis >= gatewayLatencyWarningMillis {
 		severity, impact := model.SeverityWarning, 8
 		if check.AvgLatencyMillis >= gatewayLatencyCriticalMillis {
 			severity, impact = model.SeverityCritical, 15
 		}
-		findings = append(findings, finding("gateway-high-latency", severity, "network", "Default gateway latency is elevated",
+		cmd := fmt.Sprintf("ping -c 5 %s && mtr -c 10 %s 2>/dev/null", check.Gateway, check.Gateway)
+		findings = append(findings, findingWithDiagnostic("gateway-high-latency", severity, "network", "Default gateway latency is elevated",
 			fmt.Sprintf("Average round-trip time to the default gateway (%s) was %.0f ms during the sample; a local, same-segment gateway is normally single-digit milliseconds.", check.Gateway, check.AvgLatencyMillis),
-			"Inspect local link saturation, duplex/speed mismatches, and traffic shaping on the path to the gateway.", impact))
+			"Inspect local link saturation, duplex/speed mismatches, and traffic shaping on the path to the gateway.", cmd, impact))
 	}
 	return findings
 }
@@ -322,17 +338,20 @@ func httpCheckFindings(check *model.HTTPCheck) []model.Finding {
 	httpsFailed := check.HTTPS != nil && !check.HTTPS.Succeeded
 	switch {
 	case httpFailed && httpsFailed:
-		findings = append(findings, finding("http-check-failed", model.SeverityWarning, "network", "HTTP and HTTPS requests are both failing",
+		cmd := fmt.Sprintf("curl -Iv %s && curl -Iv %s", check.HTTP.URL, check.HTTPS.URL)
+		findings = append(findings, findingWithDiagnostic("http-check-failed", model.SeverityWarning, "network", "HTTP and HTTPS requests are both failing",
 			fmt.Sprintf("A GET to %s failed (%s) and a GET to %s failed (%s).", check.HTTP.URL, check.HTTP.Error, check.HTTPS.URL, check.HTTPS.Error),
-			"Confirm proxy policy and reachability, or inspect firewall and routing policy for direct checks.", 8))
+			"Confirm proxy policy and reachability, or inspect firewall and routing policy for direct checks.", cmd, 8))
 	case httpsFailed:
-		findings = append(findings, finding("https-check-failed", model.SeverityWarning, "network", "HTTPS request failed while HTTP succeeded",
+		cmd := fmt.Sprintf("curl -Iv %s", check.HTTPS.URL)
+		findings = append(findings, findingWithDiagnostic("https-check-failed", model.SeverityWarning, "network", "HTTPS request failed while HTTP succeeded",
 			fmt.Sprintf("A GET to %s failed: %s", check.HTTPS.URL, check.HTTPS.Error),
-			"Inspect TLS interception, certificate trust, or firewalling of port 443 specifically.", 8))
+			"Inspect TLS interception, certificate trust, or firewalling of port 443 specifically.", cmd, 8))
 	case httpFailed:
-		findings = append(findings, finding("http-check-http-failed", model.SeverityWarning, "network", "HTTP request failed while HTTPS succeeded",
+		cmd := fmt.Sprintf("curl -Iv %s", check.HTTP.URL)
+		findings = append(findings, findingWithDiagnostic("http-check-http-failed", model.SeverityWarning, "network", "HTTP request failed while HTTPS succeeded",
 			fmt.Sprintf("A GET to %s failed: %s", check.HTTP.URL, check.HTTP.Error),
-			"This is unusual since HTTPS succeeded; inspect port 80 filtering specifically.", 8))
+			"This is unusual since HTTPS succeeded; inspect port 80 filtering specifically.", cmd, 8))
 	}
 	return findings
 }

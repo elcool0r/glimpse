@@ -38,19 +38,33 @@ func TestDeltaImplementationsPreserveFinalObservation(t *testing.T) {
 			name:    "disk",
 			sampler: disk.Collector{},
 			final:   mustCollect(t, disk.Collector{}),
-			check:   func(d collect.Data) bool { return d.Disks != nil },
+			check: func(d collect.Data) bool {
+				for _, disk := range d.Disks {
+					if disk.Sampled == nil || *disk.Sampled {
+						return false
+					}
+				}
+				return d.Disks != nil
+			},
 		},
 		{
 			name:    "network",
 			sampler: network.Collector{},
 			final:   mustCollect(t, network.Collector{}),
-			check:   func(d collect.Data) bool { return d.Network != nil },
+			check: func(d collect.Data) bool {
+				for _, iface := range d.Network {
+					if iface.Sampled == nil || *iface.Sampled {
+						return false
+					}
+				}
+				return d.Network != nil
+			},
 		},
 		{
 			name:    "tcp",
 			sampler: network.TCPCollector{},
 			final:   mustCollect(t, network.TCPCollector{}),
-			check:   func(d collect.Data) bool { return d.TCP != nil },
+			check:   func(d collect.Data) bool { return d.TCP != nil && d.TCP.Sampled != nil && !*d.TCP.Sampled },
 		},
 		{
 			name:    "processes",

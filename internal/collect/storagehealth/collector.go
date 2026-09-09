@@ -80,7 +80,7 @@ func (c *Collector) Collect(parent context.Context) (collect.Data, error) {
 	if len(devices) == 0 {
 		// Virtual-only hosts have no vendor SMART/NVMe device to query. Keep this
 		// optional check silent instead of reporting missing utilities as a fault.
-		return collect.Data{DeviceHealth: []model.DeviceHealth{}}, nil
+		return collect.Data{DeviceHealth: []model.DeviceHealth{}, DeviceHealthCoverage: &model.DeviceHealthCoverage{}}, nil
 	}
 	lookup := c.lookPath
 	if lookup == nil {
@@ -89,7 +89,11 @@ func (c *Collector) Collect(parent context.Context) (collect.Data, error) {
 	smartctl, _ := lookup("smartctl")
 	nvme, _ := lookup("nvme")
 	if smartctl == "" && nvme == "" {
-		return collect.Data{DeviceHealth: []model.DeviceHealth{}, Diagnostics: []model.CollectionStatus{{Collector: c.Name(), Status: "unavailable", Detail: "smartctl and nvme commands are unavailable"}}}, nil
+		return collect.Data{
+			DeviceHealth:         []model.DeviceHealth{},
+			DeviceHealthCoverage: &model.DeviceHealthCoverage{DevicesEligible: len(devices), Limited: true, Reason: "SMART/NVMe tools unavailable"},
+			Diagnostics:          []model.CollectionStatus{{Collector: c.Name(), Status: "unavailable", Detail: "smartctl and nvme commands are unavailable"}},
+		}, nil
 	}
 	timeout := c.Timeout
 	if timeout <= 0 {
@@ -141,12 +145,19 @@ func (c *Collector) Collect(parent context.Context) (collect.Data, error) {
 			diagnostics = append(diagnostics, *o.diagnostic)
 		}
 	}
+	coverage := &model.DeviceHealthCoverage{DevicesEligible: len(devices), DevicesChecked: len(result)}
 	if len(skipped) > 0 {
+		coverage.Limited = true
+		coverage.Reason = "scan deadline"
 		diagnostics = append(diagnostics, model.CollectionStatus{Collector: c.Name(), Status: "unavailable",
 			Detail: fmt.Sprintf("device scan deadline reached; %d of %d devices were not checked: %s", len(skipped), len(devices), strings.Join(skipped, ", "))})
 	}
+	if len(diagnostics) > 0 && !coverage.Limited {
+		coverage.Limited = true
+		coverage.Reason = "device health unavailable"
+	}
 	sort.Slice(result, func(i, j int) bool { return result[i].Device < result[j].Device })
-	return collect.Data{DeviceHealth: result, Diagnostics: diagnostics}, nil
+	return collect.Data{DeviceHealth: result, DeviceHealthCoverage: coverage, Diagnostics: diagnostics}, nil
 }
 
 // probeResult is one device outcome: the health facts, or the reason there

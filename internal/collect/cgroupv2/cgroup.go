@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -99,6 +100,13 @@ func (c *Collector) Collect(ctx context.Context) (collect.Data, error) {
 	setLimit("memory.swap.max", &s.metric.MemorySwapMaxBytes, &s.metric.MemorySwapMaxValid)
 	setUint("pids.current", &s.metric.PIDsCurrent, &s.metric.PIDsCurrentValid)
 	setLimit("pids.max", &s.metric.PIDsMax, &s.metric.PIDsMaxValid)
+	pressure, ok, err := readMemoryPressure(read, filepath.Join(dir, "memory.pressure"))
+	s.metric.MemoryPressureValid = boolPtr(ok)
+	if ok {
+		s.metric.MemoryPressure = &pressure
+	} else {
+		add("memory.pressure", err)
+	}
 	memEvents, ok, err := readRequired(read, filepath.Join(dir, "memory.events"), "oom", "oom_kill")
 	s.metric.MemoryEventsSampled = boolPtr(ok)
 	if ok {
@@ -252,6 +260,75 @@ func readRequired(read func(string) ([]byte, error), name string, required ...st
 		}
 	}
 	return values, true, nil
+}
+
+// readMemoryPressure accepts the cgroup-v2 PSI format and retains the local
+// some/full averages in the shared model representation. A missing or
+// malformed local file is explicitly invalid rather than host PSI fallback.
+func readMemoryPressure(read func(string) ([]byte, error), name string) (model.PressureResource, bool, error) {
+	text, _, err := readText(read, name)
+	if err != nil {
+		return model.PressureResource{}, false, err
+	}
+	var out model.PressureResource
+	haveSome := false
+	for _, line := range strings.Split(text, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		if len(fields) != 5 || (fields[0] != "some" && fields[0] != "full") {
+			return model.PressureResource{}, false, fmt.Errorf("malformed pressure line")
+		}
+		var avg10 float64
+		seen := map[string]bool{}
+		for _, field := range fields[1:] {
+			key, value, found := strings.Cut(field, "=")
+			if !found {
+				return model.PressureResource{}, false, fmt.Errorf("malformed pressure field")
+			}
+			switch key {
+			case "avg10":
+				if seen[key] {
+					return model.PressureResource{}, false, fmt.Errorf("duplicate pressure %s", key)
+				}
+				avg10, err = strconv.ParseFloat(value, 64)
+				if err != nil || math.IsNaN(avg10) || math.IsInf(avg10, 0) || avg10 < 0 {
+					return model.PressureResource{}, false, fmt.Errorf("malformed pressure avg10")
+				}
+			case "avg60", "avg300":
+				if seen[key] {
+					return model.PressureResource{}, false, fmt.Errorf("duplicate pressure %s", key)
+				}
+				v, parseErr := strconv.ParseFloat(value, 64)
+				if parseErr != nil || math.IsNaN(v) || math.IsInf(v, 0) || v < 0 {
+					return model.PressureResource{}, false, fmt.Errorf("malformed pressure %s", key)
+				}
+			case "total":
+				if seen[key] {
+					return model.PressureResource{}, false, fmt.Errorf("duplicate pressure %s", key)
+				}
+				if _, parseErr := strconv.ParseUint(value, 10, 64); parseErr != nil {
+					return model.PressureResource{}, false, fmt.Errorf("malformed pressure total")
+				}
+			default:
+				return model.PressureResource{}, false, fmt.Errorf("unknown pressure field %s", key)
+			}
+			seen[key] = true
+		}
+		if !seen["avg10"] || !seen["avg60"] || !seen["avg300"] || !seen["total"] {
+			return model.PressureResource{}, false, fmt.Errorf("missing pressure field")
+		}
+		if fields[0] == "some" {
+			out.SomeAvg10, haveSome = avg10, true
+		} else {
+			out.FullAvg10 = avg10
+		}
+	}
+	if !haveSome {
+		return model.PressureResource{}, false, fmt.Errorf("missing pressure some line")
+	}
+	return out, true, nil
 }
 func contains(items []string, want string) bool {
 	for _, item := range items {

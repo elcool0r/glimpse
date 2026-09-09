@@ -2,6 +2,7 @@ package disk
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -137,8 +138,41 @@ func TestCollectorDelta(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(data.Disks) != 1 || data.Disks[0].Utilization != .05 || data.Disks[0].AverageQueueDepth != .1 || data.Disks[0].ReadBytes != 2048 {
+	if len(data.Disks) != 1 || data.Disks[0].Sampled == nil || !*data.Disks[0].Sampled || data.Disks[0].Utilization != .05 || data.Disks[0].AverageQueueDepth != .1 || data.Disks[0].ReadBytes != 2048 {
 		t.Fatalf("unexpected disk model: %#v", data.Disks)
+	}
+}
+
+func TestCollectorDeltaWithoutBaselineKeepsFinalGaugesMarkedUnsampled(t *testing.T) {
+	last := Snapshot{Devices: []Device{{Name: "vda", Major: 252, Counters: Counters{InFlight: 3}}}}
+	data, err := (Collector{}).Delta(collect.Data{}, collect.Data{Snapshot: last})
+	if err == nil {
+		t.Fatal("expected missing baseline error")
+	}
+	if len(data.Disks) != 1 || data.Disks[0].Sampled == nil || *data.Disks[0].Sampled || data.Disks[0].Name != "vda" || data.Disks[0].InFlight != 3 {
+		t.Fatalf("final gauges were not retained as unsampled: %#v", data.Disks)
+	}
+	encoded, err := json.Marshal(data.Disks[0])
+	if err != nil || !strings.Contains(string(encoded), `"sampled":false`) {
+		t.Fatalf("unsampled disk JSON = %s, err = %v", encoded, err)
+	}
+}
+
+func TestCollectorDeltaRejectsInvalidSamplingIntervalAndKeepsNewDevice(t *testing.T) {
+	first := Snapshot{At: time.Unix(10, 0), Devices: []Device{{Name: "vda", Major: 252}}}
+	last := Snapshot{At: time.Unix(10, 0), Devices: []Device{{Name: "vdb", Major: 252, Minor: 16, Counters: Counters{InFlight: 2}}}}
+	data, err := (Collector{}).Delta(collect.Data{Snapshot: first}, collect.Data{Snapshot: last})
+	if err == nil || len(data.Disks) != 1 || data.Disks[0].Sampled == nil || *data.Disks[0].Sampled || data.Disks[0].Name != "vdb" || data.Disks[0].InFlight != 2 {
+		t.Fatalf("invalid interval was reported as sampled: data=%#v err=%v", data, err)
+	}
+}
+
+func TestCollectorDeltaKeepsNewDeviceAsUnsampled(t *testing.T) {
+	first := Snapshot{At: time.Unix(10, 0), Devices: []Device{{Name: "vda", Major: 252}}}
+	last := Snapshot{At: time.Unix(12, 0), Devices: []Device{{Name: "vda", Major: 252}, {Name: "vdb", Major: 252, Minor: 16, Counters: Counters{InFlight: 2}}}}
+	data, err := (Collector{}).Delta(collect.Data{Snapshot: first}, collect.Data{Snapshot: last})
+	if err != nil || len(data.Disks) != 2 || data.Disks[1].Sampled == nil || *data.Disks[1].Sampled || data.Disks[1].Name != "vdb" || data.Disks[1].InFlight != 2 {
+		t.Fatalf("new final device was not retained as unsampled: data=%#v err=%v", data, err)
 	}
 }
 

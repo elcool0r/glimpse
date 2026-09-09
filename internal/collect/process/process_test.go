@@ -1,10 +1,29 @@
 package process
 
 import (
+	"context"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/elcool0r/glimpse/internal/collect"
 )
+
+func TestCollectStampsSuccessfulSnapshot(t *testing.T) {
+	procRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(procRoot, "stat"), []byte("cpu 1 2 3 4 5 6 7 8\ncpu0 1 2 3 4 5 6 7 8\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	snapshot, err := Collect(context.Background(), procRoot, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.At.Before(started) || snapshot.At.After(time.Now()) {
+		t.Fatalf("snapshot timestamp %s is outside collection interval", snapshot.At)
+	}
+}
 
 func TestParseStatWithParentheses(t *testing.T) {
 	// Fields after ')' begin with state, then ppid. utime/stime are indexes 11/12, threads 17, rss 21.
@@ -69,17 +88,15 @@ func TestZombiesIncludeParentIdentity(t *testing.T) {
 	}
 }
 
-// A process in D state at only one boundary is common and usually transient
-// (a brief disk wait); it must not be reported as stuck.
-func TestStuckInDRequiresBothBoundaries(t *testing.T) {
+func TestEndpointDStateRequiresBothBoundaries(t *testing.T) {
 	before := []Process{{PID: 20, Name: "reader", State: 'D', StartTimeTicks: 5}}
 	after := []Process{{PID: 20, Name: "reader", State: 'R', StartTimeTicks: 5}}
-	if got := stuckInD(before, after, 10); len(got) != 0 {
-		t.Fatalf("expected no stuck processes for a one-boundary D state, got %#v", got)
+	if got := endpointDStateProcesses(before, after, 10); len(got) != 0 {
+		t.Fatalf("expected no match for a one-boundary D state, got %#v", got)
 	}
 }
 
-func TestStuckInDReportsProcessBlockedAcrossTheWholeWindow(t *testing.T) {
+func TestEndpointDStateReportsMatchingIdentityAtBothBoundaries(t *testing.T) {
 	before := []Process{
 		{PID: 1, Name: "supervisor"},
 		{PID: 20, ParentPID: 1, Name: "reader", State: 'D', StartTimeTicks: 5},
@@ -88,18 +105,46 @@ func TestStuckInDReportsProcessBlockedAcrossTheWholeWindow(t *testing.T) {
 		{PID: 1, Name: "supervisor"},
 		{PID: 20, ParentPID: 1, Name: "reader", State: 'D', StartTimeTicks: 5},
 	}
-	got := stuckInD(before, after, 10)
+	got := endpointDStateProcesses(before, after, 10)
 	if len(got) != 1 || got[0].PID != 20 || got[0].ParentPID != 1 || got[0].ParentCommand != "supervisor" || got[0].State != "D" {
-		t.Fatalf("unexpected stuck processes: %#v", got)
+		t.Fatalf("unexpected endpoint matches: %#v", got)
 	}
 }
 
-// A PID reused by an unrelated process must not be mistaken for the same
-// process having stayed blocked.
-func TestStuckInDRejectsPIDReuse(t *testing.T) {
+func TestEndpointDStateRejectsPIDReuse(t *testing.T) {
 	before := []Process{{PID: 20, Name: "reader", State: 'D', StartTimeTicks: 5}}
 	after := []Process{{PID: 20, Name: "unrelated", State: 'D', StartTimeTicks: 99}}
-	if got := stuckInD(before, after, 10); len(got) != 0 {
+	if got := endpointDStateProcesses(before, after, 10); len(got) != 0 {
 		t.Fatalf("expected reused PID to be rejected, got %#v", got)
+	}
+}
+
+func TestDeltaRequiresMinimumDStateObservationInterval(t *testing.T) {
+	start := time.Unix(100, 0)
+	processes := []Process{{PID: 20, Name: "reader", State: 'D', StartTimeTicks: 5}}
+	tests := []struct {
+		name  string
+		start time.Time
+		end   time.Time
+		want  int
+	}{
+		{name: "unset timestamps", want: 0},
+		{name: "zero interval", start: start, end: start, want: 0},
+		{name: "reversed timestamps", start: start, end: start.Add(-minimumDStateObservationInterval), want: 0},
+		{name: "just below minimum", start: start, end: start.Add(minimumDStateObservationInterval - time.Nanosecond), want: 0},
+		{name: "at minimum", start: start, end: start.Add(minimumDStateObservationInterval), want: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			first := Snapshot{At: tt.start, all: processes}
+			last := Snapshot{At: tt.end, all: processes}
+			data, err := (Collector{}).Delta(collect.Data{Snapshot: first}, collect.Data{Snapshot: last})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := len(data.Processes.StuckProcesses); got != tt.want {
+				t.Fatalf("endpoint matches=%d, want %d", got, tt.want)
+			}
+		})
 	}
 }

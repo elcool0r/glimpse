@@ -19,12 +19,19 @@ import (
 // the other boundary — or the sampling window — impossible to complete.
 const DefaultBoundaryTimeout = 30 * time.Second
 
+// DefaultObservationTimeout bounds one intermediate trend observation. The
+// effective timeout is also capped by the remaining sample window.
+const DefaultObservationTimeout = time.Second
+
 type Config struct {
 	Duration       time.Duration
 	SampleInterval time.Duration
 	// BoundaryTimeout bounds optional command work at each collection
 	// boundary. A zero value uses DefaultBoundaryTimeout.
 	BoundaryTimeout time.Duration
+	// ObservationTimeout bounds each intermediate trend observation. A zero
+	// value uses DefaultObservationTimeout.
+	ObservationTimeout time.Duration
 	// Progress receives lifecycle updates synchronously from the coordinating
 	// goroutine. Callers that emit machine-readable output should leave it nil.
 	Progress func(Progress)
@@ -55,18 +62,24 @@ func Run(ctx context.Context, config Config, collectors []collect.Collector) mod
 	if boundary <= 0 {
 		boundary = DefaultBoundaryTimeout
 	}
+	observation := config.ObservationTimeout
+	if observation <= 0 {
+		observation = DefaultObservationTimeout
+	}
 	started := time.Now()
 	emitProgress(config, Progress{Phase: "baseline", Duration: config.Duration, Collectors: len(collectors)})
 	// Static collectors expose gauges, not counter boundaries; merge only reads
 	// their final observation, so collecting them here would be pure cost.
-	first, firstStatus := collectBoundary(ctx, collectors, boundary, skipStatic)
+	excluded := make([]bool, len(collectors))
+	first, firstStatus := collectBoundary(ctx, collectors, boundary, skipStatic, excluded)
 	samplingStarted := time.Now()
-	intermediate, sampledStatus := sampleTrends(ctx, config, collectors, samplingStarted)
+	sampleDeadline := samplingStarted.Add(config.Duration)
+	intermediate, sampledStatus := sampleTrends(ctx, config, collectors, samplingStarted, sampleDeadline, observation, excluded)
 	emitProgress(config, Progress{Phase: "final", Elapsed: time.Since(started), Duration: config.Duration, Collectors: len(collectors)})
-	last, lastStatus := collectBoundary(ctx, collectors, boundary, collectEvery)
+	last, lastStatus := collectBoundary(ctx, collectors, boundary, collectEvery, excluded)
 	samplingEnded := time.Now()
-	metrics, deltaStatus := merge(collectors, first, last)
-	metrics.Trends = buildTrends(collectors, append(append([][]collect.Data{first}, intermediate...), last))
+	metrics, deltaStatus := merge(collectors, first, last, excluded)
+	metrics.Trends = buildTrends(collectors, append(append([][]collect.Data{first}, intermediate...), last), excluded)
 	statuses := append(firstStatus, sampledStatus...)
 	statuses = append(statuses, lastStatus...)
 	statuses = append(statuses, deltaStatus...)
@@ -88,6 +101,12 @@ func Run(ctx context.Context, config Config, collectors []collect.Collector) mod
 		SampleDurationSeconds: samplingEnded.Sub(samplingStarted).Seconds(),
 		Host:                  platform.Host(), Metrics: metrics, Findings: make([]model.Finding, 0), Collection: statuses,
 	}
+	// runtime.NumCPU may reflect the process's affinity or cpuset. CPU's
+	// count is derived from the same host-wide procfs population used for load
+	// and utilization, so it is the only valid normalizer for those signals.
+	if metrics.CPU != nil && metrics.CPU.HostCPUCount > 0 {
+		report.Host.CPUCount = metrics.CPU.HostCPUCount
+	}
 	report.Score = model.Score{Value: 100, Status: model.SeverityOK, Label: "EXCELLENT"}
 	emitProgress(config, Progress{Phase: "complete", Elapsed: time.Since(started), Duration: config.Duration, Collectors: len(collectors)})
 	return report
@@ -103,10 +122,12 @@ const (
 
 // collectBoundary runs one boundary under its own budget so a slow optional
 // integration cannot consume the time the rest of the report needs.
-func collectBoundary(parent context.Context, collectors []collect.Collector, budget time.Duration, mode boundaryMode) ([]collect.Data, []model.CollectionStatus) {
+func collectBoundary(parent context.Context, collectors []collect.Collector, budget time.Duration, mode boundaryMode, excluded []bool) ([]collect.Data, []model.CollectionStatus) {
 	ctx, cancel := context.WithTimeout(parent, budget)
 	defer cancel()
-	return collectAll(ctx, collectors, mode)
+	data, status, unfinished := collectAll(ctx, collectors, mode, excluded)
+	excludeUnfinished(excluded, unfinished)
+	return data, status
 }
 
 // staticCollector reports whether a collector's baseline observation is
@@ -126,7 +147,7 @@ func emitProgress(config Config, progress Progress) {
 	}
 }
 
-func sampleTrends(ctx context.Context, config Config, collectors []collect.Collector, started time.Time) ([][]collect.Data, []model.CollectionStatus) {
+func sampleTrends(ctx context.Context, config Config, collectors []collect.Collector, started, sampleDeadline time.Time, observationTimeout time.Duration, excluded []bool) ([][]collect.Data, []model.CollectionStatus) {
 	if config.Duration <= 0 {
 		return nil, nil
 	}
@@ -145,7 +166,7 @@ func sampleTrends(ctx context.Context, config Config, collectors []collect.Colle
 		}
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
-		deadline := time.NewTimer(config.Duration)
+		deadline := time.NewTimer(time.Until(sampleDeadline))
 		defer deadline.Stop()
 		for {
 			select {
@@ -169,7 +190,7 @@ func sampleTrends(ctx context.Context, config Config, collectors []collect.Colle
 	}
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-	deadline := time.NewTimer(config.Duration)
+	deadline := time.NewTimer(time.Until(sampleDeadline))
 	defer deadline.Stop()
 	var samples [][]collect.Data
 	var statuses []model.CollectionStatus
@@ -180,12 +201,23 @@ func sampleTrends(ctx context.Context, config Config, collectors []collect.Colle
 		case <-deadline.C:
 			return samples, statuses
 		case <-ticker.C:
-			elapsed := time.Since(started)
+			now := time.Now()
+			if !now.Before(sampleDeadline) {
+				return samples, statuses
+			}
+			elapsed := now.Sub(started)
 			if elapsed > config.Duration {
 				elapsed = config.Duration
 			}
 			emitProgress(config, Progress{Phase: "sampling", Elapsed: elapsed, Duration: config.Duration, Collectors: len(collectors)})
-			data, status := collectTrendAll(ctx, collectors)
+			observationDeadline := now.Add(observationTimeout)
+			if sampleDeadline.Before(observationDeadline) {
+				observationDeadline = sampleDeadline
+			}
+			observationCtx, cancel := context.WithDeadline(ctx, observationDeadline)
+			data, status, unfinished := collectTrendAll(observationCtx, collectors, excluded)
+			cancel()
+			excludeUnfinished(excluded, unfinished)
 			samples = append(samples, data)
 			statuses = append(statuses, status...)
 		}
@@ -194,36 +226,54 @@ func sampleTrends(ctx context.Context, config Config, collectors []collect.Colle
 
 // collectTrendAll retains the registered collector index, while avoiding
 // needless repeated reads or optional command execution for static checks.
-func collectTrendAll(ctx context.Context, collectors []collect.Collector) ([]collect.Data, []model.CollectionStatus) {
+func collectTrendAll(ctx context.Context, collectors []collect.Collector, excluded []bool) ([]collect.Data, []model.CollectionStatus, []bool) {
 	data := make([]collect.Data, len(collectors))
 	status := make([]model.CollectionStatus, len(collectors))
-	running := make([]bool, len(collectors))
-	results := make(chan collectionResult, len(collectors))
-	remaining := 0
+	selected := make([]bool, len(collectors))
 	for i, collector := range collectors {
+		if excluded[i] {
+			continue
+		}
 		if _, ok := collector.(collect.TrendCollector); !ok {
 			continue
 		}
+		selected[i] = true
+	}
+	results := make(chan collectionResult, countSelected(selected))
+	launched := make([]bool, len(collectors))
+	running := make([]bool, len(collectors))
+	remaining := 0
+	for i, collector := range collectors {
+		if !selected[i] {
+			continue
+		}
+		if ctx.Err() != nil {
+			break
+		}
+		launched[i] = true
 		running[i] = true
 		remaining++
 		go func(i int, collector collect.Collector) {
 			data, err := collector.Collect(ctx)
-			results <- collectionResult{index: i, data: data, err: err}
+			results <- collectionResult{index: i, data: data, err: err, finished: time.Now()}
 		}(i, collector)
 	}
-	data, status = awaitCollection(ctx, collectors, data, status, running, remaining, results)
+	data, status, unfinished := awaitCollection(ctx, collectors, data, status, running, remaining, results)
 	result := status[:0]
-	for i, collector := range collectors {
-		if _, ok := collector.(collect.TrendCollector); ok {
+	for i := range collectors {
+		if launched[i] {
 			result = append(result, status[i])
 		}
 	}
-	return data, result
+	return data, result, unfinished
 }
 
-func buildTrends(collectors []collect.Collector, samples [][]collect.Data) []model.Trend {
+func buildTrends(collectors []collect.Collector, samples [][]collect.Data, excluded []bool) []model.Trend {
 	var trends []model.Trend
 	for index, collector := range collectors {
+		if excluded[index] {
+			continue
+		}
 		trendCollector, ok := collector.(collect.TrendCollector)
 		if !ok {
 			continue
@@ -239,45 +289,84 @@ func buildTrends(collectors []collect.Collector, samples [][]collect.Data) []mod
 	return trends
 }
 
-func collectAll(ctx context.Context, collectors []collect.Collector, mode boundaryMode) ([]collect.Data, []model.CollectionStatus) {
+func collectAll(ctx context.Context, collectors []collect.Collector, mode boundaryMode, excluded []bool) ([]collect.Data, []model.CollectionStatus, []bool) {
 	data := make([]collect.Data, len(collectors))
 	status := make([]model.CollectionStatus, len(collectors))
-	skipped := make([]bool, len(collectors))
-	results := make(chan collectionResult, len(collectors))
+	if ctx.Err() != nil {
+		return data, nil, make([]bool, len(collectors))
+	}
+	selected := make([]bool, len(collectors))
+	for i, collector := range collectors {
+		if excluded[i] {
+			continue
+		}
+		if mode == skipStatic && staticCollector(collector) {
+			continue
+		}
+		selected[i] = true
+	}
+	results := make(chan collectionResult, countSelected(selected))
+	launched := make([]bool, len(collectors))
 	running := make([]bool, len(collectors))
 	remaining := 0
 	for i, collector := range collectors {
-		if mode == skipStatic && staticCollector(collector) {
-			skipped[i] = true
+		if !selected[i] {
 			continue
 		}
+		if ctx.Err() != nil {
+			break
+		}
+		launched[i] = true
 		running[i] = true
 		remaining++
 		go func(i int, collector collect.Collector) {
 			data, err := collector.Collect(ctx)
-			results <- collectionResult{index: i, data: data, err: err}
+			results <- collectionResult{index: i, data: data, err: err, finished: time.Now()}
 		}(i, collector)
 	}
-	data, status = awaitCollection(ctx, collectors, data, status, running, remaining, results)
+	data, status, unfinished := awaitCollection(ctx, collectors, data, status, running, remaining, results)
 	result := status[:0]
 	for i, s := range status {
-		if !skipped[i] {
+		if launched[i] {
 			result = append(result, s)
 		}
 	}
-	return data, result
+	return data, result, unfinished
+}
+
+func countSelected(selected []bool) int {
+	count := 0
+	for _, include := range selected {
+		if include {
+			count++
+		}
+	}
+	return count
+}
+
+func excludeUnfinished(excluded, unfinished []bool) {
+	for i, active := range unfinished {
+		if active {
+			excluded[i] = true
+		}
+	}
 }
 
 // collectionResult is deliberately passed through a buffered channel. A
 // collector that ignores cancellation must not keep the coordinator waiting,
 // and it must be able to finish later without writing into the returned data.
 type collectionResult struct {
-	index int
-	data  collect.Data
-	err   error
+	index    int
+	data     collect.Data
+	err      error
+	finished time.Time
 }
 
-func awaitCollection(ctx context.Context, collectors []collect.Collector, data []collect.Data, status []model.CollectionStatus, running []bool, remaining int, results <-chan collectionResult) ([]collect.Data, []model.CollectionStatus) {
+func awaitCollection(ctx context.Context, collectors []collect.Collector, data []collect.Data, status []model.CollectionStatus, running []bool, remaining int, results <-chan collectionResult) ([]collect.Data, []model.CollectionStatus, []bool) {
+	timely := func(result collectionResult) bool {
+		deadline, ok := ctx.Deadline()
+		return !ok || result.finished.Before(deadline)
+	}
 	apply := func(result collectionResult) {
 		if !running[result.index] {
 			return
@@ -290,7 +379,9 @@ func awaitCollection(ctx context.Context, collectors []collect.Collector, data [
 	for remaining > 0 {
 		select {
 		case result := <-results:
-			apply(result)
+			if timely(result) {
+				apply(result)
+			}
 		case <-ctx.Done():
 			// Preserve results that raced with cancellation, then report every
 			// still-running collector as partial coverage. Never wait for a
@@ -298,26 +389,28 @@ func awaitCollection(ctx context.Context, collectors []collect.Collector, data [
 			for {
 				select {
 				case result := <-results:
-					apply(result)
+					if timely(result) {
+						apply(result)
+					}
 				default:
 					for i, active := range running {
 						if active {
 							status[i] = model.CollectionStatus{Collector: collectors[i].Name(), Status: "error", Detail: ctx.Err().Error()}
 						}
 					}
-					return data, status
+					return data, status, running
 				}
 			}
 		}
 	}
-	return data, status
+	return data, status, running
 }
 
-func merge(collectors []collect.Collector, first, last []collect.Data) (model.Metrics, []model.CollectionStatus) {
+func merge(collectors []collect.Collector, first, last []collect.Data, excluded []bool) (model.Metrics, []model.CollectionStatus) {
 	var statuses []model.CollectionStatus
 	var metrics model.Metrics
 	for i, data := range last {
-		if sampler, ok := collectors[i].(collect.DeltaCollector); ok {
+		if sampler, ok := collectors[i].(collect.DeltaCollector); ok && !excluded[i] {
 			delta, err := sampler.Delta(first[i], data)
 			if err != nil {
 				statuses = append(statuses, model.CollectionStatus{Collector: collectors[i].Name(), Status: "error", Detail: fmt.Sprintf("derive sampled metrics: %v", err)})
@@ -383,6 +476,9 @@ func apply(metrics *model.Metrics, data collect.Data) {
 	}
 	if data.DeviceHealth != nil {
 		metrics.DeviceHealth = data.DeviceHealth
+	}
+	if data.DeviceHealthCoverage != nil {
+		metrics.DeviceHealthCoverage = data.DeviceHealthCoverage
 	}
 	if data.TimeSync != nil {
 		metrics.TimeSync = data.TimeSync

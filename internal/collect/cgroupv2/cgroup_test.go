@@ -64,6 +64,7 @@ func TestCollectSetsPerFileValidityAndReportsFailures(t *testing.T) {
 		"/sys/fs/cgroup/slice/a/memory.swap.max":     "bad\n",
 		"/sys/fs/cgroup/slice/a/pids.current":        "0\n",
 		"/sys/fs/cgroup/slice/a/pids.max":            "12\n",
+		"/sys/fs/cgroup/slice/a/memory.pressure":     "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n",
 		"/sys/fs/cgroup/slice/a/memory.events":       "oom 0\noom_kill 0\n",
 		"/sys/fs/cgroup/slice/a/cpu.stat":            "usage_usec 0\nthrottled_usec 0\n",
 	}
@@ -91,6 +92,9 @@ func TestCollectSetsPerFileValidityAndReportsFailures(t *testing.T) {
 	if got.MemoryEventsSampled == nil || !*got.MemoryEventsSampled || got.CPUStatSampled == nil || !*got.CPUStatSampled {
 		t.Fatalf("required event groups should be sampled: %+v", got)
 	}
+	if got.MemoryPressureValid == nil || !*got.MemoryPressureValid || got.MemoryPressure == nil || got.MemoryPressure.SomeAvg10 != 0 {
+		t.Fatalf("zero local pressure must be valid: %+v", got)
+	}
 	if len(data.Diagnostics) != 1 || !strings.Contains(data.Diagnostics[0].Detail, "memory.swap.max") || !strings.Contains(data.Diagnostics[0].Detail, "malformed") {
 		t.Fatalf("diagnostics = %+v", data.Diagnostics)
 	}
@@ -103,7 +107,8 @@ func TestCollectRequiredGroupsNeedBothCounters(t *testing.T) {
 		"/sys/fs/cgroup/slice/a/memory.current": "1", "/sys/fs/cgroup/slice/a/memory.max": "max",
 		"/sys/fs/cgroup/slice/a/memory.swap.current": "1", "/sys/fs/cgroup/slice/a/memory.swap.max": "max",
 		"/sys/fs/cgroup/slice/a/pids.current": "1", "/sys/fs/cgroup/slice/a/pids.max": "max",
-		"/sys/fs/cgroup/slice/a/memory.events": "oom 1", "/sys/fs/cgroup/slice/a/cpu.stat": "usage_usec 1",
+		"/sys/fs/cgroup/slice/a/memory.pressure": "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\n",
+		"/sys/fs/cgroup/slice/a/memory.events":   "oom 1", "/sys/fs/cgroup/slice/a/cpu.stat": "usage_usec 1",
 	}
 	files["/proc/self/cgroup"] = "0::/slice/a\n"
 	read := func(name string) ([]byte, error) {
@@ -122,6 +127,24 @@ func TestCollectRequiredGroupsNeedBothCounters(t *testing.T) {
 	}
 	if len(data.Diagnostics) != 2 {
 		t.Fatalf("expected one diagnostic per failed group, got %+v", data.Diagnostics)
+	}
+}
+
+func TestReadMemoryPressureRejectsMalformedAndPreservesLocalScope(t *testing.T) {
+	read := func(string) ([]byte, error) {
+		return []byte("some avg10=1.25 avg60=0.50 avg300=0.25 total=4\nfull avg10=0.75 avg60=0.20 avg300=0.10 total=2\n"), nil
+	}
+	got, ok, err := readMemoryPressure(read, "memory.pressure")
+	if err != nil || !ok || got.SomeAvg10 != 1.25 || got.FullAvg10 != .75 {
+		t.Fatalf("local pressure = %#v, %v, %v", got, ok, err)
+	}
+	bad := func(string) ([]byte, error) { return []byte("some avg10=nope avg60=0 avg300=0 total=0\n"), nil }
+	if _, ok, err := readMemoryPressure(bad, "memory.pressure"); err == nil || ok {
+		t.Fatal("malformed local pressure was accepted")
+	}
+	missing := func(string) ([]byte, error) { return []byte("some avg60=0 avg300=0 total=0 extra=0\n"), nil }
+	if _, ok, err := readMemoryPressure(missing, "memory.pressure"); err == nil || ok {
+		t.Fatal("pressure without avg10 was accepted")
 	}
 }
 

@@ -1,6 +1,7 @@
 package network
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -29,7 +30,7 @@ func TestParseDevRejectsMalformed(t *testing.T) {
 	}
 }
 
-func TestCollectorDeltaSkipsInterfaceWithoutBaseline(t *testing.T) {
+func TestCollectorDeltaKeepsInterfaceWithoutBaselineAsUnsampled(t *testing.T) {
 	c := Collector{}
 	start := time.Now()
 	first := collect.Data{Snapshot: Snapshot{At: start, Interfaces: []Interface{{Name: "eth0", Counters: Counters{RXErrors: 4}}}}}
@@ -41,7 +42,34 @@ func TestCollectorDeltaSkipsInterfaceWithoutBaseline(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got.Network) != 1 || got.Network[0].Name != "eth0" || got.Network[0].RXErrors != 1 {
-		t.Fatalf("network delta=%#v, want only sampled eth0 delta", got.Network)
+	if len(got.Network) != 2 || got.Network[0].Sampled == nil || !*got.Network[0].Sampled || got.Network[0].Name != "eth0" || got.Network[0].RXErrors != 1 || got.Network[1].Sampled == nil || *got.Network[1].Sampled || got.Network[1].Name != "veth-new" {
+		t.Fatalf("network delta=%#v, want sampled eth0 and final-only veth-new", got.Network)
+	}
+}
+
+func TestCollectorDeltaRejectsInvalidSamplingInterval(t *testing.T) {
+	for _, lastAt := range []time.Time{time.Time{}, time.Unix(10, 0)} {
+		first := Snapshot{At: time.Unix(10, 0), Interfaces: []Interface{{Name: "eth0"}}}
+		last := Snapshot{At: lastAt, Interfaces: []Interface{{Name: "eth0"}}}
+		data, err := (Collector{}).Delta(collect.Data{Snapshot: first}, collect.Data{Snapshot: last})
+		if err == nil || len(data.Network) != 1 || data.Network[0].Sampled == nil || *data.Network[0].Sampled {
+			t.Fatalf("lastAt=%v: invalid interval was reported as sampled: data=%#v err=%v", lastAt, data, err)
+		}
+	}
+}
+
+func TestCollectorDeltaWithoutBaselineKeepsFinalLinkFactsMarkedUnsampled(t *testing.T) {
+	carrier := true
+	last := Snapshot{Interfaces: []Interface{{Name: "eth0", OperState: "up", MTU: 1500, Carrier: &carrier}}}
+	data, err := (Collector{}).Delta(collect.Data{}, collect.Data{Snapshot: last})
+	if err == nil {
+		t.Fatal("expected missing baseline error")
+	}
+	if len(data.Network) != 1 || data.Network[0].Sampled == nil || *data.Network[0].Sampled || data.Network[0].Name != "eth0" || data.Network[0].MTU != 1500 || data.Network[0].Carrier == nil || !*data.Network[0].Carrier {
+		t.Fatalf("final link facts were not retained as unsampled: %#v", data.Network)
+	}
+	encoded, err := json.Marshal(data.Network[0])
+	if err != nil || !strings.Contains(string(encoded), `"sampled":false`) {
+		t.Fatalf("unsampled network JSON = %s, err = %v", encoded, err)
 	}
 }

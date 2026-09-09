@@ -106,16 +106,18 @@ func main() {
 	}
 	containerEnabled := !*f.noContainers && runtimeAvailable()
 	collectors := defaultCollectors(containerEnabled, !*f.disableExternalChecks, *f.noProxy)
-	tty := platform.IsTerminal(os.Stdout)
+	stdoutTTY := platform.IsTerminal(os.Stdout)
+	stderrTTY := platform.IsTerminal(os.Stderr)
+	colorEnabled := progressColorEnabled(*f.noColor, os.Getenv("NO_COLOR"))
 	var progress func(app.Progress)
-	if tty && !*f.jsonOutput {
-		progress = progressWriter(os.Stderr)
+	if progressEnabled(*f.jsonOutput, stderrTTY) {
+		progress = progressWriter(os.Stderr, colorEnabled)
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	report := app.Run(ctx, app.Config{Duration: *f.duration, SampleInterval: time.Second, Full: true, IncludeContainers: containerEnabled, Progress: progress}, collectors)
 	analyze.Report(&report)
-	code := writeReport(os.Stdout, os.Stderr, report, *f.jsonOutput, *f.verbose, render.Options{Color: !*f.noColor && os.Getenv("NO_COLOR") == "" && tty, Verbose: *f.verbose, Width: platform.TerminalWidth(os.Stdout), ASCII: !tty, Quiet: *f.quiet, Events: *f.events, EventsAll: *f.eventsAll})
+	code := writeReport(os.Stdout, os.Stderr, report, *f.jsonOutput, *f.verbose, render.Options{Color: colorEnabled && stdoutTTY, Verbose: *f.verbose, Width: platform.TerminalWidth(os.Stdout), ASCII: !stdoutTTY, Quiet: *f.quiet, Events: *f.events, EventsAll: *f.eventsAll})
 	if ctx.Err() != nil {
 		code = 3
 	}
@@ -206,7 +208,17 @@ func runtimeAvailable() bool {
 	return false
 }
 
-func progressWriter(w io.Writer) func(app.Progress) {
+// progressEnabled keeps progress off structured JSON output and only enables
+// transient terminal control on the stream that receives it.
+func progressEnabled(jsonOutput, stderrTTY bool) bool {
+	return !jsonOutput && stderrTTY
+}
+
+func progressColorEnabled(noColor bool, noColorEnvironment string) bool {
+	return !noColor && noColorEnvironment == ""
+}
+
+func progressWriter(w io.Writer, color bool) func(app.Progress) {
 	shown := false
 	const cyan = "\033[36m"
 	const white = "\033[37m"
@@ -219,24 +231,36 @@ func progressWriter(w io.Writer) func(app.Progress) {
 		return fmt.Sprintf("%02ds", int(d.Round(time.Second)/time.Second))
 	}
 	return func(progress app.Progress) {
+		write := func(plain, colored string) {
+			if color {
+				fmt.Fprint(w, colored)
+				return
+			}
+			fmt.Fprint(w, plain)
+		}
 		switch progress.Phase {
 		case "baseline":
 			if !shown {
-				fmt.Fprint(w, cyan+"Collecting health data..."+reset)
+				write("Collecting health data...", cyan+"Collecting health data..."+reset)
 				shown = true
 			}
 		case "sampling":
-			fmt.Fprintf(w, clearLine+cyan+"Sampling health data: "+white+"%s / %s"+reset,
-				formatDuration(progress.Elapsed), formatDuration(progress.Duration))
+			elapsed, duration := formatDuration(progress.Elapsed), formatDuration(progress.Duration)
+			write("\rSampling health data: "+elapsed+" / "+duration,
+				fmt.Sprintf(clearLine+cyan+"Sampling health data: "+white+"%s / %s"+reset, elapsed, duration))
 			shown = true
 		case "final":
-			fmt.Fprint(w, clearLine+cyan+"Processing health data..."+reset)
+			write("\rProcessing health data...", clearLine+cyan+"Processing health data..."+reset)
 			shown = true
 		case "complete":
 			if shown {
 				// Clear the transient TTY status so the final report starts at the
 				// first visible line, without a stale timer or progress history.
-				fmt.Fprint(w, clearLine)
+				if color {
+					fmt.Fprint(w, clearLine)
+				} else {
+					fmt.Fprint(w, "\n")
+				}
 			}
 		}
 	}

@@ -33,6 +33,40 @@ func TestReportExitCodesIndependentOfFormat(t *testing.T) {
 	}
 }
 
+func TestInterruptedUnknownAssessmentAgreesAcrossTerminalJSONAndExitCode(t *testing.T) {
+	report := model.Report{
+		SchemaVersion: model.SchemaVersion,
+		Score:         model.Score{Status: model.SeverityUnknown, Label: "INSUFFICIENT DATA"},
+		Collection:    []model.CollectionStatus{{Collector: "sampling", Status: "error", Detail: "context deadline exceeded"}},
+	}
+
+	for _, quiet := range []bool{false, true} {
+		var stdout, stderr bytes.Buffer
+		code := writeReport(&stdout, &stderr, report, false, false, render.Options{ASCII: true, Quiet: quiet})
+		if code != 3 {
+			t.Fatalf("quiet=%t terminal exit code = %d, want 3", quiet, code)
+		}
+		if !strings.Contains(strings.Join(strings.Fields(stdout.String()), " "), "Assessment UNKNOWN INSUFFICIENT DATA: Sampling was interrupted; the health assessment is incomplete.") {
+			t.Fatalf("quiet=%t missing interrupted assessment:\n%s", quiet, stdout.String())
+		}
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := writeReport(&stdout, &stderr, report, true, false, render.Options{}); code != 3 {
+		t.Fatalf("JSON exit code = %d, want 3", code)
+	}
+	var got model.Report
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("decode JSON report: %v\n%s", err, stdout.String())
+	}
+	if got.Score.Status != model.SeverityUnknown || got.Score.Label != "INSUFFICIENT DATA" {
+		t.Fatalf("JSON lost unknown score: %+v", got.Score)
+	}
+	if len(got.Collection) != 1 || got.Collection[0].Collector != "sampling" || got.Collection[0].Status != "error" {
+		t.Fatalf("JSON lost sampling failure: %+v", got.Collection)
+	}
+}
+
 // The bash completion word list is generated from the registered flags
 // rather than a hand-maintained string precisely so a new flag can't be
 // added without appearing here too, the way --quiet and --events once did.
@@ -92,7 +126,7 @@ func TestVerboseDiagnosticsAreSanitized(t *testing.T) {
 
 func TestProgressIsOneTransientLine(t *testing.T) {
 	var output bytes.Buffer
-	progress := progressWriter(&output)
+	progress := progressWriter(&output, true)
 	progress(app.Progress{Phase: "baseline"})
 	progress(app.Progress{Phase: "sampling", Elapsed: 5 * time.Second, Duration: 60 * time.Second})
 	progress(app.Progress{Phase: "final"})
@@ -110,5 +144,60 @@ func TestProgressIsOneTransientLine(t *testing.T) {
 	}
 	if strings.Contains(got, "Sampling health data: 00s / 00s") {
 		t.Fatalf("unexpected progress output: %q", output.String())
+	}
+}
+
+func TestProgressWithoutColorUsesNoANSIEscapes(t *testing.T) {
+	var output bytes.Buffer
+	progress := progressWriter(&output, false)
+	progress(app.Progress{Phase: "baseline"})
+	progress(app.Progress{Phase: "sampling", Elapsed: 5 * time.Second, Duration: 60 * time.Second})
+	progress(app.Progress{Phase: "final"})
+	progress(app.Progress{Phase: "complete"})
+
+	got := output.String()
+	if strings.Contains(got, "\x1b") {
+		t.Fatalf("no-color progress contains ANSI escape: %q", got)
+	}
+	if !strings.Contains(got, "Sampling health data: 05s / 60s") || !strings.HasSuffix(got, "\n") {
+		t.Fatalf("unexpected no-color progress output: %q", got)
+	}
+}
+
+func TestProgressActivationUsesStderrTTYAndExcludesJSON(t *testing.T) {
+	for _, tt := range []struct {
+		name                  string
+		jsonOutput, stderrTTY bool
+		want                  bool
+	}{
+		{name: "terminal stderr", stderrTTY: true, want: true},
+		{name: "redirected stderr", stderrTTY: false, want: false},
+		{name: "json terminal stderr", jsonOutput: true, stderrTTY: true, want: false},
+		{name: "json redirected stderr", jsonOutput: true, stderrTTY: false, want: false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := progressEnabled(tt.jsonOutput, tt.stderrTTY); got != tt.want {
+				t.Fatalf("progressEnabled(json=%t, stderrTTY=%t) = %t, want %t", tt.jsonOutput, tt.stderrTTY, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestProgressColorPolicyHonorsBothDisableMechanisms(t *testing.T) {
+	for _, tt := range []struct {
+		name               string
+		noColor            bool
+		noColorEnvironment string
+		want               bool
+	}{
+		{name: "color enabled", want: true},
+		{name: "no-color flag", noColor: true, want: false},
+		{name: "NO_COLOR", noColorEnvironment: "1", want: false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := progressColorEnabled(tt.noColor, tt.noColorEnvironment); got != tt.want {
+				t.Fatalf("progressColorEnabled(noColor=%t, NO_COLOR=%q) = %t, want %t", tt.noColor, tt.noColorEnvironment, got, tt.want)
+			}
+		})
 	}
 }

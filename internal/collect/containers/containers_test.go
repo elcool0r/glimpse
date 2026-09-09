@@ -123,12 +123,14 @@ func TestClassifyLogEventsDeduplicatesButDoesNotCapCount(t *testing.T) {
 
 func TestCollectLogsIsBoundedAndSkipsIrrelevantStates(t *testing.T) {
 	var calls [][]string
+	collectedAt := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
 	c := &Collector{
 		LogTimeout:      time.Second,
 		LogTotalTimeout: time.Second,
+		now:             func() time.Time { return collectedAt },
 		runLogs: func(_ context.Context, args []string, _ string) ([]byte, bool, error) {
 			calls = append(calls, args)
-			return []byte("panic: boom\n"), false, nil
+			return []byte("2026-09-09T11:30:00Z panic: boom\n"), false, nil
 		},
 	}
 	items := []model.Container{
@@ -140,12 +142,42 @@ func TestCollectLogsIsBoundedAndSkipsIrrelevantStates(t *testing.T) {
 	if len(calls) != 2 {
 		t.Fatalf("calls=%v", calls)
 	}
-	want := []string{"--remote=false", "logs", "--since", "1h", "--tail", "200", "run"}
+	want := []string{"--remote=false", "logs", "--timestamps", "--since", "1h", "--tail", "200", "run"}
 	if !reflect.DeepEqual(calls[0], want) {
 		t.Fatalf("args=%q want=%q", calls[0], want)
 	}
 	if len(items[0].LogEvents) != 1 || len(items[1].LogEvents) != 0 || len(items[2].LogEvents) != 1 {
 		t.Fatalf("items=%+v", items)
+	}
+	for _, item := range []model.Container{items[0], items[2]} {
+		event := item.LogEvents[0]
+		if event.Message != "panic: boom" || event.AgeSeconds == nil || *event.AgeSeconds != 30*60 {
+			t.Fatalf("timestamped collector event=%+v", event)
+		}
+	}
+}
+
+func TestClassifyLogEventsAtUsesRuntimeTimestampAndKeepsNewestDuplicate(t *testing.T) {
+	collectedAt := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	got := ClassifyLogEventsAt("2026-09-09T11:30:00.000000000Z panic: boom\n2026-09-09T11:45:00Z panic: boom\n", collectedAt)
+	if len(got) != 1 || got[0].Message != "panic: boom" || got[0].AgeSeconds == nil {
+		t.Fatalf("events=%+v", got)
+	}
+	if age := *got[0].AgeSeconds; age != 15*60 {
+		t.Fatalf("age=%v, want 900", age)
+	}
+}
+
+func TestClassifyLogEventsAtLeavesMalformedOrMissingTimestampUnaged(t *testing.T) {
+	collectedAt := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	got := ClassifyLogEventsAt("not-a-timestamp panic: malformed\npanic: missing\n", collectedAt)
+	if len(got) != 2 {
+		t.Fatalf("events=%+v", got)
+	}
+	for _, event := range got {
+		if event.AgeSeconds != nil {
+			t.Fatalf("unparseable timestamp gained an age: %+v", event)
+		}
 	}
 }
 

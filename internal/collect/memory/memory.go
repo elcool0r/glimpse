@@ -40,7 +40,8 @@ func (c Collector) Collect(ctx context.Context) (collect.Data, error) {
 	if snapshot.Info.Total > 0 {
 		availableFraction = float64(snapshot.Info.Available) / float64(snapshot.Info.Total)
 	}
-	memory := &model.Memory{Sampled: &sampled, TotalBytes: snapshot.Info.Total, AvailableBytes: snapshot.Info.Available, SwapTotalBytes: snapshot.Info.SwapTotal, SwapFreeBytes: snapshot.Info.SwapFree, AvailableFraction: availableFraction}
+	availableValid := snapshot.Info.AvailableValid
+	memory := &model.Memory{Sampled: &sampled, AvailableValid: &availableValid, TotalBytes: snapshot.Info.Total, AvailableBytes: snapshot.Info.Available, SwapTotalBytes: snapshot.Info.SwapTotal, SwapFreeBytes: snapshot.Info.SwapFree, AvailableFraction: availableFraction}
 	if raw, readErr := os.ReadFile(root + "/sys/vm/swappiness"); readErr == nil {
 		if value, parseErr := parseSwappiness(string(raw)); parseErr == nil {
 			memory.Swappiness = &value
@@ -77,7 +78,8 @@ func (Collector) Delta(first, last collect.Data) (collect.Data, error) {
 	}
 	pageSize := uint64(os.Getpagesize())
 	sampled := true
-	memory := &model.Memory{Sampled: &sampled, TotalBytes: delta.Info.Total, AvailableBytes: delta.Info.Available, SwapTotalBytes: delta.Info.SwapTotal, SwapFreeBytes: delta.Info.SwapFree, SwapInBytes: saturatingMultiply(delta.SwapIn, pageSize), SwapOutBytes: saturatingMultiply(delta.SwapOut, pageSize), PageFaults: delta.PageFault, MajorFaults: delta.MajorFault, AvailableFraction: availableFraction}
+	availableValid := delta.Info.AvailableValid
+	memory := &model.Memory{Sampled: &sampled, AvailableValid: &availableValid, TotalBytes: delta.Info.Total, AvailableBytes: delta.Info.Available, SwapTotalBytes: delta.Info.SwapTotal, SwapFreeBytes: delta.Info.SwapFree, SwapInBytes: saturatingMultiply(delta.SwapIn, pageSize), SwapOutBytes: saturatingMultiply(delta.SwapOut, pageSize), PageFaults: delta.PageFault, MajorFaults: delta.MajorFault, AvailableFraction: availableFraction}
 	if last.Memory != nil {
 		memory.Swappiness = last.Memory.Swappiness
 	}
@@ -102,7 +104,7 @@ func (Collector) Trends(samples []collect.Data) []model.Trend {
 	available := make([]float64, 0, len(samples))
 	pressure := make([]float64, 0, len(samples))
 	for _, sample := range samples {
-		if sample.Memory != nil {
+		if sample.Memory != nil && memoryAvailable(sample.Memory) {
 			available = append(available, sample.Memory.AvailableFraction)
 		}
 		if sample.Pressure != nil {
@@ -126,9 +128,12 @@ func toModelPressure(p Pressure) model.PressureResource {
 // Info is normalized /proc/meminfo. All fields are bytes.
 type Info struct {
 	Total, Available, Free, Buffers, Cached, SReclaimable uint64
-	SwapTotal, SwapFree                                   uint64
-	Active, Inactive, Dirty, Writeback, Slab              uint64
-	PageTables, CommitLimit, CommittedAS                  uint64
+	// AvailableValid distinguishes a measured zero MemAvailable value from a
+	// procfs implementation that does not expose MemAvailable at all.
+	AvailableValid                           bool
+	SwapTotal, SwapFree                      uint64
+	Active, Inactive, Dirty, Writeback, Slab uint64
+	PageTables, CommitLimit, CommittedAS     uint64
 }
 
 // Used returns a cache-aware estimate based on MemAvailable.
@@ -211,6 +216,7 @@ func ParseMemInfo(r io.Reader) (Info, error) {
 			out.Total = value
 		case "MemAvailable":
 			out.Available = value
+			out.AvailableValid = true
 		case "MemFree":
 			out.Free = value
 		case "Buffers":
@@ -248,6 +254,12 @@ func ParseMemInfo(r io.Reader) (Info, error) {
 		return Info{}, errors.New("meminfo: missing MemTotal")
 	}
 	return out, nil
+}
+
+// memoryAvailable keeps reports created before availability validity was added
+// compatible: only an explicit false means MemAvailable was unavailable.
+func memoryAvailable(m *model.Memory) bool {
+	return m.AvailableValid == nil || *m.AvailableValid
 }
 
 // consumedMemInfoKey lists the keys ParseMemInfo stores. Keeping it beside the

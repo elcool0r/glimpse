@@ -70,8 +70,16 @@ func (Collector) Delta(first, last collect.Data) (collect.Data, error) {
 		// activity: no rate, utilization or queue rule can fire on zeros.
 		return finalGauges(end), errors.New("disk: invalid first snapshot")
 	}
+	if start.At.IsZero() || end.At.IsZero() || !end.At.After(start.At) {
+		return finalGauges(end), errors.New("disk: invalid sampling interval")
+	}
 	deltas := Between(start, end)
 	disks := make([]model.Disk, 0, len(deltas))
+	sampled := true
+	previous := make(map[string]Device, len(start.Devices))
+	for _, device := range start.Devices {
+		previous[device.Name] = device
+	}
 	for _, delta := range deltas {
 		ioSeconds := float64(delta.IOMillis) / 1000
 		weightedSeconds := float64(delta.WeightedIOMillis) / 1000
@@ -93,7 +101,21 @@ func (Collector) Delta(first, last collect.Data) (collect.Data, error) {
 		if delta.Rotational != nil {
 			rotational = *delta.Rotational
 		}
-		disks = append(disks, model.Disk{SampleDurationSeconds: durationSeconds, Name: delta.Name, Rotational: rotational, Reads: delta.Reads, Writes: delta.Writes, ReadBytes: delta.ReadBytes, WriteBytes: delta.WriteBytes, DiscardBytes: delta.DiscardBytes, IOTimeSeconds: ioSeconds, WeightedIOTimeSeconds: weightedSeconds, InFlight: delta.InFlight, Utilization: utilization, AverageQueueDepth: queueDepth, AverageLatencyMillis: latency})
+		disks = append(disks, model.Disk{Sampled: &sampled, SampleDurationSeconds: durationSeconds, Name: delta.Name, Rotational: rotational, Reads: delta.Reads, Writes: delta.Writes, ReadBytes: delta.ReadBytes, WriteBytes: delta.WriteBytes, DiscardBytes: delta.DiscardBytes, IOTimeSeconds: ioSeconds, WeightedIOTimeSeconds: weightedSeconds, InFlight: delta.InFlight, Utilization: utilization, AverageQueueDepth: queueDepth, AverageLatencyMillis: latency})
+	}
+	// A final device without the same baseline identity is still useful
+	// inventory, but its interval counters are unavailable for this window.
+	unsampled := false
+	for _, device := range end.Devices {
+		before, exists := previous[device.Name]
+		if exists && before.Major == device.Major && before.Minor == device.Minor {
+			continue
+		}
+		rotational := false
+		if device.Rotational != nil {
+			rotational = *device.Rotational
+		}
+		disks = append(disks, model.Disk{Sampled: &unsampled, Name: device.Name, Rotational: rotational, InFlight: device.Counters.InFlight})
 	}
 	return collect.Data{Disks: disks}, nil
 }
@@ -101,12 +123,13 @@ func (Collector) Delta(first, last collect.Data) (collect.Data, error) {
 // finalGauges reports devices without a sampling interval.
 func finalGauges(last Snapshot) collect.Data {
 	disks := make([]model.Disk, 0, len(last.Devices))
+	sampled := false
 	for _, device := range last.Devices {
 		rotational := false
 		if device.Rotational != nil {
 			rotational = *device.Rotational
 		}
-		disks = append(disks, model.Disk{Name: device.Name, Rotational: rotational, InFlight: device.Counters.InFlight})
+		disks = append(disks, model.Disk{Sampled: &sampled, Name: device.Name, Rotational: rotational, InFlight: device.Counters.InFlight})
 	}
 	return collect.Data{Disks: disks}
 }

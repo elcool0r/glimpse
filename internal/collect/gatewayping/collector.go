@@ -34,6 +34,9 @@ const (
 	// rtfGateway is the route flag bit (RTF_GATEWAY) marking a route that goes
 	// through a gateway rather than being directly connected.
 	rtfGateway = 0x2
+	// rtfUp marks a route the kernel may use. A gateway route without it is
+	// present in procfs but must not be selected for an active probe.
+	rtfUp = 0x1
 
 	pingCount      = 3
 	perPingTimeout = 1 // seconds, passed to `ping -W`
@@ -102,27 +105,37 @@ func (c *Collector) Collect(parent context.Context) (collect.Data, error) {
 	return collect.Data{GatewayCheck: check}, nil
 }
 
-// defaultGateway reads /proc/net/route directly instead of shelling out to
-// `ip route`, so this collector needs no extra command beyond `ping` itself
-// and does not depend on collection ordering with networkstate.
+// defaultGateway reads the main IPv4 route table directly instead of shelling
+// out to `ip route`, so this collector needs no extra command beyond `ping`
+// itself and does not depend on collection ordering with networkstate. This is
+// deliberately a conservative main-table fallback, not a claim about policy
+// routing: only usable all-zero destination/mask routes qualify, and the
+// lowest metric wins. Equal metrics retain their procfs order, which is a
+// deterministic fallback when the kernel's policy selection is unavailable.
 func defaultGateway(raw string) string {
 	scanner := bufio.NewScanner(strings.NewReader(raw))
 	scanner.Scan() // header line
+	var bestMetric uint64
+	bestGateway := ""
+	bestSet := false
 	for scanner.Scan() {
 		fields := strings.Fields(scanner.Text())
 		if len(fields) < 8 {
 			continue
 		}
-		destination, gatewayHex, flagsHex := fields[1], fields[2], fields[3]
+		destination, gatewayHex, flagsHex, metricText, mask := fields[1], fields[2], fields[3], fields[6], fields[7]
 		flags, err := strconv.ParseUint(flagsHex, 16, 16)
-		if err != nil || destination != "00000000" || flags&rtfGateway == 0 {
+		metric, metricErr := strconv.ParseUint(metricText, 10, 64)
+		if err != nil || metricErr != nil || destination != "00000000" || mask != "00000000" || flags&(rtfUp|rtfGateway) != (rtfUp|rtfGateway) {
 			continue
 		}
-		if ip, err := hexToIPv4(gatewayHex); err == nil {
-			return ip
+		if ip, err := hexToIPv4(gatewayHex); err == nil && ip != "0.0.0.0" && (!bestSet || metric < bestMetric) {
+			bestMetric = metric
+			bestGateway = ip
+			bestSet = true
 		}
 	}
-	return ""
+	return bestGateway
 }
 
 // hexToIPv4 decodes the little-endian hex address /proc/net/route uses.

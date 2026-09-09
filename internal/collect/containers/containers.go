@@ -45,6 +45,7 @@ type Collector struct {
 	lookPath        func(string) (string, error)
 	run             func(context.Context, string, ...string) ([]byte, error)
 	runLogs         logRunner
+	now             func() time.Time
 }
 
 // logRunner reads bounded log output. It reports truncation separately from
@@ -262,8 +263,10 @@ func (c *Collector) collectLogs(parent context.Context, run logRunner, runtime, 
 		}
 		commandCtx, commandCancel := context.WithTimeout(parent, perCommand)
 		// Both CLIs accept this direct, non-shell invocation. `--since 1h`
-		// avoids parsing host timestamps and covers the useful incident window.
-		raw, truncated, err := run(commandCtx, runtimeArgs(runtime, endpoint, "logs", "--since", "1h", "--tail", fmt.Sprint(maxLogLines), items[i].ID), path)
+		// bounds the useful incident window, while --timestamps gives the
+		// renderer a real event time instead of making it guess when a log
+		// incident happened.
+		raw, truncated, err := run(commandCtx, runtimeArgs(runtime, endpoint, "logs", "--timestamps", "--since", "1h", "--tail", fmt.Sprint(maxLogLines), items[i].ID), path)
 		commandCancel()
 		outcome.attempted++
 		if err != nil {
@@ -278,9 +281,19 @@ func (c *Collector) collectLogs(parent context.Context, run logRunner, runtime, 
 		if truncated {
 			outcome.truncated++
 		}
-		items[i].LogEvents = ClassifyLogEvents(string(raw))
+		// This is the defined reference time for timestamped log records. It
+		// is captured after the bounded command returns, so a record dated in
+		// the future due to clock skew is conservatively reported as age zero.
+		items[i].LogEvents = ClassifyLogEventsAt(string(raw), c.collectionTime())
 	}
 	return outcome
+}
+
+func (c *Collector) collectionTime() time.Time {
+	if c.now != nil {
+		return c.now()
+	}
+	return time.Now()
 }
 
 func logRelevant(item model.Container) bool {
@@ -518,33 +531,87 @@ var benignGenericLogPatterns = []*regexp.Regexp{
 // bounded (maxLogBytes per container), so the number of distinct matches
 // cannot be unbounded, and capping it separately only produced a
 // same-looking count on every container that happened to exceed the cap.
-// It is deliberately exported for fixture-based parser tests.
+// It preserves the legacy parser API for untimestamped input. Collectors that
+// request runtime timestamps should call ClassifyLogEventsAt with their
+// collection reference.
 func ClassifyLogEvents(text string) []model.LogEvent {
+	return ClassifyLogEventsAt(text, time.Time{})
+}
+
+// ClassifyLogEventsAt classifies runtime log output and calculates event ages
+// from leading RFC3339/RFC3339Nano timestamps. A missing or malformed
+// timestamp keeps AgeSeconds nil; it must never be presented as happening now.
+// The timestamp itself is not retained in the message. For duplicate
+// kind/message pairs, the newest timestamped instance wins.
+func ClassifyLogEventsAt(text string, collectedAt time.Time) []model.LogEvent {
 	events := make([]model.LogEvent, 0)
-	seen := make(map[string]struct{})
+	seen := make(map[string]int)
+	times := make(map[string]time.Time)
 	for _, line := range strings.Split(text, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
+		messageLine, eventAt := splitRuntimeLogTimestamp(line)
 		for _, pattern := range containerLogPatterns {
-			if !pattern.match.MatchString(line) {
+			if !pattern.match.MatchString(messageLine) {
 				continue
 			}
-			if (pattern.kind == "error" || pattern.kind == "failure") && benignGenericLogLine(line) {
+			if (pattern.kind == "error" || pattern.kind == "failure") && benignGenericLogLine(messageLine) {
 				break
 			}
-			message := truncateLogLine(line)
+			message := truncateLogLine(messageLine)
 			key := pattern.kind + "\x00" + message
-			if _, ok := seen[key]; ok {
+			index, duplicate := seen[key]
+			if duplicate {
+				if eventAt != nil {
+					previousAt, known := times[key]
+					if !known || eventAt.After(previousAt) {
+						events[index].AgeSeconds = logAgeSeconds(*eventAt, collectedAt)
+						times[key] = *eventAt
+					}
+				}
 				break
 			}
-			seen[key] = struct{}{}
-			events = append(events, model.LogEvent{Kind: pattern.kind, Message: message})
+			seen[key] = len(events)
+			if eventAt != nil {
+				times[key] = *eventAt
+			}
+			events = append(events, model.LogEvent{Kind: pattern.kind, Message: message, AgeSeconds: logAgeSecondsAt(eventAt, collectedAt)})
 			break
 		}
 	}
 	return events
+}
+
+// splitRuntimeLogTimestamp recognizes the prefix emitted by Docker and Podman
+// with --timestamps. If it cannot parse the prefix exactly, it leaves the line
+// intact so the diagnostic text remains visible and unaged.
+func splitRuntimeLogTimestamp(line string) (string, *time.Time) {
+	separator := strings.IndexAny(line, " \t")
+	if separator <= 0 {
+		return line, nil
+	}
+	at, err := time.Parse(time.RFC3339Nano, line[:separator])
+	if err != nil {
+		return line, nil
+	}
+	return strings.TrimSpace(line[separator:]), &at
+}
+
+func logAgeSecondsAt(eventAt *time.Time, collectedAt time.Time) *float64 {
+	if eventAt == nil || collectedAt.IsZero() {
+		return nil
+	}
+	return logAgeSeconds(*eventAt, collectedAt)
+}
+
+func logAgeSeconds(eventAt, collectedAt time.Time) *float64 {
+	age := collectedAt.Sub(eventAt).Seconds()
+	if age < 0 {
+		age = 0
+	}
+	return &age
 }
 
 func benignGenericLogLine(line string) bool {

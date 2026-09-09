@@ -31,19 +31,19 @@ func TestMetricsOmitOptionalMilestoneTwoCategories(t *testing.T) {
 
 func TestCgroupValidityFlagsPreserveExplicitFalseAndTrue(t *testing.T) {
 	valid, invalid := true, false
-	b, err := json.Marshal(CgroupV2{MemoryCurrentValid: &valid, MemoryMaxValid: &invalid})
+	b, err := json.Marshal(CgroupV2{MemoryCurrentValid: &valid, MemoryMaxValid: &invalid, MemoryPressureValid: &valid, MemoryPressure: &PressureResource{SomeAvg10: 1.25}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	text := string(b)
-	if !strings.Contains(text, `"memory_current_valid":true`) || !strings.Contains(text, `"memory_max_valid":false`) {
+	if !strings.Contains(text, `"memory_current_valid":true`) || !strings.Contains(text, `"memory_max_valid":false`) || !strings.Contains(text, `"memory_pressure_valid":true`) || !strings.Contains(text, `"memory_pressure":{"some_avg10":1.25`) {
 		t.Fatalf("validity flags lost: %s", text)
 	}
 	var roundTrip CgroupV2
 	if err := json.Unmarshal(b, &roundTrip); err != nil {
 		t.Fatal(err)
 	}
-	if roundTrip.MemoryCurrentValid == nil || !*roundTrip.MemoryCurrentValid || roundTrip.MemoryMaxValid == nil || *roundTrip.MemoryMaxValid {
+	if roundTrip.MemoryCurrentValid == nil || !*roundTrip.MemoryCurrentValid || roundTrip.MemoryMaxValid == nil || *roundTrip.MemoryMaxValid || roundTrip.MemoryPressureValid == nil || !*roundTrip.MemoryPressureValid || roundTrip.MemoryPressure == nil || roundTrip.MemoryPressure.SomeAvg10 != 1.25 {
 		t.Fatalf("validity flags did not round trip: %+v", roundTrip)
 	}
 }
@@ -62,6 +62,26 @@ func TestPathMTUPacketTooBigFeedbackJSON(t *testing.T) {
 	}
 	if !roundTrip.PacketTooBigFeedback || roundTrip.DiscoveredMTU != 1428 {
 		t.Fatalf("path MTU evidence did not round trip: %+v", roundTrip)
+	}
+}
+
+func TestDeviceHealthCoverageJSONPreservesPartialAndZeroSuccessScans(t *testing.T) {
+	metrics := Metrics{DeviceHealthCoverage: &DeviceHealthCoverage{
+		DevicesEligible: 8, DevicesChecked: 0, Limited: true, Reason: "SMART/NVMe tools unavailable",
+	}}
+	b, err := json.Marshal(metrics)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"device_health_coverage":{"devices_eligible":8,"devices_checked":0,"limited":true,"reason":"SMART/NVMe tools unavailable"}`) {
+		t.Fatalf("coverage missing from JSON: %s", b)
+	}
+	var roundTrip Metrics
+	if err := json.Unmarshal(b, &roundTrip); err != nil {
+		t.Fatal(err)
+	}
+	if roundTrip.DeviceHealthCoverage == nil || roundTrip.DeviceHealthCoverage.DevicesEligible != 8 || roundTrip.DeviceHealthCoverage.DevicesChecked != 0 || !roundTrip.DeviceHealthCoverage.Limited || roundTrip.DeviceHealthCoverage.Reason != "SMART/NVMe tools unavailable" {
+		t.Fatalf("coverage did not round trip: %+v", roundTrip.DeviceHealthCoverage)
 	}
 }
 

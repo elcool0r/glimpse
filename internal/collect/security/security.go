@@ -36,9 +36,11 @@ const (
 	journalWindow      = "1h"
 	journalWindowLabel = "the last hour"
 	journalMaxRecords  = "5000"
-	// authprivFacility selects syslog authpriv, where sshd, sudo and PAM
-	// record authentication outcomes. Priority cannot be used instead: these
-	// records are informational, not warnings.
+	// authFacility and authprivFacility cover the two syslog facilities used
+	// for authentication outcomes. OpenSSH defaults to AUTH; PAM and sudo may
+	// use AUTHPRIV. Priority cannot be used instead: these records are often
+	// informational rather than warnings.
+	authFacility     = "SYSLOG_FACILITY=4"
 	authprivFacility = "SYSLOG_FACILITY=10"
 	// journalEventsWindow matches the timeline's own "today" scope, unlike the
 	// 1h journalWindow above (which bounds the noisier failed-auth *count*
@@ -166,9 +168,10 @@ func (c *Collector) Collect(ctx context.Context) (collect.Data, error) {
 	var sudoCommands []model.SudoEvent
 	if path, err := lookup("journalctl"); err == nil {
 		s.JournalWindow = journalWindow
-		// Authentication outcomes come from the authpriv facility; scanning an
-		// unfiltered record tail found them only by luck.
-		if raw, runErr := boundedCommand(ctx, timeout, run, path, "--since=-"+journalWindow, "--no-pager", "--output=cat", "--lines="+journalMaxRecords, authprivFacility); runErr == nil {
+		// Authentication outcomes come from AUTH or AUTHPRIV. journalctl's "+"
+		// separator is an explicit disjunction; this remains a bounded,
+		// source-filtered query rather than an unfiltered journal tail.
+		if raw, runErr := boundedCommand(ctx, timeout, run, path, "--since=-"+journalWindow, "--no-pager", "--output=cat", "--lines="+journalMaxRecords, authFacility, "+", authprivFacility); runErr == nil {
 			observed = true
 			auth, _, _ := ParseJournalSecurity(string(raw))
 			s.FailedAuthAttempts = uintPtr(auth)

@@ -163,8 +163,8 @@ func TestJournalQueriesAreFilteredAndWindowed(t *testing.T) {
 		t.Fatalf("queries=%q", queries)
 	}
 	auth := strings.Join(queries[0], " ")
-	if !strings.Contains(auth, authprivFacility) {
-		t.Fatalf("authentication query is not filtered to the auth facility: %q", auth)
+	if !strings.Contains(auth, authFacility) || !strings.Contains(auth, authprivFacility) || !strings.Contains(auth, " + ") {
+		t.Fatalf("authentication query is not an AUTH/AUTHPRIV disjunction: %q", auth)
 	}
 	if !strings.Contains(auth, "--since=-"+journalWindow) {
 		t.Fatalf("authentication query has no bounded window: %q", auth)
@@ -179,6 +179,35 @@ func TestJournalQueriesAreFilteredAndWindowed(t *testing.T) {
 	}
 	if data.Security == nil || data.Security.JournalWindow != journalWindow {
 		t.Fatalf("window not reported to consumers: %+v", data.Security)
+	}
+}
+
+func TestCollectCountsAuthOnlyFailedLogins(t *testing.T) {
+	c := New()
+	c.readFile = func(string) ([]byte, error) { return nil, os.ErrNotExist }
+	c.readDir = func(string) ([]os.DirEntry, error) { return nil, os.ErrNotExist }
+	c.lookPath = func(name string) (string, error) {
+		if name == "journalctl" {
+			return "/usr/bin/journalctl", nil
+		}
+		return "", errors.New("missing")
+	}
+	c.run = func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		joined := strings.Join(args, " ")
+		if strings.Contains(joined, authFacility) || strings.Contains(joined, authprivFacility) {
+			if !strings.Contains(joined, authFacility) || !strings.Contains(joined, authprivFacility) || !strings.Contains(joined, " + ") {
+				t.Fatalf("authentication query does not request both facilities: %q", joined)
+			}
+			return []byte("sshd: Failed password for invalid user test from 192.0.2.1\n"), nil
+		}
+		return nil, nil
+	}
+	data, err := c.Collect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if data.Security == nil || data.Security.FailedAuthAttempts == nil || *data.Security.FailedAuthAttempts != 1 {
+		t.Fatalf("AUTH-only failed login was not counted: %+v", data.Security)
 	}
 }
 

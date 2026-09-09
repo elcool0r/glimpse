@@ -69,6 +69,31 @@ func TestMemoryPressureFiresWithPSI(t *testing.T) {
 	}
 }
 
+func TestMemoryPressureDoesNotTreatUnknownAvailabilityAsZero(t *testing.T) {
+	unknown := false
+	report := model.Report{Metrics: model.Metrics{
+		CPU:      &model.CPU{},
+		Memory:   &model.Memory{AvailableValid: &unknown, AvailableFraction: 0, SwapInBytes: 4096},
+		Pressure: &model.Pressure{Memory: model.PressureResource{SomeAvg10: 5}},
+	}}
+	Report(&report)
+	if findingByID(report, "memory-pressure") != nil {
+		t.Fatalf("unknown MemAvailable produced memory pressure: %+v", report.Findings)
+	}
+}
+
+func TestMemoryPressureStillFiresForMeasuredZeroAvailability(t *testing.T) {
+	valid := true
+	report := model.Report{Metrics: model.Metrics{
+		CPU:    &model.CPU{},
+		Memory: &model.Memory{AvailableValid: &valid, AvailableFraction: 0, SwapInBytes: 4096},
+	}}
+	Report(&report)
+	if findingByID(report, "memory-pressure") == nil {
+		t.Fatalf("measured zero MemAvailable did not produce memory pressure: %+v", report.Findings)
+	}
+}
+
 func TestResourceFileDescriptorsFiresNearCeiling(t *testing.T) {
 	report := model.Report{Metrics: model.Metrics{
 		CPU:       &model.CPU{},

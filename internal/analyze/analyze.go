@@ -20,7 +20,7 @@ func Report(report *model.Report) {
 		findings = append(findings, findingWithDiagnostic("cpu-steal", model.SeverityWarning, "cpu", "CPU time lost to the hypervisor", fmt.Sprintf("Steal averaged %.1f%% during the sample and CPU PSI some avg10 was %.1f%%.", cpu.Steal*100, m.Pressure.CPU.SomeAvg10), "Inspect hypervisor contention and the VM CPU allocation.", "watch -n 1 'grep cpu /proc/stat'", 10))
 	}
 
-	if mem := m.Memory; mem != nil && mem.AvailableFraction < memoryAvailableWarning && ((m.Pressure != nil && m.Pressure.Memory.SomeAvg10 >= memoryPressureWarning) || mem.SwapInBytes > 0 || mem.SwapOutBytes > 0) {
+	if mem := m.Memory; mem != nil && memoryAvailable(mem) && mem.AvailableFraction < memoryAvailableWarning && ((m.Pressure != nil && m.Pressure.Memory.SomeAvg10 >= memoryPressureWarning) || mem.SwapInBytes > 0 || mem.SwapOutBytes > 0) {
 		findings = append(findings, findingWithDiagnostic("memory-pressure", model.SeverityWarning, "memory", "Memory pressure observed", fmt.Sprintf("MemAvailable is %.1f%%; memory PSI some avg10 is %.1f%%; swap activity during the sample was %s.", mem.AvailableFraction*100, pressureMemory(m.Pressure), bytes(mem.SwapInBytes+mem.SwapOutBytes)), "Inspect top memory consumers and cgroup limits.", "ps aux --sort=-%mem | head -11", 12))
 	}
 	for _, fs := range m.Filesystems {
@@ -47,11 +47,15 @@ func Report(report *model.Report) {
 				if used >= inodeFull {
 					severity, impact = model.SeverityCritical, 20
 				}
-				findings = append(findings, finding("filesystem-inodes-"+fs.MountPoint, severity, "filesystem", "Filesystem inode capacity nearly exhausted", fmt.Sprintf("%s has %d of %d inodes free (%.1f%% used).", fs.MountPoint, fs.InodesFree, fs.InodesTotal, used*100), "Inspect directories with many small files and their retention policies.", impact))
+				cmd := fmt.Sprintf("df -i %s && find %s -maxdepth 1 -type d -exec bash -c 'printf \"%%s %%s\\\\n\" $(find \"{}\" -type f 2>/dev/null | wc -l) \"{}\"' \\; | sort -rn | head -10", fs.MountPoint, fs.MountPoint)
+				findings = append(findings, findingWithDiagnostic("filesystem-inodes-"+fs.MountPoint, severity, "filesystem", "Filesystem inode capacity nearly exhausted", fmt.Sprintf("%s has %d of %d inodes free (%.1f%% used).", fs.MountPoint, fs.InodesFree, fs.InodesTotal, used*100), "Inspect directories with many small files and their retention policies.", cmd, impact))
 			}
 		}
 	}
 	for _, n := range m.Network {
+		if !intervalSampled(n.Sampled) {
+			continue
+		}
 		for _, direction := range []struct {
 			name                             string
 			packets, errors, drops, overruns uint64
@@ -70,7 +74,8 @@ func Report(report *model.Report) {
 				if signal.count < networkMinimumEvents || ratio < networkWarningRatio {
 					continue
 				}
-				findings = append(findings, finding("network-"+n.Name+"-"+direction.name+"-"+signal.name, model.SeverityWarning, "network", "Elevated network "+signal.name, fmt.Sprintf("%s %s recorded %d %s alongside %d packets during the sample (%.1f%%).", n.Name, direction.name, signal.count, signal.name, direction.packets, ratio*100), "Inspect interface and peer counters; for drops and overruns, also inspect queues and application receive capacity.", 7))
+				cmd := fmt.Sprintf("ethtool -S %s 2>/dev/null | grep -i \"%s.*%s\" || ip -s link show %s", n.Name, direction.name, signal.name, n.Name)
+				findings = append(findings, findingWithDiagnostic("network-"+n.Name+"-"+direction.name+"-"+signal.name, model.SeverityWarning, "network", "Elevated network "+signal.name, fmt.Sprintf("%s %s recorded %d %s alongside %d packets during the sample (%.1f%%).", n.Name, direction.name, signal.count, signal.name, direction.packets, ratio*100), "Inspect interface and peer counters; for drops and overruns, also inspect queues and application receive capacity.", cmd, 7))
 			}
 		}
 		findings = append(findings, linkFindings(n)...)
@@ -85,9 +90,11 @@ func Report(report *model.Report) {
 		// operation. Only crossing the hardware's own limit is a warning.
 		switch {
 		case t.TemperatureC >= t.CriticalC:
-			findings = append(findings, finding("thermal-"+t.Name, model.SeverityWarning, "thermal", "Temperature at or above critical limit", fmt.Sprintf("%s is %.1f°C (critical %.1f°C).", t.Name, t.TemperatureC, t.CriticalC), "Check cooling, airflow, and load; sustained operation at this temperature will throttle or damage hardware.", 10))
+			cmd := fmt.Sprintf("sensors 2>/dev/null | grep -A2 \"%s\"", t.Name)
+			findings = append(findings, findingWithDiagnostic("thermal-"+t.Name, model.SeverityWarning, "thermal", "Temperature at or above critical limit", fmt.Sprintf("%s is %.1f°C (critical %.1f°C).", t.Name, t.TemperatureC, t.CriticalC), "Check cooling, airflow, and load; sustained operation at this temperature will throttle or damage hardware.", cmd, 10))
 		case t.TemperatureC >= t.CriticalC-thermalMargin:
-			findings = append(findings, finding("thermal-"+t.Name, model.SeverityInfo, "thermal", "Temperature approaching critical limit", fmt.Sprintf("%s is %.1f°C, within %.0f°C of its %.1f°C critical limit.", t.Name, t.TemperatureC, thermalMargin, t.CriticalC), "Expected under sustained load on many CPUs; check cooling and airflow if it persists at idle.", 0))
+			cmd := fmt.Sprintf("sensors 2>/dev/null | grep -A2 \"%s\"", t.Name)
+			findings = append(findings, findingWithDiagnostic("thermal-"+t.Name, model.SeverityInfo, "thermal", "Temperature approaching critical limit", fmt.Sprintf("%s is %.1f°C, within %.0f°C of its %.1f°C critical limit.", t.Name, t.TemperatureC, thermalMargin, t.CriticalC), "Expected under sustained load on many CPUs; check cooling and airflow if it persists at idle.", cmd, 0))
 		}
 	}
 	if p := m.Processes; p != nil && p.Zombies > 0 {
@@ -95,10 +102,12 @@ func Report(report *model.Report) {
 		findings = append(findings, finding("zombies", model.SeverityInfo, "process", zombieTitle(p), summary, suggestion, 0))
 	}
 	if p := m.Processes; p != nil && len(p.StuckProcesses) > 0 {
-		findings = append(findings, stuckProcessFinding(p))
+		f := endpointDStateFinding(p)
+		f.DiagnosticCommand = "ps aux | grep -E ' D ' && lsof -p <pid> 2>/dev/null"
+		findings = append(findings, f)
 	}
 	if s := m.Systemd; s != nil && len(s.FailedUnits) > 0 {
-		findings = append(findings, finding("failed-units", model.SeverityCritical, "services", "Failed systemd units", failedUnitsSummary(s), "Run systemctl --failed and inspect the affected unit logs.", 25))
+		findings = append(findings, findingWithDiagnostic("failed-units", model.SeverityCritical, "services", "Failed systemd units", failedUnitsSummary(s), "Run systemctl --failed and inspect the affected unit logs.", "systemctl --failed && systemctl status <unit>", 25))
 	}
 	if s := m.Systemd; s != nil {
 		// A unit using Restart=always crash-looping never appears in
@@ -112,14 +121,20 @@ func Report(report *model.Report) {
 			if u.RestartsDelta >= 3 {
 				severity, impact = model.SeverityCritical, 25
 			}
-			findings = append(findings, finding("systemd-restarting-"+u.Unit, severity, "services", fmt.Sprintf("Systemd unit %s is restarting repeatedly", u.Unit),
+			cmd := fmt.Sprintf("journalctl -u %s --since '30 minutes ago' | tail -30", u.Unit)
+			findings = append(findings, findingWithDiagnostic("systemd-restarting-"+u.Unit, severity, "services", fmt.Sprintf("Systemd unit %s is restarting repeatedly", u.Unit),
 				fmt.Sprintf("%s restarted %d time(s) during the sampling window. A unit does not normally restart while being observed; this can mean the service is crash-looping even though it may show as active between restarts.", u.Unit, u.RestartsDelta),
-				fmt.Sprintf("Inspect recent logs (journalctl -u %s) and the unit's exit status.", u.Unit), impact))
+				fmt.Sprintf("Inspect recent logs (journalctl -u %s) and the unit's exit status.", u.Unit), cmd, impact))
 		}
 	}
 	if k := m.Kernel; k != nil {
 		for _, event := range k.Events {
-			findings = append(findings, kernelFinding(event))
+			var eventTime *time.Time
+			if event.AgeSeconds != nil {
+				t := report.GeneratedAt.Add(-time.Duration(*event.AgeSeconds) * time.Second)
+				eventTime = &t
+			}
+			findings = append(findings, kernelFinding(event, eventTime))
 		}
 	}
 	findings = append(findings, diskFindings(report)...)
@@ -208,13 +223,9 @@ func zombieDetails(processes *model.Processes) (string, string) {
 	return fmt.Sprintf("%d zombie process(es): %s%s.", processes.Zombies, strings.Join(items, "; "), more), suggestion
 }
 
-// stuckProcessFinding reports processes the kernel had in uninterruptible
-// sleep (D state) for the entire sampling window -- a process cannot be
-// killed out of D state, and its parent's load contribution keeps rising
-// for as long as it stays there. A brief, one-boundary D state is normal and
-// not reported at all (see stuckInD); this only fires once a process has
-// already been stuck the whole time this report was watching.
-func stuckProcessFinding(processes *model.Processes) model.Finding {
+// endpointDStateFinding reports process identities observed in D state at
+// both sampling boundaries without inferring their state between endpoints.
+func endpointDStateFinding(processes *model.Processes) model.Finding {
 	items := make([]string, 0, len(processes.StuckProcesses))
 	for _, process := range processes.StuckProcesses {
 		item := fmt.Sprintf("PID %d (%s)", process.PID, process.Command)
@@ -223,13 +234,9 @@ func stuckProcessFinding(processes *model.Processes) model.Finding {
 		}
 		items = append(items, item)
 	}
-	severity, impact := model.SeverityWarning, 10
-	if len(processes.StuckProcesses) >= 3 {
-		severity, impact = model.SeverityCritical, 18
-	}
-	return finding("process-stuck-uninterruptible", severity, "process", "Process stuck in uninterruptible sleep (D state)",
-		fmt.Sprintf("%d process(es) stayed in D state for the entire sampling window: %s. A process in this state is waiting on the kernel (usually disk or NFS I/O) and cannot be killed until that wait resolves.", len(processes.StuckProcesses), strings.Join(items, "; ")),
-		"Inspect the underlying storage or NFS mount for the affected process; if it never clears, the backing device or server is the more likely fault than the process itself.", impact)
+	return finding("process-stuck-uninterruptible", model.SeverityInfo, "process", "Processes observed in uninterruptible sleep (D state) at both boundaries",
+		fmt.Sprintf("%d process(es) were observed in D state at both sampling boundaries: %s. Endpoint observations do not establish continuous D-state residency between them.", len(processes.StuckProcesses), strings.Join(items, "; ")),
+		"Inspect the affected process and its storage or NFS dependencies if the condition recurs or host I/O pressure is elevated.", 0)
 }
 
 func zombieTitle(processes *model.Processes) string {
@@ -250,24 +257,24 @@ func zombieTitle(processes *model.Processes) string {
 	return "Zombie: " + strings.Join(items, "; ")
 }
 
-func cgroupFindings(cgroup *model.CgroupV2, pressure *model.Pressure) []model.Finding {
+func cgroupFindings(cgroup *model.CgroupV2, _ *model.Pressure) []model.Finding {
 	if cgroup == nil || !cgroup.Available {
 		return nil
 	}
 	var findings []model.Finding
 	if cgroupValid(cgroup.MemoryEventsSampled) && cgroup.MemoryOOMKillDelta > 0 {
-		findings = append(findings, finding("cgroup-oom-kill", model.SeverityCritical, "cgroup", "Cgroup OOM kills during sample", fmt.Sprintf("The current cgroup recorded %d OOM kill(s) during the sampling window.", cgroup.MemoryOOMKillDelta), "Inspect the workload's memory limit and the largest memory consumers.", 25))
+		findings = append(findings, findingWithDiagnostic("cgroup-oom-kill", model.SeverityCritical, "cgroup", "Cgroup OOM kills during sample", fmt.Sprintf("The current cgroup recorded %d OOM kill(s) during the sampling window.", cgroup.MemoryOOMKillDelta), "Inspect the workload's memory limit and the largest memory consumers.", "systemctl show --property=MemoryLimit --value <unit> 2>/dev/null || cat /sys/fs/cgroup/memory/memory.max_usage_in_bytes", 25))
 	} else if cgroupValid(cgroup.MemoryEventsSampled) && cgroup.MemoryOOMDelta > 0 {
-		findings = append(findings, finding("cgroup-oom", model.SeverityWarning, "cgroup", "Cgroup memory allocation failures", fmt.Sprintf("The current cgroup recorded %d memory OOM event(s) during the sampling window.", cgroup.MemoryOOMDelta), "Inspect the workload's memory limit and memory demand.", 15))
+		findings = append(findings, findingWithDiagnostic("cgroup-oom", model.SeverityWarning, "cgroup", "Cgroup memory allocation failures", fmt.Sprintf("The current cgroup recorded %d memory OOM event(s) during the sampling window.", cgroup.MemoryOOMDelta), "Inspect the workload's memory limit and memory demand.", "systemctl show --property=MemoryLimit --value <unit> 2>/dev/null || cat /sys/fs/cgroup/memory/memory.max_usage_in_bytes", 15))
 	}
 	if cgroupValid(cgroup.CPUStatSampled) && cgroup.CPUUsageSecondsDelta >= .1 && cgroup.CPUThrottledSecondsDelta >= .1 && cgroup.CPUThrottledSecondsDelta/cgroup.CPUUsageSecondsDelta >= .10 {
-		findings = append(findings, finding("cgroup-cpu-throttling", model.SeverityWarning, "cgroup", "Cgroup CPU quota throttling", fmt.Sprintf("The current cgroup spent %.1fs throttled while using %.1fs CPU during the sample.", cgroup.CPUThrottledSecondsDelta, cgroup.CPUUsageSecondsDelta), "Inspect the CPU quota and runnable workload in this cgroup.", 10))
+		findings = append(findings, findingWithDiagnostic("cgroup-cpu-throttling", model.SeverityWarning, "cgroup", "Cgroup CPU quota throttling", fmt.Sprintf("The current cgroup spent %.1fs throttled while using %.1fs CPU during the sample.", cgroup.CPUThrottledSecondsDelta, cgroup.CPUUsageSecondsDelta), "Inspect the CPU quota and runnable workload in this cgroup.", "systemctl show --property=CPUQuotaPerSecUSec --value <unit> 2>/dev/null || cat /sys/fs/cgroup/cpu/cpu.stat | grep throttled", 10))
 	}
 	if cgroupValid(cgroup.PIDsCurrentValid) && cgroupValid(cgroup.PIDsMaxValid) && cgroup.PIDsMax != nil && *cgroup.PIDsMax > 0 && fraction(cgroup.PIDsCurrent, *cgroup.PIDsMax) >= .95 {
-		findings = append(findings, finding("cgroup-pids-limit", model.SeverityWarning, "cgroup", "Cgroup PID limit nearly exhausted", fmt.Sprintf("The current cgroup uses %d of %d allowed PIDs.", cgroup.PIDsCurrent, *cgroup.PIDsMax), "Inspect process growth and raise the cgroup PID limit only if demand is expected.", 10))
+		findings = append(findings, findingWithDiagnostic("cgroup-pids-limit", model.SeverityWarning, "cgroup", "Cgroup PID limit nearly exhausted", fmt.Sprintf("The current cgroup uses %d of %d allowed PIDs.", cgroup.PIDsCurrent, *cgroup.PIDsMax), "Inspect process growth and raise the cgroup PID limit only if demand is expected.", "ps --cgroup <cgroup-path> -eo pid,cmd | wc -l", 10))
 	}
-	if cgroupValid(cgroup.MemoryCurrentValid) && cgroupValid(cgroup.MemoryMaxValid) && cgroup.MemoryMaxBytes != nil && *cgroup.MemoryMaxBytes > 0 && fraction(cgroup.MemoryCurrentBytes, *cgroup.MemoryMaxBytes) >= .95 && ((cgroupValid(cgroup.MemoryEventsSampled) && (cgroup.MemoryOOMDelta > 0 || cgroup.MemoryOOMKillDelta > 0)) || pressure != nil && pressure.Memory.SomeAvg10 >= 1) {
-		findings = append(findings, finding("cgroup-memory-limit", model.SeverityWarning, "cgroup", "Cgroup memory limit under pressure", fmt.Sprintf("The current cgroup uses %.1f%% of its %s memory limit with corroborating memory pressure.", fraction(cgroup.MemoryCurrentBytes, *cgroup.MemoryMaxBytes)*100, bytes(*cgroup.MemoryMaxBytes)), "Inspect the cgroup memory limit and workload memory demand.", 12))
+	if cgroupValid(cgroup.MemoryCurrentValid) && cgroupValid(cgroup.MemoryMaxValid) && cgroup.MemoryMaxBytes != nil && *cgroup.MemoryMaxBytes > 0 && fraction(cgroup.MemoryCurrentBytes, *cgroup.MemoryMaxBytes) >= .95 && ((cgroupValid(cgroup.MemoryEventsSampled) && (cgroup.MemoryOOMDelta > 0 || cgroup.MemoryOOMKillDelta > 0)) || (cgroupValid(cgroup.MemoryPressureValid) && cgroup.MemoryPressure != nil && cgroup.MemoryPressure.SomeAvg10 >= 1)) {
+		findings = append(findings, findingWithDiagnostic("cgroup-memory-limit", model.SeverityWarning, "cgroup", "Cgroup memory limit under pressure", fmt.Sprintf("The current cgroup uses %.1f%% of its %s memory limit with corroborating memory pressure.", fraction(cgroup.MemoryCurrentBytes, *cgroup.MemoryMaxBytes)*100, bytes(*cgroup.MemoryMaxBytes)), "Inspect the cgroup memory limit and workload memory demand.", "systemctl show --property=MemoryLimit --value <unit> 2>/dev/null && ps aux --sort=-%mem | head -11", 12))
 	}
 	return findings
 }
@@ -287,20 +294,24 @@ func containerFindings(runtimes []model.ContainerRuntime) []model.Finding {
 			}
 			prefix := "container-" + runtime.Runtime + "-" + name
 			if container.OOMKilled {
-				findings = append(findings, finding(prefix+"-oom", model.SeverityCritical, "containers", "Container was OOM-killed", fmt.Sprintf("%s container %s reports an OOM-killed state.", runtime.Runtime, name), "Inspect its memory limit, recent logs, and workload memory demand.", 20))
+				cmd := fmt.Sprintf("%s inspect %s --format='{{.HostConfig.Memory}}'", runtime.Runtime, name)
+				findings = append(findings, findingWithDiagnostic(prefix+"-oom", model.SeverityCritical, "containers", "Container was OOM-killed", fmt.Sprintf("%s container %s reports an OOM-killed state.", runtime.Runtime, name), "Inspect its memory limit, recent logs, and workload memory demand.", cmd, 20))
 			}
 			if container.Healthy != nil && !*container.Healthy {
-				findings = append(findings, finding(prefix+"-unhealthy", model.SeverityWarning, "containers", "Container health check is failing", fmt.Sprintf("%s container %s is marked unhealthy.", runtime.Runtime, name), "Inspect the container health check and recent application logs.", 12))
+				cmd := fmt.Sprintf("%s inspect %s --format='{{.State.Health.Status}}'", runtime.Runtime, name)
+				findings = append(findings, findingWithDiagnostic(prefix+"-unhealthy", model.SeverityWarning, "containers", "Container health check is failing", fmt.Sprintf("%s container %s is marked unhealthy.", runtime.Runtime, name), "Inspect the container health check and recent application logs.", cmd, 12))
 			}
 			if container.RestartCount > 0 {
 				severity, impact := model.SeverityWarning, 12
 				if container.RestartCount >= 3 {
 					severity, impact = model.SeverityCritical, 20
 				}
-				findings = append(findings, finding(prefix+"-restarts", severity, "containers", "Container restarted during sample", fmt.Sprintf("%s container %s restarted %d time(s) during the sampling window.", runtime.Runtime, name, container.RestartCount), "Inspect exit status and recent application logs.", impact))
+				cmd := fmt.Sprintf("%s logs --tail 30 %s", runtime.Runtime, name)
+				findings = append(findings, findingWithDiagnostic(prefix+"-restarts", severity, "containers", "Container restarted during sample", fmt.Sprintf("%s container %s restarted %d time(s) during the sampling window.", runtime.Runtime, name, container.RestartCount), "Inspect exit status and recent application logs.", cmd, impact))
 			}
 			if strings.EqualFold(container.State, "exited") && container.HasRestartPolicy {
-				findings = append(findings, finding(prefix+"-exited", model.SeverityWarning, "containers", "Restart-managed container is exited", fmt.Sprintf("%s container %s is exited despite a restart policy.", runtime.Runtime, name), "Inspect exit status, runtime events, and the restart policy.", 10))
+				cmd := fmt.Sprintf("%s logs --tail 20 %s", runtime.Runtime, name)
+				findings = append(findings, findingWithDiagnostic(prefix+"-exited", model.SeverityWarning, "containers", "Restart-managed container is exited", fmt.Sprintf("%s container %s is exited despite a restart policy.", runtime.Runtime, name), "Inspect exit status, runtime events, and the restart policy.", cmd, 10))
 			}
 			// A log line containing the word "error" is not a failure. Matching
 			// it as one turned an HTTP path, a package name and a successful
@@ -311,26 +322,30 @@ func containerFindings(runtimes []model.ContainerRuntime) []model.Finding {
 			// score.
 			specific, generic := partitionLogEvents(container.LogEvents)
 			if len(specific) > 0 {
+				cmd := fmt.Sprintf("%s logs --since 1h --timestamps %s 2>/dev/null | grep -iE 'oom|segmentation|panic|abort|signal'", runtime.Runtime, name)
 				findings = append(findings, model.Finding{
-					ID:          prefix + "-log-events",
-					Severity:    model.SeverityWarning,
-					Category:    "containers",
-					Title:       "Container log reports a failure",
-					Summary:     fmt.Sprintf("%s container %s logged %s in the last hour.", runtime.Runtime, name, describeLogKinds(specific)),
-					Evidence:    logEvidence(specific),
-					Suggestion:  fmt.Sprintf("Review with %s logs --since 1h %s", runtime.Runtime, name),
-					ScoreImpact: 8,
+					ID:                prefix + "-log-events",
+					Severity:          model.SeverityWarning,
+					Category:          "containers",
+					Title:             "Container log reports a failure",
+					Summary:           fmt.Sprintf("%s container %s logged %s in the last hour.", runtime.Runtime, name, describeLogKinds(specific)),
+					Evidence:          logEvidence(specific),
+					Suggestion:        fmt.Sprintf("Review with %s logs --since 1h %s", runtime.Runtime, name),
+					DiagnosticCommand: cmd,
+					ScoreImpact:       8,
 				})
 			} else if len(generic) > 0 {
+				cmd := fmt.Sprintf("%s logs --since 1h --timestamps %s 2>/dev/null | head -20", runtime.Runtime, name)
 				findings = append(findings, model.Finding{
-					ID:          prefix + "-log-messages",
-					Severity:    model.SeverityInfo,
-					Category:    "containers",
-					Title:       fmt.Sprintf("Container %s logged %d error/failure line(s)", name, len(generic)),
-					Summary:     fmt.Sprintf("%s container %s logged lines matching generic error wording; this is context, not a detected fault.", runtime.Runtime, name),
-					Evidence:    logEvidence(generic),
-					Suggestion:  fmt.Sprintf("Review with %s logs --since 1h %s", runtime.Runtime, name),
-					ScoreImpact: 0,
+					ID:                prefix + "-log-messages",
+					Severity:          model.SeverityInfo,
+					Category:          "containers",
+					Title:             fmt.Sprintf("Container %s logged %d error/failure line(s)", name, len(generic)),
+					Summary:           fmt.Sprintf("%s container %s logged lines matching generic error wording; this is context, not a detected fault.", runtime.Runtime, name),
+					Evidence:          logEvidence(generic),
+					Suggestion:        fmt.Sprintf("Review with %s logs --since 1h %s", runtime.Runtime, name),
+					DiagnosticCommand: cmd,
+					ScoreImpact:       0,
 				})
 			}
 		}
@@ -388,14 +403,17 @@ func zfsFindings(pools []model.ZFSPool) []model.Finding {
 	var findings []model.Finding
 	for _, pool := range pools {
 		if strings.Contains(strings.ToLower(pool.ScanState), "in progress") {
-			findings = append(findings, finding("zfs-pool-"+pool.Name+"-scan", model.SeverityInfo, "zfs", "ZFS maintenance scan is running", fmt.Sprintf("Pool %s: %s", pool.Name, pool.ScanState), "Monitor zpool status for completion; temporary extra disk activity is expected.", 0))
+			cmd := fmt.Sprintf("zpool status -v %s 2>/dev/null | grep -E 'scan:|state:'", pool.Name)
+			findings = append(findings, findingWithDiagnostic("zfs-pool-"+pool.Name+"-scan", model.SeverityInfo, "zfs", "ZFS maintenance scan is running", fmt.Sprintf("Pool %s: %s", pool.Name, pool.ScanState), "Monitor zpool status for completion; temporary extra disk activity is expected.", cmd, 0))
 		}
 		if pool.Health != "" && !strings.EqualFold(pool.Health, "ONLINE") {
-			findings = append(findings, finding("zfs-pool-"+pool.Name+"-health", model.SeverityCritical, "zfs", "ZFS pool is not ONLINE", fmt.Sprintf("Pool %s reports health %s.", pool.Name, pool.Health), "Run zpool status -v and repair or replace affected devices before relying on the pool.", 30))
+			cmd := fmt.Sprintf("zpool status -v %s 2>/dev/null | head -40", pool.Name)
+			findings = append(findings, findingWithDiagnostic("zfs-pool-"+pool.Name+"-health", model.SeverityCritical, "zfs", "ZFS pool is not ONLINE", fmt.Sprintf("Pool %s reports health %s.", pool.Name, pool.Health), "Run zpool status -v and repair or replace affected devices before relying on the pool.", cmd, 30))
 			continue
 		}
 		if pool.PermanentErrors {
-			findings = append(findings, finding("zfs-pool-"+pool.Name+"-permanent-errors", model.SeverityCritical, "zfs", "ZFS reports permanent data errors", fmt.Sprintf("Pool %s is ONLINE but zpool status reports permanent data errors.", pool.Name), "Restore affected data from backup and investigate zpool status -v immediately.", 30))
+			cmd := fmt.Sprintf("zpool status -v %s 2>/dev/null | grep -E 'state:|error'", pool.Name)
+			findings = append(findings, findingWithDiagnostic("zfs-pool-"+pool.Name+"-permanent-errors", model.SeverityCritical, "zfs", "ZFS reports permanent data errors", fmt.Sprintf("Pool %s is ONLINE but zpool status reports permanent data errors.", pool.Name), "Restore affected data from backup and investigate zpool status -v immediately.", cmd, 30))
 			continue
 		}
 		if zfsPoolHasErrors(pool) {
@@ -429,7 +447,8 @@ func zfsErrorFinding(pool model.ZFSPool) model.Finding {
 	if pool.Approximate || zfsVdevApproximate(pool.VdevErrors) {
 		summary += " Some counters use approximate scaled values."
 	}
-	return finding("zfs-pool-"+pool.Name+"-io-errors", model.SeverityWarning, "zfs", "ZFS pool reports device errors", summary, "Run zpool status -v and inspect the affected device path and cables.", 15)
+	cmd := fmt.Sprintf("zpool status -v %s 2>/dev/null | grep -E 'FAULTED|OFFLINE|errors|checksum'", pool.Name)
+	return findingWithDiagnostic("zfs-pool-"+pool.Name+"-io-errors", model.SeverityWarning, "zfs", "ZFS pool reports device errors", summary, "Run zpool status -v and inspect the affected device path and cables.", cmd, 15)
 }
 
 func zfsVdevApproximate(vdevs []model.ZFSVdevError) bool {
@@ -444,11 +463,14 @@ func zfsVdevApproximate(vdevs []model.ZFSVdevError) bool {
 func diskFindings(report *model.Report) []model.Finding {
 	var findings []model.Finding
 	for _, disk := range report.Metrics.Disks {
+		if !intervalSampled(disk.Sampled) {
+			continue
+		}
 		// Throughput alone is not a failure. Require saturation and a latency or
 		// queueing symptom, plus independent host pressure before warning.
 		queued := disk.AverageQueueDepth >= 2 || disk.AverageLatencyMillis >= 50
 		pressure := report.Metrics.Pressure != nil && report.Metrics.Pressure.IO.SomeAvg10 >= 1
-		iowait := report.Metrics.CPU != nil && report.Metrics.CPU.IOWait >= .10
+		iowait := report.Metrics.CPU != nil && (report.Metrics.CPU.Sampled == nil || *report.Metrics.CPU.Sampled) && report.Metrics.CPU.IOWait >= .10
 		blocked := report.Metrics.CPU != nil && report.Metrics.CPU.Blocked > 0
 		if disk.Utilization < .85 || !queued || !(pressure || iowait || blocked) {
 			continue
@@ -465,7 +487,8 @@ func diskFindings(report *model.Report) []model.Finding {
 		} else if iowait {
 			corroboration = "elevated iowait"
 		}
-		findings = append(findings, finding("disk-contention-"+disk.Name, severity, "disk", "Storage I/O contention", fmt.Sprintf("%s was %.0f%% busy with an average queue depth of %.1f and %.1f ms average I/O latency; additional evidence: %s.", disk.Name, disk.Utilization*100, disk.AverageQueueDepth, disk.AverageLatencyMillis, corroboration), "Inspect the busiest processes, device latency, and underlying storage path.", impact))
+		cmd := fmt.Sprintf("iostat -xz 1 3 2>/dev/null | grep %s", disk.Name)
+		findings = append(findings, findingWithDiagnostic("disk-contention-"+disk.Name, severity, "disk", "Storage I/O contention", fmt.Sprintf("%s was %.0f%% busy with an average queue depth of %.1f and %.1f ms average I/O latency; additional evidence: %s.", disk.Name, disk.Utilization*100, disk.AverageQueueDepth, disk.AverageLatencyMillis, corroboration), "Inspect the busiest processes, device latency, and underlying storage path.", cmd, impact))
 	}
 	return findings
 }
@@ -477,17 +500,19 @@ func diskFindings(report *model.Report) []model.Finding {
 func linkFindings(n model.Network) []model.Finding {
 	findings := make([]model.Finding, 0, 2)
 	if n.RXFrameErrors+n.TXCarrierErrors >= networkMinimumEvents {
-		findings = append(findings, finding("network-"+n.Name+"-link-errors", model.SeverityWarning, "network", "Physical link errors",
+		cmd := fmt.Sprintf("ethtool -S %s 2>/dev/null | grep -E 'rx_frame|tx_carrier' || cat /proc/net/dev | grep %s", n.Name, n.Name)
+		findings = append(findings, findingWithDiagnostic("network-"+n.Name+"-link-errors", model.SeverityWarning, "network", "Physical link errors",
 			fmt.Sprintf("%s recorded %d frame errors and %d carrier losses during the sample.", n.Name, n.RXFrameErrors, n.TXCarrierErrors),
-			"Inspect the cable, the transceiver or SFP, and the counters on the switch port.", 8))
+			"Inspect the cable, the transceiver or SFP, and the counters on the switch port.", cmd, 8))
 	}
 	// Collisions are normal on a half-duplex segment and carry no fault there.
 	// On a link the driver reports as full duplex they are the classic symptom
 	// of a duplex mismatch with the switch port.
 	if n.Collisions >= networkMinimumEvents && strings.EqualFold(strings.TrimSpace(n.Duplex), "full") {
-		findings = append(findings, finding("network-"+n.Name+"-collisions", model.SeverityWarning, "network", "Collisions on a full-duplex link",
+		cmd := fmt.Sprintf("ethtool %s 2>/dev/null | grep -E 'Speed|Duplex' && ethtool -S %s 2>/dev/null | grep collisions", n.Name, n.Name)
+		findings = append(findings, findingWithDiagnostic("network-"+n.Name+"-collisions", model.SeverityWarning, "network", "Collisions on a full-duplex link",
 			fmt.Sprintf("%s negotiated full duplex but recorded %d collisions during the sample.", n.Name, n.Collisions),
-			"Compare the duplex setting on this interface with the switch port; a mismatch is the usual cause.", 8))
+			"Compare the duplex setting on this interface with the switch port; a mismatch is the usual cause.", cmd, 8))
 	}
 	return findings
 }
@@ -505,9 +530,10 @@ func conntrackFindings(conntrack *model.Conntrack) []model.Finding {
 	if total == 0 {
 		return nil
 	}
-	return []model.Finding{finding("conntrack-drops", model.SeverityWarning, "network", "Connection tracking dropped packets",
+	cmd := "sysctl net.netfilter.nf_conntrack_count net.netfilter.nf_conntrack_max 2>/dev/null && conntrack -L 2>/dev/null | wc -l"
+	return []model.Finding{findingWithDiagnostic("conntrack-drops", model.SeverityWarning, "network", "Connection tracking dropped packets",
 		fmt.Sprintf("Netfilter recorded %d drops, %d early drops, and %d failed inserts during the sample.", conntrack.Drops, conntrack.EarlyDrops, conntrack.InsertFailed),
-		"Inspect the connection rate against nf_conntrack_max and the conntrack timeouts for the busiest protocol.", 12)}
+		"Inspect the connection rate against nf_conntrack_max and the conntrack timeouts for the busiest protocol.", cmd, 12)}
 }
 
 func tcpFindings(tcp *model.TCP, resources *model.Resources, ipv6 *model.IPv6Check) []model.Finding {
@@ -515,69 +541,86 @@ func tcpFindings(tcp *model.TCP, resources *model.Resources, ipv6 *model.IPv6Che
 		return nil
 	}
 	var findings []model.Finding
-	if tcp.SegmentsOut >= 100 && fraction(tcp.RetransmittedSegments, tcp.SegmentsOut) >= .02 {
-		severity, impact := model.SeverityWarning, 10
-		if fraction(tcp.RetransmittedSegments, tcp.SegmentsOut) >= .10 {
-			severity, impact = model.SeverityCritical, 20
+	if intervalSampled(tcp.Sampled) {
+		if tcp.SegmentsOut >= 100 && fraction(tcp.RetransmittedSegments, tcp.SegmentsOut) >= .02 {
+			severity, impact := model.SeverityWarning, 10
+			if fraction(tcp.RetransmittedSegments, tcp.SegmentsOut) >= .10 {
+				severity, impact = model.SeverityCritical, 20
+			}
+			summary := fmt.Sprintf("%d of %d outbound TCP segments were retransmitted during the sample (%.1f%%).", tcp.RetransmittedSegments, tcp.SegmentsOut, fraction(tcp.RetransmittedSegments, tcp.SegmentsOut)*100)
+			suggestion := "Inspect packet loss, interface counters, and the remote path."
+			// This counter is system-wide, not per-connection: any application that
+			// races a connection over IPv6 before falling back to IPv4 (or simply
+			// prefers IPv6 and never falls back) contributes its unanswered SYN
+			// retries to it too. When IPv6 is already reported unreachable, that is
+			// usually the more likely explanation and the one to fix first, rather
+			// than a separate, unrelated path problem.
+			if ipv6 != nil && ipv6.Available && ipv6.Sent > 0 && ipv6.Received == 0 {
+				summary += " This host's external IPv6 reachability check also failed during this sample; if any of this traffic was connections racing over IPv6 before falling back to IPv4, that alone can produce this many retransmits."
+				suggestion = "Fix or disable IPv6 first (see the IPv6 finding) and recheck this counter; if it persists afterward, then inspect packet loss, interface counters, and the remote path."
+			}
+			cmd := "ss -i 2>/dev/null | head -10 || netstat -s 2>/dev/null | grep retransmit"
+			findings = append(findings, findingWithDiagnostic("tcp-retransmits", severity, "network", "Elevated TCP retransmissions", summary, suggestion, cmd, impact))
 		}
-		summary := fmt.Sprintf("%d of %d outbound TCP segments were retransmitted during the sample (%.1f%%).", tcp.RetransmittedSegments, tcp.SegmentsOut, fraction(tcp.RetransmittedSegments, tcp.SegmentsOut)*100)
-		suggestion := "Inspect packet loss, interface counters, and the remote path."
-		// This counter is system-wide, not per-connection: any application that
-		// races a connection over IPv6 before falling back to IPv4 (or simply
-		// prefers IPv6 and never falls back) contributes its unanswered SYN
-		// retries to it too. When IPv6 is already reported unreachable, that is
-		// usually the more likely explanation and the one to fix first, rather
-		// than a separate, unrelated path problem.
-		if ipv6 != nil && ipv6.Available && ipv6.Sent > 0 && ipv6.Received == 0 {
-			summary += " This host's external IPv6 reachability check also failed during this sample; if any of this traffic was connections racing over IPv6 before falling back to IPv4, that alone can produce this many retransmits."
-			suggestion = "Fix or disable IPv6 first (see the IPv6 finding) and recheck this counter; if it persists afterward, then inspect packet loss, interface counters, and the remote path."
+		if tcp.ListenOverflows+tcp.ListenDrops > 0 {
+			// Naming somaxconn turns the finding from an observation into a number
+			// the reader can act on, since it is the ceiling every listener's
+			// requested backlog is silently capped to.
+			ceiling := ""
+			if resources != nil && resources.ListenBacklogMaximum > 0 {
+				ceiling = fmt.Sprintf(" net.core.somaxconn is %d.", resources.ListenBacklogMaximum)
+			}
+			cmd := "ss -ltn 2>/dev/null | head -15 || netstat -s 2>/dev/null | grep listen"
+			findings = append(findings, findingWithDiagnostic("tcp-listen-overflow", model.SeverityWarning, "network", "TCP listen queue overflow", fmt.Sprintf("The kernel recorded %d listen overflows or drops during the sample.%s", tcp.ListenOverflows+tcp.ListenDrops, ceiling), "Inspect the affected listener's backlog, accept rate, and file descriptor limits.", cmd, 12))
 		}
-		findings = append(findings, finding("tcp-retransmits", severity, "network", "Elevated TCP retransmissions", summary, suggestion, impact))
-	}
-	if tcp.ListenOverflows+tcp.ListenDrops > 0 {
-		// Naming somaxconn turns the finding from an observation into a number
-		// the reader can act on, since it is the ceiling every listener's
-		// requested backlog is silently capped to.
-		ceiling := ""
-		if resources != nil && resources.ListenBacklogMaximum > 0 {
-			ceiling = fmt.Sprintf(" net.core.somaxconn is %d.", resources.ListenBacklogMaximum)
+		if opens := tcp.ActiveOpens + tcp.PassiveOpens; opens >= 50 && fraction(tcp.AttemptFails, opens) >= .10 {
+			cmd := "ss -tn 2>/dev/null | head -20 || netstat -an | grep ESTAB"
+			findings = append(findings, findingWithDiagnostic("tcp-connect-failures", model.SeverityWarning, "network", "Elevated TCP connection failures", fmt.Sprintf("%d of %d TCP connection attempts failed during the sample.", tcp.AttemptFails, opens), "Inspect destination availability, DNS, firewall rules, and application logs.", cmd, 8))
 		}
-		findings = append(findings, finding("tcp-listen-overflow", model.SeverityWarning, "network", "TCP listen queue overflow", fmt.Sprintf("The kernel recorded %d listen overflows or drops during the sample.%s", tcp.ListenOverflows+tcp.ListenDrops, ceiling), "Inspect the affected listener's backlog, accept rate, and file descriptor limits.", 12))
-	}
-	if opens := tcp.ActiveOpens + tcp.PassiveOpens; opens >= 50 && fraction(tcp.AttemptFails, opens) >= .10 {
-		findings = append(findings, finding("tcp-connect-failures", model.SeverityWarning, "network", "Elevated TCP connection failures", fmt.Sprintf("%d of %d TCP connection attempts failed during the sample.", tcp.AttemptFails, opens), "Inspect destination availability, DNS, firewall rules, and application logs.", 8))
 	}
 	// Socket tables have explicit kernel ceilings, which is what makes a
 	// "large" socket count judgeable at all. An absolute threshold without one
 	// would fire on every busy host.
 	if resources != nil {
 		for _, limit := range []struct {
-			id, title, advice string
-			current, maximum  uint64
+			id, title, advice, cmd string
+			current, maximum       uint64
 		}{
-			{"tcp-time-wait-saturation", "TIME_WAIT table nearly exhausted", "Inspect connection churn and whether clients reuse connections; the kernel discards the oldest entries once the bucket is full.", tcp.TimeWaitSockets, resources.TimeWaitMaximum},
-			{"tcp-orphan-saturation", "Orphaned socket table nearly exhausted", "Inspect applications abandoning sockets with unsent data; the kernel resets orphans once the limit is reached.", tcp.OrphanSockets, resources.OrphanMaximum},
+			{"tcp-time-wait-saturation", "TIME_WAIT table nearly exhausted", "Inspect connection churn and whether clients reuse connections; the kernel discards the oldest entries once the bucket is full.", "ss -tan 2>/dev/null | grep TIME-WAIT | wc -l", tcp.TimeWaitSockets, resources.TimeWaitMaximum},
+			{"tcp-orphan-saturation", "Orphaned socket table nearly exhausted", "Inspect applications abandoning sockets with unsent data; the kernel resets orphans once the limit is reached.", "netstat -an 2>/dev/null | grep -E 'FIN_WAIT|CLOSE_WAIT' | wc -l", tcp.OrphanSockets, resources.OrphanMaximum},
 		} {
 			if limit.maximum == 0 || fraction(limit.current, limit.maximum) < resourceWarning {
 				continue
 			}
-			findings = append(findings, finding(limit.id, model.SeverityWarning, "network", limit.title,
+			findings = append(findings, findingWithDiagnostic(limit.id, model.SeverityWarning, "network", limit.title,
 				fmt.Sprintf("%d of %d entries are in use (%.0f%%).", limit.current, limit.maximum, fraction(limit.current, limit.maximum)*100),
-				limit.advice, 10))
+				limit.advice, limit.cmd, 10))
 		}
 	}
 	return findings
+}
+
+// intervalSampled keeps pre-validity reports compatible: only an explicit
+// false means that counter deltas were unavailable at one sampling boundary.
+func intervalSampled(sampled *bool) bool { return sampled == nil || *sampled }
+
+// memoryAvailable preserves compatibility with older reports, where the
+// absence of an explicit validity marker represented a measured value.
+func memoryAvailable(memory *model.Memory) bool {
+	return memory.AvailableValid == nil || *memory.AvailableValid
 }
 
 func deviceHealthFindings(devices []model.DeviceHealth) []model.Finding {
 	var findings []model.Finding
 	for _, device := range devices {
 		if device.OverallPassed != nil && !*device.OverallPassed || device.CriticalWarning != 0 || device.PendingSectors != 0 || device.Uncorrectable != 0 || device.MediaErrors != 0 {
-			findings = append(findings, finding("device-health-"+device.Device, model.SeverityCritical, "disk", "Device health requires attention", fmt.Sprintf("%s reported a SMART/NVMe health failure or uncorrectable media error.", device.Device), "Back up important data and inspect the device's SMART/NVMe log promptly.", 25))
+			cmd := fmt.Sprintf("smartctl -a /dev/%s 2>/dev/null | grep -E 'FAILED|Health Status|Critical Warning' || nvme smart-log /dev/%s", device.Device, device.Device)
+			findings = append(findings, findingWithDiagnostic("device-health-"+device.Device, model.SeverityCritical, "disk", "Device health requires attention", fmt.Sprintf("%s reported a SMART/NVMe health failure or uncorrectable media error.", device.Device), "Back up important data and inspect the device's SMART/NVMe log promptly.", cmd, 25))
 			continue
 		}
 		if device.AvailableSpare > 0 && device.AvailableSpare < .10 || device.PercentageUsed >= .95 {
-			findings = append(findings, finding("device-wear-"+device.Device, model.SeverityWarning, "disk", "Device endurance is nearly exhausted", fmt.Sprintf("%s reports %.0f%% spare remaining and %.0f%% endurance used.", device.Device, device.AvailableSpare*100, device.PercentageUsed*100), "Plan replacement and verify current backups.", 14))
+			cmd := fmt.Sprintf("smartctl -a /dev/%s 2>/dev/null | grep -iE 'Spare|Wear|Reallocated|Media' || nvme smart-log /dev/%s", device.Device, device.Device)
+			findings = append(findings, findingWithDiagnostic("device-wear-"+device.Device, model.SeverityWarning, "disk", "Device endurance is nearly exhausted", fmt.Sprintf("%s reports %.0f%% spare remaining and %.0f%% endurance used.", device.Device, device.AvailableSpare*100, device.PercentageUsed*100), "Plan replacement and verify current backups.", cmd, 14))
 		}
 	}
 	return findings
@@ -588,14 +631,16 @@ func timeSyncFindings(sync *model.TimeSync) []model.Finding {
 		return nil
 	}
 	if sync.Synchronized != nil && !*sync.Synchronized {
-		return []model.Finding{finding("time-unsynchronized", model.SeverityWarning, "time", "System clock is not synchronized", fmt.Sprintf("%s reports that the system clock is unsynchronized.", sync.Service), "Inspect the time synchronization service, sources, and network reachability.", 10)}
+		cmd := "timedatectl status || ntpq -p 2>/dev/null || chronyc tracking 2>/dev/null"
+		return []model.Finding{findingWithDiagnostic("time-unsynchronized", model.SeverityWarning, "time", "System clock is not synchronized", fmt.Sprintf("%s reports that the system clock is unsynchronized.", sync.Service), "Inspect the time synchronization service, sources, and network reachability.", cmd, 10)}
 	}
 	if sync.OffsetMillis != nil && abs(*sync.OffsetMillis) >= 1000 {
 		severity, impact := model.SeverityWarning, 8
 		if abs(*sync.OffsetMillis) >= 5000 {
 			severity, impact = model.SeverityCritical, 16
 		}
-		return []model.Finding{finding("time-offset", severity, "time", "Large clock offset", fmt.Sprintf("%s reports an offset of %.0f ms.", sync.Service, *sync.OffsetMillis), "Inspect time sources and correct clock synchronization before relying on timestamps.", impact)}
+		cmd := "timedatectl status || ntpq -p 2>/dev/null || chronyc tracking 2>/dev/null"
+		return []model.Finding{findingWithDiagnostic("time-offset", severity, "time", "Large clock offset", fmt.Sprintf("%s reports an offset of %.0f ms.", sync.Service, *sync.OffsetMillis), "Inspect time sources and correct clock synchronization before relying on timestamps.", cmd, impact)}
 	}
 	return nil
 }
@@ -611,12 +656,12 @@ func resourceFindings(resources *model.Resources) []model.Finding {
 	// The inotify watch count has no global kernel counter, so no usage rule
 	// exists for it; only its limits are reported as capacity facts.
 	for _, limit := range []struct {
-		id, title        string
+		id, title, cmd   string
 		current, maximum uint64
 	}{
-		{"file-descriptors", "File descriptor capacity nearly exhausted", resources.OpenFiles, resources.OpenFilesMaximum},
-		{"tasks", "Process and thread capacity nearly exhausted", resources.Processes, taskCeiling(resources)},
-		{"conntrack", "Conntrack table nearly exhausted", resources.Conntrack, resources.ConntrackMaximum},
+		{"file-descriptors", "File descriptor capacity nearly exhausted", "lsof -p $$ 2>/dev/null | wc -l || cat /proc/sys/fs/file-nr", resources.OpenFiles, resources.OpenFilesMaximum},
+		{"tasks", "Process and thread capacity nearly exhausted", "ps -eLf 2>/dev/null | wc -l || cat /proc/sys/kernel/pid_max", resources.Processes, taskCeiling(resources)},
+		{"conntrack", "Conntrack table nearly exhausted", "sysctl net.netfilter.nf_conntrack_count net.netfilter.nf_conntrack_max 2>/dev/null", resources.Conntrack, resources.ConntrackMaximum},
 	} {
 		if limit.maximum == 0 || fraction(limit.current, limit.maximum) < resourceWarning {
 			continue
@@ -625,7 +670,7 @@ func resourceFindings(resources *model.Resources) []model.Finding {
 		if fraction(limit.current, limit.maximum) >= resourceFull {
 			severity, impact = model.SeverityCritical, 20
 		}
-		findings = append(findings, finding("resource-"+limit.id, severity, "resources", limit.title, fmt.Sprintf("%d of %d (%0.f%%) are currently in use.", limit.current, limit.maximum, fraction(limit.current, limit.maximum)*100), "Identify consumers and raise the limit only after confirming expected demand.", impact))
+		findings = append(findings, findingWithDiagnostic("resource-"+limit.id, severity, "resources", limit.title, fmt.Sprintf("%d of %d (%0.f%%) are currently in use.", limit.current, limit.maximum, fraction(limit.current, limit.maximum)*100), "Identify consumers and raise the limit only after confirming expected demand.", limit.cmd, impact))
 	}
 	return findings
 }
@@ -633,7 +678,7 @@ func resourceFindings(resources *model.Resources) []model.Finding {
 // kernelFinding weighs a journal record by kind and by age. The journal scan
 // covers the current boot up to 24 hours, so without an age an incident from
 // overnight reads exactly as urgently as one happening now.
-func kernelFinding(event model.LogEvent) model.Finding {
+func kernelFinding(event model.LogEvent, eventTime *time.Time) model.Finding {
 	// A link coming back up is the recovery half of a link_down/link_up
 	// pair, not a fault on its own -- reporting it as a Warning would
 	// penalize a host for a NIC that already fixed itself.
@@ -642,13 +687,35 @@ func kernelFinding(event model.LogEvent) model.Finding {
 		if event.AgeSeconds != nil {
 			summary = fmt.Sprintf("%s (recorded %s ago)", summary, humanDuration(time.Duration(*event.AgeSeconds)*time.Second))
 		}
-		return finding("kernel-"+event.Kind, model.SeverityInfo, "kernel", "Kernel event: "+event.Kind, summary, "No action needed; this reports when the link came back up.", 0)
+		cmd := kernelDiagnosticCommand(event.Kind, eventTime)
+		return findingWithEventTime("kernel-"+event.Kind, model.SeverityInfo, "kernel", "Kernel event: "+event.Kind, summary, "No action needed; this reports when the link came back up.", cmd, eventTime, 0)
 	}
 	severity, impact := model.SeverityWarning, 12
 	if criticalKernelEvent(event.Kind) {
 		severity, impact = model.SeverityCritical, 25
 	}
 	summary := event.Message
+	suggestion := "Inspect the kernel journal and affected hardware or workload."
+
+	switch event.Kind {
+	case "oom":
+		suggestion = "Inspect the kernel journal and affected processes using the diagnostic command above."
+	case "panic":
+		suggestion = "Inspect the panic message and system state using the diagnostic command above."
+	case "oops":
+		suggestion = "Inspect the oops details and kernel module state using the diagnostic command above."
+	case "cgroup_oom":
+		suggestion = "Inspect cgroup OOM events and container/workload memory limits."
+	case "hardware_error":
+		suggestion = "Inspect hardware error details and EDAC counters."
+	case "filesystem_corruption":
+		suggestion = "Run filesystem check and restore from backup if necessary."
+	case "filesystem_readonly_remount":
+		suggestion = "Inspect filesystem error details and attempt remount."
+	case "disk_full":
+		suggestion = "Free disk space and investigate the cause."
+	}
+
 	if event.AgeSeconds != nil {
 		age := time.Duration(*event.AgeSeconds) * time.Second
 		if age > kernelEventRecent {
@@ -663,7 +730,42 @@ func kernelFinding(event model.LogEvent) model.Finding {
 		}
 		summary = fmt.Sprintf("%s (recorded %s ago)", summary, humanDuration(age))
 	}
-	return finding("kernel-"+event.Kind, severity, "kernel", "Kernel event: "+event.Kind, summary, "Inspect the kernel journal and affected hardware or workload.", impact)
+	cmd := kernelDiagnosticCommand(event.Kind, eventTime)
+	return findingWithEventTime("kernel-"+event.Kind, severity, "kernel", "Kernel event: "+event.Kind, summary, suggestion, cmd, eventTime, impact)
+}
+
+func kernelDiagnosticCommand(kind string, eventTime *time.Time) string {
+	var pattern string
+	switch kind {
+	case "oom":
+		pattern = "oom-killer"
+	case "panic":
+		pattern = "kernel panic"
+	case "oops":
+		pattern = "oops"
+	case "cgroup_oom":
+		pattern = "cgroup.*oom"
+	case "hardware_error":
+		pattern = "machine check|mce|hardware error"
+	case "filesystem_corruption":
+		pattern = "corrupted inode|bad block"
+	case "filesystem_readonly_remount":
+		pattern = "read-only|remount.*ro"
+	case "disk_full":
+		pattern = "no space|disk full|ENOSPC"
+	case "link_up", "link_down":
+		pattern = "link|carrier"
+	default:
+		return "journalctl -k | tail -50"
+	}
+
+	if eventTime != nil {
+		// Use the date of the event to avoid hardcoded time windows
+		dateStr := eventTime.Local().Format("2006-01-02")
+		return fmt.Sprintf("journalctl -k --since '%s' -q | grep -A3 -B3 -Ei '%s'", dateStr, pattern)
+	}
+	// Fallback if no event time: use a 24-hour window
+	return fmt.Sprintf("journalctl -k --since '24 hours ago' -q | grep -A3 -B3 -Ei '%s'", pattern)
 }
 
 func humanDuration(d time.Duration) string {
