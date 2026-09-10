@@ -35,6 +35,7 @@ import (
 	"github.com/elcool0r/glimpse/internal/collect/network"
 	"github.com/elcool0r/glimpse/internal/collect/networkstate"
 	"github.com/elcool0r/glimpse/internal/collect/packageactivity"
+	"github.com/elcool0r/glimpse/internal/collect/packageupdates"
 	"github.com/elcool0r/glimpse/internal/collect/pathmtu"
 	"github.com/elcool0r/glimpse/internal/collect/process"
 	"github.com/elcool0r/glimpse/internal/collect/resources"
@@ -135,7 +136,7 @@ func defaultCollectors(includeContainers, enableExternalChecks bool, disableProx
 		network.Collector{}, network.TCPCollector{}, networkstate.New(), thermal.Collector{},
 		process.Collector{}, systemd.New(), kernel.New(), timesync.New(), resources.New(),
 		security.New(), cgroupv2.New(), zfs.New(), storage.New(), hardware.New(),
-		storagehealth.New(), deletedfiles.New(), packageactivity.New(),
+		storagehealth.New(), deletedfiles.New(), packageactivity.New(), packageupdates.New(),
 	}
 	if includeContainers {
 		collectors = append(collectors, containers.New())

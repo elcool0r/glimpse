@@ -22,7 +22,18 @@ func backlogFindings(report *model.Report) []model.Finding {
 	findings = append(findings, ipv6CheckFindings(report.Metrics.IPv6Check)...)
 	findings = append(findings, deletedFilesFindings(report.Metrics.DeletedFiles)...)
 	findings = append(findings, hardwareErrorFindings(report.Metrics.Hardware)...)
+	findings = append(findings, packageUpdateFindings(report.Metrics.PackageUpdates)...)
 	return findings
+}
+
+func packageUpdateFindings(updates *model.PackageUpdates) []model.Finding {
+	if updates == nil || !updates.Available || updates.Count == 0 {
+		return nil
+	}
+	return []model.Finding{finding("package-updates", model.SeverityInfo, "packages",
+		fmt.Sprintf("%d package updates are available", updates.Count),
+		fmt.Sprintf("The local %s package metadata lists %d packages that can be upgraded. This check does not refresh repository metadata or install anything.", updates.Manager, updates.Count),
+		"Review the package changes and apply them through the normal package-manager workflow; refresh metadata first if this result may be stale.", 0)}
 }
 
 func memoryBacklogFindings(memory *model.Memory, pressure *model.Pressure) []model.Finding {

@@ -543,6 +543,9 @@ func apply(metrics *model.Metrics, data collect.Data) {
 	if data.PackageActivity != nil {
 		metrics.PackageActivity = data.PackageActivity
 	}
+	if data.PackageUpdates != nil {
+		metrics.PackageUpdates = data.PackageUpdates
+	}
 	if data.Logins != nil {
 		metrics.Logins = data.Logins
 	}

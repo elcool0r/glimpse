@@ -52,6 +52,7 @@ type Data struct {
 	Hardware             *model.HardwareErrors
 	Trends               []model.Trend
 	PackageActivity      []model.PackageActivity
+	PackageUpdates       *model.PackageUpdates
 	Logins               []model.LoginEvent
 	SudoCommands         []model.SudoEvent
 }

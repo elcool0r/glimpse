@@ -83,6 +83,7 @@ type Metrics struct {
 	Hardware             *HardwareErrors       `json:"hardware_errors,omitempty"`
 	Trends               []Trend               `json:"trends,omitempty"`
 	PackageActivity      []PackageActivity     `json:"package_activity,omitempty"`
+	PackageUpdates       *PackageUpdates       `json:"package_updates,omitempty"`
 	Logins               []LoginEvent          `json:"logins,omitempty"`
 	SudoCommands         []SudoEvent           `json:"sudo_commands,omitempty"`
 }
@@ -95,6 +96,15 @@ type PackageActivity struct {
 	At      time.Time `json:"at"`
 	Manager string    `json:"manager"`
 	Summary string    `json:"summary"`
+}
+
+// PackageUpdates is a read-only snapshot of updates offered by the local
+// package-manager metadata. It is not proof that the metadata is current.
+// dpkg has no remote repository knowledge, so Debian-family checks use apt.
+type PackageUpdates struct {
+	Available bool   `json:"available"`
+	Manager   string `json:"manager"`
+	Count     int    `json:"count"`
 }
 
 // LoginEvent is one real interactive login session, from wtmp (the `last`
