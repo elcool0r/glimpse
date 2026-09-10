@@ -393,7 +393,7 @@ func TestAllocatedBytesUsesBlocksWithoutLogicalFallback(t *testing.T) {
 	if got := allocatedBytes(sparse); got != 0 {
 		t.Fatalf("with zero blocks, want zero allocated bytes: got %d", got)
 	}
-	allocated := &syscall.Stat_t{Blocks: 8} // 8 * 512 = 4096 bytes allocated
+	allocated := &syscall.Stat_t{Blocks: 8, Size: 200 << 20} // 8 * 512 = 4096 bytes allocated
 	if got := allocatedBytes(allocated); got != 4096 {
 		t.Fatalf("allocatedBytes = %d, want 4096 (st_blocks*512), not the 200 MiB logical size", got)
 	}

@@ -257,8 +257,16 @@ func largestHolder(order []inodeKey, files map[inodeKey]*model.DeletedFile) (pid
 // allocatedBytes reports actual allocated filesystem space. st_blocks uses
 // 512-byte units on Linux, and a valid zero value means a fully sparse or
 // empty file consumes no disk blocks even when its logical size is enormous.
+// Some filesystems include a small amount of extent/metadata overhead in
+// st_blocks, so cap the result at the logical file size; this avoids reporting
+// more file data than the inode can contain while preserving sparse-file
+// accounting.
 func allocatedBytes(stat *syscall.Stat_t) uint64 {
-	return uint64(stat.Blocks) * 512
+	allocated := uint64(stat.Blocks) * 512
+	if stat.Size >= 0 && allocated > uint64(stat.Size) {
+		return uint64(stat.Size)
+	}
+	return allocated
 }
 
 // formatDevice renders a raw dev_t as the familiar "major:minor" form (as
