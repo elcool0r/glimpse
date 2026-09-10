@@ -330,7 +330,6 @@ func containerFindings(runtimes []model.ContainerRuntime) []model.Finding {
 					Title:             "Container log reports a failure",
 					Summary:           fmt.Sprintf("%s container %s logged %s in the last hour.", runtime.Runtime, name, describeLogKinds(specific)),
 					Evidence:          logEvidence(specific),
-					Suggestion:        fmt.Sprintf("Review with %s logs --since 1h %s", runtime.Runtime, name),
 					DiagnosticCommand: cmd,
 					ScoreImpact:       8,
 				})
@@ -343,7 +342,6 @@ func containerFindings(runtimes []model.ContainerRuntime) []model.Finding {
 					Title:             fmt.Sprintf("Container %s logged %d error/failure line(s)", name, len(generic)),
 					Summary:           fmt.Sprintf("%s container %s logged lines matching generic error wording; this is context, not a detected fault.", runtime.Runtime, name),
 					Evidence:          logEvidence(generic),
-					Suggestion:        fmt.Sprintf("Review with %s logs --since 1h %s", runtime.Runtime, name),
 					DiagnosticCommand: cmd,
 					ScoreImpact:       0,
 				})

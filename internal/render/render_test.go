@@ -296,7 +296,65 @@ func TestSecurityKernelTaintExplainsInfoInline(t *testing.T) {
 		Available: true, SELinux: "unknown", AppArmor: "enabled", KernelTaintMask: 4097, KernelTaintModules: []string{"zfs", "spl"},
 	}}, Findings: []model.Finding{{ID: "security-kernel-tainted", Severity: model.SeverityInfo, Category: "security"}}}, Options{ASCII: true})
 	if got := output.String(); !strings.Contains(got, "Security INFO") || !strings.Contains(got, "Kernel taint INFO  mask 4097 (modules zfs,spl)") {
-		t.Fatalf("security INFO lacks inline taint evidence:\n%s", got)
+		t.Fatalf("security summary or inline taint evidence is incorrect:\n%s", got)
+	}
+}
+
+func TestSecuritySummaryOnlyUsesRenderedSecurityChecks(t *testing.T) {
+	var output bytes.Buffer
+	Write(&output, model.Report{Metrics: model.Metrics{Security: &model.Security{
+		Available: true, SELinux: "unknown", AppArmor: "enabled", KernelTaintMask: 0,
+	}}, Findings: []model.Finding{{ID: "security-unrelated-advisory", Severity: model.SeverityInfo, Category: "security"}}}, Options{ASCII: true, Verbose: true})
+	if got := output.String(); !strings.Contains(got, "Security OK") {
+		t.Fatalf("unrendered security advisory downgraded the section badge:\n%s", got)
+	}
+}
+
+func TestSecuritySkipsInactiveMACPeerWhenAlternateFrameworkIsActive(t *testing.T) {
+	tests := []struct {
+		name  string
+		sec   model.Security
+		wants []string
+	}{
+		{
+			name: "apparmor active",
+			sec:  model.Security{Available: true, SELinux: "unknown", AppArmor: "enabled"},
+			wants: []string{
+				"Security OK", "SELinux skipped", "AppArmor enabled", "SELinux SKIPPED  not detected; AppArmor is enabled", "AppArmor OK",
+			},
+		},
+		{
+			name: "selinux active",
+			sec:  model.Security{Available: true, SELinux: "enforcing", AppArmor: "unknown"},
+			wants: []string{
+				"Security OK", "SELinux enforcing", "AppArmor skipped", "SELinux OK", "AppArmor SKIPPED  not detected; SELinux is enforcing",
+			},
+		},
+		{
+			name: "neither detected",
+			sec:  model.Security{Available: true, SELinux: "unknown", AppArmor: "unknown"},
+			wants: []string{
+				"Security SKIPPED", "no MAC enforcement", "framework detected", "SELinux SKIPPED", "AppArmor SKIPPED",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var output bytes.Buffer
+			Write(&output, model.Report{Metrics: model.Metrics{Security: &tt.sec}}, Options{ASCII: true, Verbose: true})
+			for _, want := range tt.wants {
+				if !strings.Contains(output.String(), want) {
+					t.Fatalf("security output missing %q:\n%s", want, output.String())
+				}
+			}
+			if tt.name == "neither detected" {
+				var quiet bytes.Buffer
+				Write(&quiet, model.Report{Metrics: model.Metrics{Security: &tt.sec}}, Options{ASCII: true, Quiet: true})
+				if !strings.Contains(quiet.String(), "Security SKIPPED") {
+					t.Fatalf("all-skipped MAC state was hidden in quiet output:\n%s", quiet.String())
+				}
+			}
+		})
 	}
 }
 
@@ -304,13 +362,15 @@ func TestContainerLogDetailsAreCompactAndColorCommand(t *testing.T) {
 	var output bytes.Buffer
 	Write(&output, model.Report{Metrics: model.Metrics{Containers: []model.ContainerRuntime{{
 		Runtime: "docker", Containers: []model.Container{{Name: "samba", State: "running", LogEvents: []model.LogEvent{{Kind: "error", Message: "foo error"}}}},
-	}}}, Findings: []model.Finding{{Severity: model.SeverityWarning, Category: "containers", Title: "samba", Evidence: []model.Evidence{{Value: "foo error"}}, Suggestion: "Review with docker logs --since 1h samba"}}}, Options{Color: true})
+	}}}, Findings: []model.Finding{{Severity: model.SeverityWarning, Category: "containers", Title: "samba", Evidence: []model.Evidence{{Value: "foo error"}}, DiagnosticCommand: "docker logs --since 1h --timestamps samba"}}}, Options{Color: true})
 	text := output.String()
-	if !strings.Contains(text, "foo error") || strings.Contains(text, "error: foo error") || strings.Contains(text, "and fix") || !strings.Contains(text, "docker logs --since 1h samba") {
+	if !strings.Contains(text, "foo error") || strings.Contains(text, "error: foo error") || strings.Contains(text, "and fix") || strings.Contains(text, "Review with docker logs") || !strings.Contains(text, "Diagnostic:") || !strings.Contains(text, "docker logs --since 1h --timestamps samba") {
 		t.Fatalf("container log details were rendered incorrectly: %s", text)
 	}
 	if !strings.Contains(text, "\x1b[33mWARN\x1b[0m  \x1b[1;33msamba\x1b[0m") || !strings.Contains(text, "    foo error") || strings.Contains(text, "error: foo error") || !strings.Contains(text, "and fix") || !strings.Contains(text, "\x1b[34mdocker logs --since 1h samba\x1b[0m") || !strings.Contains(text, "\x1b[35mDetails\x1b[0m") {
-		t.Log(text)
+		if !strings.Contains(text, "\x1b[36mDiagnostic: \x1b[0m") || !strings.Contains(text, "docker logs --since 1h --timestamps samba") {
+			t.Fatalf("colored diagnostic command was not rendered: %s", text)
+		}
 	}
 }
 
@@ -540,6 +600,27 @@ func TestPathMTUWarningRowAlwaysShown(t *testing.T) {
 	Write(&out, report, Options{})
 	if !strings.Contains(out.String(), "Path MTU") {
 		t.Fatalf("expected the Path MTU row to show by default when it found a real problem:\n%s", out.String())
+	}
+}
+
+func TestPathMTUReducedReplyWithFeedbackRendersOK(t *testing.T) {
+	report := model.Report{Metrics: model.Metrics{PathMTUCheck: &model.PathMTUCheck{
+		Available: true, Target: "1.1.1.1", CeilingMTU: 1500, FloorMTU: 576,
+		BaselineOK: true, DiscoveredMTU: 1492, PacketTooBigFeedback: true,
+	}}}
+	var out strings.Builder
+	Write(&out, report, Options{ASCII: true, Verbose: true})
+	text := out.String()
+	for _, want := range []string{
+		"Path MTU OK", "largest tested IPv4 DF echo reply: 1492/1500 bytes",
+		"Largest tested IPv4 DF reply OK", "Packet-too-big feedback OK",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("successful PMTU feedback output missing %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "Largest tested IPv4 DF echo reply was 1492 bytes") {
+		t.Fatalf("successful PMTU feedback created an informational finding:\n%s", text)
 	}
 }
 

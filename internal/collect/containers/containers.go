@@ -195,9 +195,34 @@ func (c *Collector) Collect(parent context.Context) (collect.Data, error) {
 		for _, detail := range missingRuntimes {
 			diagnostics = append(diagnostics, model.CollectionStatus{Collector: c.Name(), Status: "unavailable", Detail: detail})
 		}
+	} else if hasRuntime(result, "podman") {
+		// A locally usable Podman installation is a complete container
+		// observation. Do not make its report noisy merely because a Docker
+		// client binary is also installed but has no reachable daemon.
+		diagnostics = removeDockerListDiagnostics(diagnostics)
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].Runtime < result[j].Runtime })
 	return collect.Data{Containers: result, Snapshot: snapshot{restarts: restarts}, Diagnostics: diagnostics}, nil
+}
+
+func hasRuntime(runtimes []model.ContainerRuntime, want string) bool {
+	for _, runtime := range runtimes {
+		if runtime.Runtime == want {
+			return true
+		}
+	}
+	return false
+}
+
+func removeDockerListDiagnostics(diagnostics []model.CollectionStatus) []model.CollectionStatus {
+	kept := diagnostics[:0]
+	for _, diagnostic := range diagnostics {
+		if strings.HasPrefix(diagnostic.Detail, "docker list failed:") {
+			continue
+		}
+		kept = append(kept, diagnostic)
+	}
+	return kept
 }
 
 // runtimeArgs makes every inspection explicitly local. Docker's host flag

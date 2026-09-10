@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -181,7 +182,7 @@ func TestSmartExitHelper(t *testing.T) {
 }
 
 func TestSmartHealthExitRetainsFailureFacts(t *testing.T) {
-	for _, code := range []string{"8", "2"} {
+	for _, code := range []string{"8", "2", "4"} {
 		t.Run(code, func(t *testing.T) {
 			root := t.TempDir()
 			if err := os.MkdirAll(filepath.Join(root, "block", "sda"), 0755); err != nil {
@@ -211,8 +212,12 @@ func TestSmartHealthExitRetainsFailureFacts(t *testing.T) {
 				if len(data.DeviceHealth) != 1 || data.DeviceHealth[0].OverallPassed == nil || *data.DeviceHealth[0].OverallPassed {
 					t.Fatalf("lost health failure: %+v", data)
 				}
-			} else if len(data.DeviceHealth) != 0 || len(data.Diagnostics) == 0 {
-				t.Fatalf("execution failure accepted: %+v", data)
+			} else if len(data.DeviceHealth) != 0 || len(data.Diagnostics) == 0 || strings.Contains(data.Diagnostics[0].Detail, "exit status") {
+				t.Fatalf("execution failure was not explained clearly: %+v", data)
+			} else if code == "2" && !strings.Contains(data.Diagnostics[0].Detail, "could not open the device") {
+				t.Fatalf("device access failure was not explained: %+v", data)
+			} else if code == "4" && !strings.Contains(data.Diagnostics[0].Detail, "rejected the SMART query") {
+				t.Fatalf("unsupported SMART query was not explained: %+v", data)
 			}
 		})
 	}

@@ -43,6 +43,7 @@ func (c Collector) Collect(ctx context.Context) (collect.Data, error) {
 	}
 	d := collect.Data{}
 	var diagnostics []model.CollectionStatus
+	var lvmFailures []string
 	diagnose := func(detail string) {
 		diagnostics = append(diagnostics, model.CollectionStatus{Status: "unavailable", Detail: detail})
 	}
@@ -84,7 +85,7 @@ func (c Collector) Collect(ctx context.Context) (collect.Data, error) {
 			if ctx.Err() != nil {
 				return
 			}
-			diagnose(tool + ": " + err.Error())
+			lvmFailures = append(lvmFailures, tool)
 			return
 		}
 		if d.LVM == nil {
@@ -95,6 +96,9 @@ func (c Collector) Collect(ctx context.Context) (collect.Data, error) {
 	lvm("pvs", "pv_name,vg_name,pv_attr,pv_size,pv_free", func(raw string) { d.LVM.PhysicalVolumes = ParsePVs(raw) })
 	lvm("vgs", "vg_name,vg_attr,vg_size,vg_free", func(raw string) { d.LVM.VolumeGroups = ParseVGs(raw) })
 	lvm("lvs", "lv_name,vg_name,lv_attr,lv_size", func(raw string) { d.LVM.LogicalVolumes = ParseLVs(raw) })
+	if len(lvmFailures) > 0 {
+		diagnostics = append(diagnostics, model.CollectionStatus{Status: "info", Detail: "LVM metadata could not be read (" + strings.Join(lvmFailures, ", ") + "); this is usually restricted to root. Run with sudo to include LVM coverage."})
+	}
 
 	if raw, err := os.ReadFile(filepath.Join(etc, "fstab")); err == nil {
 		d.MountChecks = ParseFstab(string(raw))

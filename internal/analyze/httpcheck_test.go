@@ -46,6 +46,16 @@ func TestPathMTUReducedDFReplyIsInfo(t *testing.T) {
 	}
 }
 
+func TestPathMTUReducedReplyWithPacketTooBigFeedbackStaysOK(t *testing.T) {
+	report := pathMTUReport(&model.PathMTUCheck{Available: true, Target: "1.1.1.1", CeilingMTU: 1500, FloorMTU: 576, BaselineOK: true, DiscoveredMTU: 1492, PacketTooBigFeedback: true})
+	Report(&report)
+	for _, id := range []string{"path-mtu-reduced", "path-mtu-blackhole"} {
+		if findingByID(report, id) != nil {
+			t.Fatalf("packet-too-big feedback must make a reduced reply OK, got %+v", report.Findings)
+		}
+	}
+}
+
 func TestPathMTUNoReplyFindingDistinguishesObservedFeedback(t *testing.T) {
 	without := pathMTUReport(&model.PathMTUCheck{Available: true, Target: "1.1.1.1", CeilingMTU: 1500, FloorMTU: 576, BaselineOK: true})
 	with := pathMTUReport(&model.PathMTUCheck{Available: true, Target: "1.1.1.1", CeilingMTU: 1500, FloorMTU: 576, BaselineOK: true, PacketTooBigFeedback: true})

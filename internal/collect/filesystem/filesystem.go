@@ -52,7 +52,7 @@ var pseudoTypes = map[string]struct{}{
 	"autofs": {}, "bpf": {}, "cgroup": {}, "cgroup2": {}, "configfs": {}, "debugfs": {},
 	"devpts": {}, "devtmpfs": {}, "efivarfs": {}, "fusectl": {}, "hugetlbfs": {},
 	"mqueue": {}, "nsfs": {}, "overlay": {}, "proc": {}, "pstore": {}, "ramfs": {},
-	"securityfs": {}, "sysfs": {}, "tracefs": {},
+	"rpc_pipefs": {}, "securityfs": {}, "sysfs": {}, "tracefs": {},
 }
 
 // ParseMountInfo reads mount records. It delegates to the shared parser so

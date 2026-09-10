@@ -154,7 +154,7 @@ func (c *Collector) Collect(parent context.Context) (collect.Data, error) {
 	}
 	if len(diagnostics) > 0 && !coverage.Limited {
 		coverage.Limited = true
-		coverage.Reason = "device health unavailable"
+		coverage.Reason = "SMART data unavailable"
 	}
 	sort.Slice(result, func(i, j int) bool { return result[i].Device < result[j].Device })
 	return collect.Data{DeviceHealth: result, DeviceHealthCoverage: coverage, Diagnostics: diagnostics}, nil
@@ -200,7 +200,7 @@ func (c *Collector) probe(scanCtx context.Context, run func(context.Context, str
 	}
 	raw, runErr := run(ctx, smartctl, "--json", "--xall", "/dev/"+device)
 	if runErr != nil && !smartHealthExit(runErr) {
-		unavailable(device + ": smartctl failed: " + runErr.Error())
+		unavailable(smartctlUnavailableDetail(device, runErr))
 		return result
 	}
 	parsed, err := ParseSmartJSON(device, raw)
@@ -210,6 +210,22 @@ func (c *Collector) probe(scanCtx context.Context, run func(context.Context, str
 	}
 	result.device, result.ok = toModel(parsed), true
 	return result
+}
+
+func smartctlUnavailableDetail(device string, err error) string {
+	base := device + ": SMART data could not be read"
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) {
+		return base + "; smartctl could not run. Verify smartmontools is installed and the device is accessible."
+	}
+	switch {
+	case exit.ExitCode()&2 != 0:
+		return base + "; smartctl could not open the device. Run with sudo; if that does not help, the controller may not expose SMART access."
+	case exit.ExitCode()&4 != 0:
+		return base + "; the device or its controller rejected the SMART query. Check controller support or try the appropriate smartctl device type."
+	default:
+		return base + "; smartctl could not complete the query. Verify device and controller SMART support."
+	}
 }
 
 func (c *Collector) devices() ([]string, error) {

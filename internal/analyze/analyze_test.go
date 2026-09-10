@@ -189,7 +189,7 @@ func TestContainerLogEventsAreActionableButNotCriticalAlone(t *testing.T) {
 	Report(&report)
 	for _, finding := range report.Findings {
 		if finding.ID == "container-podman-web-log-events" {
-			if finding.Severity != model.SeverityWarning || finding.Title == "" || !contains(finding.Summary, "web") || !contains(finding.Suggestion, "podman logs --since 1h web") || contains(finding.Suggestion, "fix the reported") {
+			if finding.Severity != model.SeverityWarning || finding.Title == "" || !contains(finding.Summary, "web") || finding.Suggestion != "" || !contains(finding.DiagnosticCommand, "podman logs --since 1h --timestamps web") {
 				t.Fatalf("unexpected finding: %#v", finding)
 			}
 			return

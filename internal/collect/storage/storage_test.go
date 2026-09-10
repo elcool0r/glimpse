@@ -138,7 +138,7 @@ func TestFailingLVMCommandIsReportedAsMissingCoverage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(data.Diagnostics) != 3 {
+	if len(data.Diagnostics) != 1 || data.Diagnostics[0].Status != "info" || !strings.Contains(data.Diagnostics[0].Detail, "Run with sudo") {
 		t.Fatalf("denied LVM query reported as success: %+v", data.Diagnostics)
 	}
 }

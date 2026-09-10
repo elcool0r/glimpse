@@ -125,7 +125,7 @@ func securityBacklogFindings(s *model.Security) []model.Finding {
 		// counters, and are reported the same way: informational, no score
 		// impact. A crash inside the measured window is reported by
 		// coredumpctl above.
-		findings = append(findings, finding("security-crash-artifacts", model.SeverityInfo, "security", "Crash artifacts present", fmt.Sprintf("The crash directory contains %d artifact(s); this directory is not cleared automatically, so entries may be old.", len(s.CrashArtifacts)), "Review the artifacts and clear them only after preserving evidence needed for diagnosis.", 0))
+		findings = append(findings, findingWithDiagnostic("security-crash-artifacts", model.SeverityInfo, "security", "Crash artifacts present", fmt.Sprintf("The crash directory contains %d artifact(s); this directory is not cleared automatically, so entries may be old.", len(s.CrashArtifacts)), "Review the artifacts and clear them only after preserving evidence needed for diagnosis.", "sudo ls -lah /var/crash", 0))
 	}
 	return findings
 }
@@ -296,9 +296,11 @@ func gatewayFindings(check *model.GatewayCheck) []model.Finding {
 // probe series. A dropped baseline ping means the anchor
 // host is unreachable right now, which the gateway and DNS checks already
 // speak to -- it says nothing about MTU specifically, so it produces no
-// finding here. A reply below the tested ceiling is informational. Receiving
-// no replies across the series remains a warning, with packet-too-big feedback
-// reported separately from the echo result.
+// finding here. A reply below the tested ceiling with packet-too-big feedback
+// is a successful PMTU observation: the path communicated its smaller limit,
+// so it does not merit an informational finding. Without that feedback, the
+// reduced reply remains informational. Receiving no replies across the series
+// remains a warning.
 func pathMTUFindings(check *model.PathMTUCheck) []model.Finding {
 	if check == nil || !check.Available || !check.BaselineOK {
 		return nil
@@ -313,6 +315,9 @@ func pathMTUFindings(check *model.PathMTUCheck) []model.Finding {
 			"Inspect VPN, tunnel, middlebox, and ICMP handling if large transfers over this path stall while smaller packets succeed.", 12)}
 	}
 	if check.DiscoveredMTU < check.CeilingMTU {
+		if check.PacketTooBigFeedback {
+			return nil
+		}
 		return []model.Finding{finding("path-mtu-reduced", model.SeverityInfo, "network", fmt.Sprintf("Largest tested IPv4 DF echo reply was %d bytes", check.DiscoveredMTU),
 			fmt.Sprintf("The %d-byte IPv4 DF probe to %s replied after larger tested sizes up to %d bytes did not reply.", check.DiscoveredMTU, check.Target, check.CeilingMTU),
 			"Compare this observation with VPN, tunnel, and interface settings if large transfers over this path stall.", 0)}
@@ -434,8 +439,44 @@ const (
 // so this only judges what was actually found -- it never claims host-wide
 // coverage.
 func deletedFilesFindings(df *model.DeletedFiles) []model.Finding {
-	if df == nil || !df.Available || df.TotalBytes < deletedFilesWarningBytes {
+	if df == nil || !df.Available {
 		return nil
+	}
+	coverageLimited := df.ProcessScanLimited || df.ProcessesSkipped > 0
+	if df.TotalBytes < deletedFilesWarningBytes {
+		if df.TotalBytes == 0 || !coverageLimited {
+			return nil
+		}
+		eligible := df.ProcessesEligible
+		if eligible == 0 {
+			eligible = df.ProcessesScanned + df.ProcessesSkipped
+		}
+		limitations := make([]string, 0, 2)
+		if df.ProcessScanLimited {
+			limitations = append(limitations, "process scan limit")
+		}
+		if df.ProcessesSkipped > 0 {
+			limitations = append(limitations, fmt.Sprintf("%d process(es) skipped due to permission restrictions", df.ProcessesSkipped))
+		}
+		coverage := fmt.Sprintf("%d/%d process(es) checked", df.ProcessesScanned, eligible)
+		if df.ProcessesSkipped > 0 {
+			coverage += fmt.Sprintf("; %d skipped due to permissions", df.ProcessesSkipped)
+		}
+		if df.ProcessScanLimited {
+			coverage += "; scan reached the configured process limit"
+		}
+		return []model.Finding{{
+			ID:       "deleted-files-coverage",
+			Severity: model.SeverityInfo,
+			Category: "storage",
+			Title:    "Deleted-file scan has reduced coverage",
+			Summary:  fmt.Sprintf("Found %s across %d unique deleted file(s), below the %s warning threshold. The scan checked %d/%d process(es); reduced coverage: %s.", bytes(df.TotalBytes), df.UniqueFiles, bytes(deletedFilesWarningBytes), df.ProcessesScanned, eligible, strings.Join(limitations, ", ")),
+			Evidence: []model.Evidence{{
+				Label: "Coverage",
+				Value: coverage + ".",
+			}},
+			Suggestion: "Run glimpse with sudo for complete process visibility if reclaiming deleted-file space is important.",
+		}}
 	}
 	severity, impact := model.SeverityWarning, 10
 	if df.TotalBytes >= deletedFilesCriticalBytes {

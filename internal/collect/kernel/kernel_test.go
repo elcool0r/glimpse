@@ -3,8 +3,10 @@ package kernel
 import (
 	"context"
 	"errors"
+	"os/exec"
 	"reflect"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -257,5 +259,73 @@ func TestCollectorUsesPortableKernelShortOption(t *testing.T) {
 		if arg == "-k" {
 			t.Fatalf("the ENOSPC scan must not be kernel-ring-buffer-only: %q", calls[2])
 		}
+	}
+}
+
+func TestNoJournalMatchesIsNotUnavailableCoverage(t *testing.T) {
+	noMatch := exec.Command("sh", "-c", "exit 1").Run()
+	if !noJournalMatches(noMatch) {
+		t.Fatalf("exit status 1 = %v, want no journal matches", noMatch)
+	}
+	c := New()
+	c.lookPath = func(string) (string, error) { return "journalctl", nil }
+	calls := 0
+	c.run = func(_ context.Context, _ string, _ ...string) ([]byte, error) {
+		calls++
+		if calls == 1 {
+			return nil, nil
+		}
+		return nil, noMatch
+	}
+	data, err := c.Collect(context.Background())
+	if err != nil || data.Kernel == nil || !data.Kernel.Available || len(data.Diagnostics) != 0 {
+		t.Fatalf("empty targeted scans must remain healthy coverage: data=%+v err=%v", data, err)
+	}
+}
+
+func TestTargetedJournalTimeoutExplainsCoverageAndManualFollowUp(t *testing.T) {
+	c := New()
+	c.Timeout = time.Millisecond
+	c.lookPath = func(string) (string, error) { return "journalctl", nil }
+	calls := 0
+	c.run = func(ctx context.Context, _ string, _ ...string) ([]byte, error) {
+		calls++
+		if calls == 1 {
+			return nil, nil
+		}
+		<-ctx.Done()
+		return nil, errors.New("signal: killed")
+	}
+	data, err := c.Collect(context.Background())
+	if err != nil || len(data.Diagnostics) != 2 {
+		t.Fatalf("timed-out targeted scans must be nonfatal coverage diagnostics: data=%+v err=%v", data, err)
+	}
+	for _, diagnostic := range data.Diagnostics {
+		if strings.Contains(diagnostic.Detail, "Disk-full journal coverage") && diagnostic.Status != "info" {
+			t.Fatalf("timed-out journal coverage should be informational: %+v", diagnostic)
+		}
+		if !strings.Contains(diagnostic.Detail, "does not change the kernel health result") || !strings.Contains(diagnostic.Detail, "exceeded its 1ms budget") || !strings.Contains(diagnostic.Detail, "To investigate manually, run: journalctl") {
+			t.Fatalf("diagnostic did not explain timeout and follow-up: %+v", diagnostic)
+		}
+	}
+}
+
+func TestDefaultTargetedJournalQueriesGetLongerBudget(t *testing.T) {
+	c := New()
+	c.lookPath = func(string) (string, error) { return "journalctl", nil }
+	var deadlines []time.Duration
+	c.run = func(ctx context.Context, _ string, _ ...string) ([]byte, error) {
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			t.Fatal("journal query has no timeout")
+		}
+		deadlines = append(deadlines, time.Until(deadline))
+		return nil, nil
+	}
+	if _, err := c.Collect(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(deadlines) != 3 || deadlines[0] > commandTimeout || deadlines[1] <= commandTimeout || deadlines[2] <= commandTimeout {
+		t.Fatalf("query budgets = %v, want 4s primary then longer targeted budgets", deadlines)
 	}
 }

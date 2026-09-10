@@ -18,6 +18,18 @@ func TestDeletedFilesBelowThresholdStaysSilent(t *testing.T) {
 	}
 }
 
+func TestDeletedFilesBelowThresholdExplainsReducedCoverage(t *testing.T) {
+	report := deletedFilesReport(&model.DeletedFiles{
+		Available: true, TotalBytes: 996 << 10, UniqueFiles: 8,
+		ProcessesScanned: 742, ProcessesSkipped: 4, ProcessesEligible: 746,
+	})
+	Report(&report)
+	found := findingByID(report, "deleted-files-coverage")
+	if found == nil || found.Severity != model.SeverityInfo || !contains(found.Summary, "200.0 MiB warning threshold") || !contains(found.Summary, "4 process(es) skipped due to permission restrictions") || !contains(found.Evidence[0].Value, "742/746 process(es) checked") {
+		t.Fatalf("reduced coverage was not explained: %+v", found)
+	}
+}
+
 func TestDeletedFilesWarnsAboveThreshold(t *testing.T) {
 	report := deletedFilesReport(&model.DeletedFiles{
 		Available: true, TotalBytes: 300 << 20, ProcessesScanned: 10, UniqueFiles: 1, ProcessesHolding: 1, TotalReferences: 3,

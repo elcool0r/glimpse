@@ -550,3 +550,23 @@ func TestMissingDockerDoesNotHidePodmanObservation(t *testing.T) {
 		t.Fatalf("missing optional runtime obscured successful query: %+v", got.Diagnostics)
 	}
 }
+
+func TestUnreachableDockerDoesNotObscurePodmanObservation(t *testing.T) {
+	c := &Collector{
+		lookPath: func(name string) (string, error) { return "/usr/bin/" + name, nil },
+		run: func(_ context.Context, name string, args ...string) ([]byte, error) {
+			if name == "/usr/bin/docker" {
+				return nil, errors.New("exit status 125")
+			}
+			if args[len(args)-1] == "--no-trunc" {
+				return []byte("podman-id\n"), nil
+			}
+			return []byte(`{"Id":"podman-id","State":{"Status":"running"}}`), nil
+		},
+		runLogs: func(context.Context, []string, string) ([]byte, bool, error) { return nil, false, nil },
+	}
+	got, err := c.Collect(context.Background())
+	if err != nil || len(got.Containers) != 1 || got.Containers[0].Runtime != "podman" || len(got.Diagnostics) != 0 {
+		t.Fatalf("Podman observation was obscured by an unreachable Docker client: data=%+v err=%v", got, err)
+	}
+}

@@ -7,6 +7,8 @@ package kernel
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"math"
 	"os/exec"
 	"strconv"
@@ -19,8 +21,9 @@ import (
 )
 
 const (
-	commandTimeout = 4 * time.Second
-	maxLines       = 200
+	commandTimeout         = 4 * time.Second
+	targetedCommandTimeout = 8 * time.Second
+	maxLines               = 200
 	// grepMaxLines bounds the two targeted --grep scans, which are already
 	// narrowed server-side by journalctl and so need much less headroom
 	// than the broad priority-based scan.
@@ -53,6 +56,10 @@ func (c *Collector) Collect(parent context.Context) (collect.Data, error) {
 	if timeout <= 0 {
 		timeout = commandTimeout
 	}
+	targetedTimeout := timeout
+	if c.Timeout <= 0 {
+		targetedTimeout = targetedCommandTimeout
+	}
 	run := c.run
 	if run == nil {
 		run = runCommand
@@ -79,22 +86,26 @@ func (c *Collector) Collect(parent context.Context) (collect.Data, error) {
 	// message). journalctl's own --grep narrows this server-side, so it
 	// stays bounded without needing to widen the priority filter above and
 	// risk routine info-level chatter crowding out the real signal.
-	if output, runErr := runBounded(parent, run, timeout, path, "--boot=0", "--since=-24h", "-k", "--grep=segfault at|NIC Link is (Up|Down)", "--no-pager", "--output=short-unix", "--lines="+strconv.Itoa(grepMaxLines)); runErr != nil {
+	if output, runErr := runBounded(parent, run, targetedTimeout, path, "--boot=0", "--since=-24h", "-k", "--grep=segfault at|NIC Link is (Up|Down)", "--no-pager", "--output=short-unix", "--lines="+strconv.Itoa(grepMaxLines)); runErr != nil {
 		if parent.Err() != nil {
 			return collect.Data{}, parent.Err()
 		}
-		diagnostics = append(diagnostics, model.CollectionStatus{Status: "unavailable", Detail: "grep(kernel): " + runErr.Error()})
+		if !noJournalMatches(runErr) {
+			diagnostics = append(diagnostics, model.CollectionStatus{Status: "unavailable", Detail: targetedJournalDiagnostic("Lower-priority kernel-event coverage", "segfault and physical-link events", "journalctl --boot=0 --since=-24h -k --grep='segfault at|NIC Link is (Up|Down)'", targetedTimeout, runErr)})
+		}
 	} else {
 		events = appendNewEvents(events, filterVirtualLinkEvents(ParseEvents(string(output), now)))
 	}
 
 	// Tertiary scan: ENOSPC is reported by the application that hit it, not
 	// the kernel, so this is the one scan here that is not -k restricted.
-	if output, runErr := runBounded(parent, run, timeout, path, "--since=-24h", "--grep=No space left on device", "--no-pager", "--output=short-unix", "--lines="+strconv.Itoa(grepMaxLines)); runErr != nil {
+	if output, runErr := runBounded(parent, run, targetedTimeout, path, "--since=-24h", "--grep=No space left on device", "--no-pager", "--output=short-unix", "--lines="+strconv.Itoa(grepMaxLines)); runErr != nil {
 		if parent.Err() != nil {
 			return collect.Data{}, parent.Err()
 		}
-		diagnostics = append(diagnostics, model.CollectionStatus{Status: "unavailable", Detail: "grep(enospc): " + runErr.Error()})
+		if !noJournalMatches(runErr) {
+			diagnostics = append(diagnostics, model.CollectionStatus{Status: "info", Detail: targetedJournalDiagnostic("Disk-full journal coverage", "application reports of 'No space left on device'", "journalctl --boot=0 --since=-24h --grep='No space left on device'", targetedTimeout, runErr)})
+		}
 	} else {
 		events = appendNewEvents(events, ParseEvents(string(output), now))
 	}
@@ -105,7 +116,27 @@ func (c *Collector) Collect(parent context.Context) (collect.Data, error) {
 func runBounded(parent context.Context, run func(context.Context, string, ...string) ([]byte, error), timeout time.Duration, path string, args ...string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
-	return run(ctx, path, args...)
+	output, err := run(ctx, path, args...)
+	if ctx.Err() != nil {
+		return output, ctx.Err()
+	}
+	return output, err
+}
+
+// noJournalMatches recognizes journalctl's exit status for a successful query
+// with no matching entries. The targeted searches are optional coverage, so
+// an empty result is normal rather than an unavailable capability.
+func noJournalMatches(err error) bool {
+	var exitErr *exec.ExitError
+	return errors.As(err, &exitErr) && exitErr.ExitCode() == 1
+}
+
+func targetedJournalDiagnostic(coverage, purpose, command string, timeout time.Duration, err error) string {
+	base := fmt.Sprintf("%s is incomplete; this does not change the kernel health result.", coverage)
+	if errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Sprintf("%s The journal query for %s exceeded its %s budget. To investigate manually, run: %s", base, purpose, timeout, command)
+	}
+	return fmt.Sprintf("%s The journal query for %s could not run (%v). To investigate manually, run: %s", base, purpose, err, command)
 }
 
 // appendNewEvents merges another scan's events, deduplicating by kind (the

@@ -188,22 +188,23 @@ func renderIntegrations(w io.Writer, width int, r model.Report, separator string
 	}
 	note("zfs")
 	if len(m.SoftwareRAID) > 0 || m.LVM != nil || len(m.MountChecks) > 0 {
-		severity := model.SeverityOK
-		raidCount, raidBad := len(m.SoftwareRAID), 0
-		for _, raid := range m.SoftwareRAID {
-			if !strings.EqualFold(raid.State, "active") && !strings.EqualFold(raid.State, "clean") {
-				raidBad++
-			}
+		raidSeverity := findingSeverityByPrefix(r.Findings, "storage", "raid-")
+		lvmSeverity := findingSeverityByPrefix(r.Findings, "storage", "lvm-")
+		mountSeverity := findingSeverityByPrefix(r.Findings, "storage", "mount-missing-")
+		storageStatus, storageLimited := collectionStatusFor(r, "storage")
+		severity := maxSeverity(raidSeverity, maxSeverity(lvmSeverity, mountSeverity))
+		if storageLimited && strings.Contains(storageStatus.Detail, "LVM metadata could not be read") {
+			severity = maxSeverity(severity, collectionSeverity(storageStatus.Status))
 		}
-		if raidBad > 0 {
-			severity = model.SeverityCritical
-		}
+		raidCount := len(m.SoftwareRAID)
 		parts := []string{}
 		if raidCount > 0 {
 			parts = append(parts, fmt.Sprintf("RAID %d checked", raidCount))
 		}
 		if m.LVM != nil {
 			parts = append(parts, fmt.Sprintf("LVM %d PV/%d VG/%d LV", len(m.LVM.PhysicalVolumes), len(m.LVM.VolumeGroups), len(m.LVM.LogicalVolumes)))
+		} else if storageLimited && strings.Contains(storageStatus.Detail, "LVM metadata could not be read") {
+			parts = append(parts, "LVM coverage requires sudo")
 		}
 		if len(m.MountChecks) > 0 {
 			active, known := 0, 0
@@ -221,35 +222,18 @@ func renderIntegrations(w io.Writer, width int, r model.Report, separator string
 				parts = append(parts, fmt.Sprintf("mounts %d/%d active", active, len(m.MountChecks)))
 			}
 		}
-		severity = sectionSeverity(r.Findings, "storage")
 		if !skip(severity) {
 			writeWrapped(w, width, "", fmt.Sprintf("%s %s  %s", sectionLabel("Storage layers", severity, color), badge(severity, color), strings.Join(parts, separator)))
 			if verbose {
 				for _, raid := range m.SoftwareRAID {
-					raidSeverity := model.SeverityOK
-					if !strings.EqualFold(raid.State, "active") && !strings.EqualFold(raid.State, "clean") {
-						raidSeverity = model.SeverityCritical
-					}
-					text := fmt.Sprintf("%s %s  %s%s%s%s%s", sectionLabel("RAID", raidSeverity, color), badge(raidSeverity, color), cleanText(raid.Device), separator, cleanText(raid.Level), separator, cleanText(raid.State))
+					itemSeverity := findingSeverity(r.Findings, "raid-"+raid.Device, "raid-resync-"+raid.Device)
+					text := fmt.Sprintf("%s %s  %s%s%s%s%s", sectionLabel("RAID", itemSeverity, color), badge(itemSeverity, color), cleanText(raid.Device), separator, cleanText(raid.Level), separator, cleanText(raid.State))
 					if raid.ResyncProgress != "" {
 						text += separator + "rebuild/resync active"
 					}
 					writeWrapped(w, width, "    ", text)
 				}
 				if m.LVM != nil {
-					// The collector decides what an attribute string means; reading it
-					// again here is how the two interpretations drifted apart.
-					lvmSeverity := model.SeverityOK
-					for _, vg := range m.LVM.VolumeGroups {
-						if vg.NeedsReview {
-							lvmSeverity = model.SeverityWarning
-						}
-					}
-					for _, lv := range m.LVM.LogicalVolumes {
-						if lv.NeedsReview {
-							lvmSeverity = model.SeverityWarning
-						}
-					}
 					writeWrapped(w, width, "    ", fmt.Sprintf("%s %s  %d PVs%s%d VGs%s%d LVs", sectionLabel("LVM", lvmSeverity, color), badge(lvmSeverity, color), len(m.LVM.PhysicalVolumes), separator, len(m.LVM.VolumeGroups), separator, len(m.LVM.LogicalVolumes)))
 				}
 				if len(m.MountChecks) > 0 {
@@ -259,8 +243,7 @@ func renderIntegrations(w io.Writer, width int, r model.Report, separator string
 							active++
 						}
 					}
-					mountSeverity := sectionSeverity(r.Findings, "storage")
-					writeWrapped(w, width, "    ", fmt.Sprintf("%s %s  persistent mounts %d/%d active", sectionLabel("Mounts", mountSeverity, color), badge(mountSeverity, color), active, len(m.MountChecks)))
+					writeWrapped(w, width, "    ", fmt.Sprintf("%s %s  fstab mounts %d/%d active", sectionLabel("Mounts", mountSeverity, color), badge(mountSeverity, color), active, len(m.MountChecks)))
 					for _, mount := range m.MountChecks {
 						itemSeverity := findingSeverity(r.Findings, "mount-missing-"+mount.MountPoint)
 						status := "active"
@@ -273,6 +256,8 @@ func renderIntegrations(w io.Writer, width int, r model.Report, separator string
 						checkLine(w, width, "        ", cleanText(mount.MountPoint), itemSeverity, color, detail)
 					}
 				}
+			} else if storageLimited && strings.Contains(storageStatus.Detail, "LVM metadata could not be read") {
+				checkLine(w, width, "    ", "LVM metadata", collectionSeverity(storageStatus.Status), color, cleanText(storageStatus.Detail))
 			}
 		}
 	}
@@ -450,6 +435,9 @@ func renderIntegrations(w io.Writer, width int, r model.Report, separator string
 			result = fmt.Sprintf("no IPv4 DF echo replies from %d down to %d bytes", check.CeilingMTU, check.FloorMTU)
 		case check.DiscoveredMTU < check.CeilingMTU:
 			result = fmt.Sprintf("largest tested IPv4 DF echo reply: %d/%d bytes", check.DiscoveredMTU, check.CeilingMTU)
+			if check.PacketTooBigFeedback {
+				result += separator + "packet-too-big feedback received"
+			}
 		}
 		if check.DiscoveredMTU == 0 {
 			if check.PacketTooBigFeedback {
@@ -473,15 +461,23 @@ func renderIntegrations(w io.Writer, width int, r model.Report, separator string
 					mtuSeverity = severity
 					mtuDetail = fmt.Sprintf("no echo replies from tested sizes %d down to %d bytes", check.CeilingMTU, check.FloorMTU)
 				case check.DiscoveredMTU < check.CeilingMTU:
-					mtuSeverity = severity
-					mtuDetail = fmt.Sprintf("%d bytes; larger tested sizes up to %d bytes did not reply", check.DiscoveredMTU, check.CeilingMTU)
+					if check.PacketTooBigFeedback {
+						mtuDetail = fmt.Sprintf("%d bytes; packet-too-big feedback received for larger tested sizes up to %d bytes", check.DiscoveredMTU, check.CeilingMTU)
+					} else {
+						mtuSeverity = severity
+						mtuDetail = fmt.Sprintf("%d bytes; larger tested sizes up to %d bytes did not reply", check.DiscoveredMTU, check.CeilingMTU)
+					}
 				}
 				checkLine(w, width, "    ", "Largest tested IPv4 DF reply", mtuSeverity, color, mtuDetail)
 				feedback := "not observed in probe output"
 				if check.PacketTooBigFeedback {
 					feedback = "observed in probe output"
 				}
-				checkLine(w, width, "    ", "Packet-too-big feedback", model.SeverityInfo, color, feedback)
+				feedbackSeverity := model.SeverityInfo
+				if check.PacketTooBigFeedback {
+					feedbackSeverity = model.SeverityOK
+				}
+				checkLine(w, width, "    ", "Packet-too-big feedback", feedbackSeverity, color, feedback)
 			}
 		}
 	}
@@ -674,26 +670,71 @@ func renderIntegrations(w io.Writer, width int, r model.Report, separator string
 	note("kernel")
 
 	if security := m.Security; security != nil && security.Available {
-		severity := sectionSeverity(r.Findings, "security")
-		if !skip(severity) {
-			writeWrapped(w, width, "", fmt.Sprintf("%s %s  SELinux %s%sAppArmor %s%ssecurity sources checked", sectionLabel("Security", severity, color), badge(severity, color), cleanText(security.SELinux), separator, cleanText(security.AppArmor), separator))
+		severity := securityCheckSeverity(r, security)
+		selinuxSkipped, apparmorSkipped, macSkipped := macFrameworkStatus(security)
+		if !skip(severity) || macSkipped {
+			selinuxStatus, apparmorStatus := cleanText(security.SELinux), cleanText(security.AppArmor)
+			if selinuxSkipped {
+				selinuxStatus = "skipped"
+			}
+			if apparmorSkipped {
+				apparmorStatus = "skipped"
+			}
+			if macSkipped && severity == model.SeverityOK {
+				writeWrapped(w, width, "", fmt.Sprintf("%s %s  SELinux %s%sAppArmor %s%sno MAC enforcement framework detected", skippedLabel("Security", color), skippedBadge(color), selinuxStatus, separator, apparmorStatus, separator))
+			} else {
+				writeWrapped(w, width, "", fmt.Sprintf("%s %s  SELinux %s%sAppArmor %s%ssecurity sources checked", sectionLabel("Security", severity, color), badge(severity, color), selinuxStatus, separator, apparmorStatus, separator))
+			}
 			if verbose {
 				selinuxSeverity := maxSeverity(findingSeverity(r.Findings, "security-selinux-denials"), findingSeverity(r.Findings, "security-selinux-permissive"))
 				selinuxDetail := cleanText(security.SELinux)
 				if security.SELinuxDenials != nil {
 					selinuxDetail += fmt.Sprintf("%s%d denial(s)", separator, *security.SELinuxDenials)
 				}
-				checkLine(w, width, "    ", "SELinux", selinuxSeverity, color, selinuxDetail)
+				if selinuxSkipped && selinuxSeverity == model.SeverityOK {
+					detail := "not detected; AppArmor is enabled"
+					if macSkipped {
+						detail = "not detected; no alternate MAC framework detected"
+					}
+					skippedCheckLine(w, width, "    ", "SELinux", color, detail)
+				} else {
+					checkLine(w, width, "    ", "SELinux", selinuxSeverity, color, selinuxDetail)
+				}
 
 				apparmorSeverity := findingSeverity(r.Findings, "security-apparmor-denials")
 				apparmorDetail := cleanText(security.AppArmor)
 				if security.AppArmorDenials != nil {
 					apparmorDetail += fmt.Sprintf("%s%d denial(s)", separator, *security.AppArmorDenials)
 				}
-				checkLine(w, width, "    ", "AppArmor", apparmorSeverity, color, apparmorDetail)
+				if apparmorSkipped && apparmorSeverity == model.SeverityOK {
+					detail := "not detected; SELinux is enforcing"
+					if macSkipped {
+						detail = "not detected; no alternate MAC framework detected"
+					}
+					skippedCheckLine(w, width, "    ", "AppArmor", color, detail)
+				} else {
+					checkLine(w, width, "    ", "AppArmor", apparmorSeverity, color, apparmorDetail)
+				}
 
 				if security.ActiveSessions != nil {
 					checkLine(w, width, "    ", "Active sessions", model.SeverityOK, color, fmt.Sprintf("%d", *security.ActiveSessions))
+				}
+				if security.RebootRequired != nil && *security.RebootRequired {
+					checkLine(w, width, "    ", "Reboot required", model.SeverityInfo, color, "pending package or kernel update")
+				}
+				if security.FailedAuthAttempts != nil && *security.FailedAuthAttempts > 0 {
+					failedAuthSeverity := findingSeverity(r.Findings, "security-failed-auth")
+					checkLine(w, width, "    ", "Failed authentication", failedAuthSeverity, color, fmt.Sprintf("%d event(s) in %s", *security.FailedAuthAttempts, cleanText(security.JournalWindow)))
+				}
+				if security.CoreDumps != nil && *security.CoreDumps > 0 {
+					checkLine(w, width, "    ", "Core dumps", findingSeverity(r.Findings, "security-core-dumps"), color, fmt.Sprintf("%d recent dump(s)", *security.CoreDumps))
+				}
+				if len(security.CrashArtifacts) > 0 {
+					checkLine(w, width, "    ", "Crash artifacts", model.SeverityInfo, color, fmt.Sprintf("%d artifact(s) present", len(security.CrashArtifacts)))
+				}
+				vulnerabilitySeverity := findingSeverityByPrefix(r.Findings, "security", "security-vulnerability-")
+				if vulnerabilitySeverity != model.SeverityOK {
+					checkLine(w, width, "    ", "Kernel vulnerabilities", vulnerabilitySeverity, color, "one or more statuses require review")
 				}
 				taintSeverity := model.SeverityOK
 				taintDetail := "clean"
@@ -772,6 +813,44 @@ func renderIntegrations(w io.Writer, width int, r model.Report, separator string
 		}
 	}
 	note("cgroup-v2")
+}
+
+// macFrameworkStatus identifies the common Linux configurations where one
+// mandatory-access-control framework is intentionally absent because the
+// other is active. It keeps that expected absence out of the health verdict.
+func macFrameworkStatus(security *model.Security) (selinuxSkipped, apparmorSkipped, bothSkipped bool) {
+	if security == nil {
+		return false, false, false
+	}
+	selinux := strings.ToLower(strings.TrimSpace(security.SELinux))
+	apparmor := strings.ToLower(strings.TrimSpace(security.AppArmor))
+	selinuxUnknown := selinux == "" || selinux == "unknown"
+	apparmorUnknown := apparmor == "" || apparmor == "unknown"
+	if selinuxUnknown && apparmorUnknown {
+		return true, true, true
+	}
+	return selinuxUnknown && apparmor == "enabled", apparmorUnknown && selinux == "enforcing", false
+}
+
+// securityCheckSeverity is intentionally limited to checks the security
+// section renders. A section badge must always have corresponding visible
+// evidence rather than inheriting an unrelated category-level INFO finding.
+func securityCheckSeverity(r model.Report, security *model.Security) model.Severity {
+	severity := maxSeverity(
+		maxSeverity(
+			findingSeverity(r.Findings, "security-selinux-denials", "security-selinux-permissive"),
+			findingSeverity(r.Findings, "security-apparmor-denials"),
+		),
+		findingSeverity(r.Findings, "security-failed-auth", "security-core-dumps"),
+	)
+	severity = maxSeverity(severity, findingSeverityByPrefix(r.Findings, "security", "security-vulnerability-"))
+	if security == nil {
+		return severity
+	}
+	if security.KernelTaintMask != 0 || security.RebootRequired != nil && *security.RebootRequired || len(security.CrashArtifacts) > 0 {
+		severity = maxSeverity(severity, model.SeverityInfo)
+	}
+	return severity
 }
 
 func cgroupValid(valid *bool) bool { return valid == nil || *valid }

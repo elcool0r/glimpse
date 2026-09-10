@@ -105,6 +105,12 @@ func TestCollectorPublishesExclusionsAsCoverageDiagnostics(t *testing.T) {
 	}
 }
 
+func TestRPCPipefsIsNotFilesystemCapacityCoverage(t *testing.T) {
+	if IsReal(Mount{Type: "rpc_pipefs", Target: "/var/lib/nfs/rpc_pipefs"}) {
+		t.Fatal("rpc_pipefs is a kernel RPC pseudo-filesystem, not a capacity mount")
+	}
+}
+
 // Capacity is measured against space a normal process can use, which is what
 // df reports. Dividing by total capacity counts the root reserve as free, so a
 // default ext4 read several points more optimistic than df and the "nearly

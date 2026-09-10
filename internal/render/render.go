@@ -461,6 +461,18 @@ func checkLine(w io.Writer, width int, indent, label string, severity model.Seve
 	writeWrapped(w, width, indent, line)
 }
 
+// skippedCheckLine renders a deliberately non-health state. It is used when
+// an alternative capability covers the check (for example AppArmor covering
+// a host where SELinux is not present), rather than mislabeling that peer as
+// an informational or unavailable health result.
+func skippedCheckLine(w io.Writer, width int, indent, label string, color bool, detail string) {
+	line := fmt.Sprintf("%s %s", skippedLabel(label, color), skippedBadge(color))
+	if detail != "" {
+		line += "  " + detail
+	}
+	writeWrapped(w, width, indent, line)
+}
+
 func formatSuggestion(s string, color bool) string {
 	s = cleanText(s)
 	const prefix = "Review with "
@@ -476,6 +488,20 @@ func sectionLabel(text string, severity model.Severity, color bool) string {
 	}
 	code := severityColorCode(severity)
 	return "\x1b[1;" + code + "m" + text + "\x1b[0m"
+}
+
+func skippedLabel(text string, color bool) string {
+	if !color {
+		return text
+	}
+	return "\x1b[1;90m" + text + "\x1b[0m"
+}
+
+func skippedBadge(color bool) string {
+	if !color {
+		return "SKIPPED"
+	}
+	return "\x1b[90mSKIPPED\x1b[0m"
 }
 
 func metadata(text string, color bool) string {
