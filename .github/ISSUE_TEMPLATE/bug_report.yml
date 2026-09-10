@@ -1,0 +1,44 @@
+name: Bug report
+description: Report incorrect, unexpected, or broken Glimpse behaviour
+title: "bug: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please remove sensitive hostnames, addresses, usernames, and command output before posting.
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Describe the observed behaviour and what you expected instead.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Glimpse version
+      placeholder: "0.15.1 (glimpse --version)"
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Include distro, kernel, architecture, and whether this ran in a container.
+      placeholder: "Ubuntu 24.04, Linux 6.8, amd64, bare metal"
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction steps
+      description: Include the command and the smallest useful sanitized output.
+    validations:
+      required: true
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context
+      description: Add relevant logs, fixtures, or other context. Do not include secrets.

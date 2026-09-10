@@ -134,7 +134,9 @@ The full list of checks, their thresholds, and the reasoning behind each one is 
 
 ## Contributing
 
-Issues and pull requests are welcome.
+Issues and pull requests are welcome. See the [contributing guide](CONTRIBUTING.md)
+for development and testing expectations. Please also review the [code of
+conduct](CODE_OF_CONDUCT.md) and [security policy](SECURITY.md).
 
 ## License
 
