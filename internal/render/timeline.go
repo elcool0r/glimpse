@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/elcool0r/glimpse/internal/model"
 )
@@ -40,8 +41,19 @@ type timelineEvent struct {
 func renderTimeline(w io.Writer, width int, r model.Report, color, all bool) {
 	events := collectTimelineEvents(r)
 	// Oldest first, latest last: this reads top-to-bottom the way a log or
-	// scrollback does, with "now" nearest the prompt.
-	sort.Slice(events, func(i, j int) bool { return events[i].at.Before(events[j].at) })
+	// scrollback does, with "now" nearest the prompt. Live facts are all
+	// stamped "now" and some of them are gathered by ranging over a map, so
+	// time alone does not order them: without a tiebreak, two runs on
+	// identical data print those lines in different orders.
+	sort.Slice(events, func(i, j int) bool {
+		if !events[i].at.Equal(events[j].at) {
+			return events[i].at.Before(events[j].at)
+		}
+		if events[i].source != events[j].source {
+			return events[i].source < events[j].source
+		}
+		return events[i].label < events[j].label
+	})
 	fmt.Fprintln(w)
 	writeWrapped(w, width, "", sectionHeader("Recent events (today)", color))
 	if len(events) == 0 {
@@ -60,7 +72,7 @@ func renderTimeline(w io.Writer, width int, r model.Report, color, all bool) {
 		writeWrapped(w, width, "", fmt.Sprintf("(%d more event(s) earlier today; pass --events-all to see them)", omitted))
 	}
 	for _, e := range events {
-		writeWrapped(w, width, "", fmt.Sprintf("%s  %s  %s", metadata(e.at.Local().Format("15:04"), color), metadata("["+e.source+"]", color), cleanText(e.label)))
+		writeWrapped(w, width, "", fmt.Sprintf("%s  %s  %s", metadata(e.at.Local().Format("15:04"), color), metadata("["+cleanText(e.source)+"]", color), cleanText(e.label)))
 	}
 }
 
@@ -178,7 +190,7 @@ func collectTimelineEvents(r model.Report) []timelineEvent {
 		if activity.Summary == "" {
 			continue
 		}
-		add(activity.At, activity.Manager, activity.Summary)
+		add(activity.At, cleanText(activity.Manager), cleanText(activity.Summary))
 	}
 
 	for _, login := range r.Metrics.Logins {
@@ -206,25 +218,23 @@ func collectTimelineEvents(r model.Report) []timelineEvent {
 
 // truncateForDisplay caps a raw command line to a readable length; the full
 // text is still available in the underlying model/JSON for anyone who needs
-// it.
+// it. The cut is made on a rune boundary: slicing by byte splits a multi-byte
+// character and leaves invalid UTF-8 in the output.
 func truncateForDisplay(s string, max int) string {
 	if len(s) <= max {
 		return s
 	}
-	return s[:max] + "..."
+	cut := max
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "..."
 }
 
-// timelineSpecificLogKind mirrors analyze.specificLogKind: only a concrete
-// failure signature, not generic "error"/"failure" wording, is significant
-// enough for the timeline. It is duplicated in miniature here, the same way
-// dnsStatus duplicates analyze.dnsFindings, because the renderer decides
-// what belongs in a display list, not a health verdict.
-func timelineSpecificLogKind(kind string) bool {
-	switch kind {
-	case "oom", "panic", "segmentation_fault", "uncaught_exception",
-		"data_corruption", "read_only_filesystem":
-		return true
-	default:
-		return false
-	}
-}
+// timelineSpecificLogKind keeps generic "error"/"failure" wording off the
+// timeline. The rule comes from model rather than a local copy: the renderer
+// still decides what belongs in a display list, but it must not disagree with
+// analysis about which classifications name a concrete failure -- the two
+// copies of this list were free to drift apart, and a kind added to one of
+// them would silently be missing from the other.
+func timelineSpecificLogKind(kind string) bool { return model.SpecificLogKind(kind) }

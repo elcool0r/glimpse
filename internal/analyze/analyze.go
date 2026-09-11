@@ -166,12 +166,21 @@ func failedUnitsSummary(systemd *model.Systemd) string {
 		}
 		units = append(units, label)
 	}
-	return fmt.Sprintf("%d failed units: %v", len(units), units)
+	// %v on a slice prints Go syntax ("[nginx.service]"), which leaked into
+	// user-facing text and into the output the README advertises.
+	return fmt.Sprintf("%s: %s", pluralize(len(units), "failed unit"), strings.Join(units, ", "))
 }
 
 // scoreFindings subtracts each finding's impact, bounded per category so one
 // noisy subsystem cannot floor the score and erase the distinction between a
 // host with a single problem and a host with nothing left working.
+//
+// Severity and impact are two halves of one contract: severity sets
+// Score.Status, which cmd/glimpse turns into the process exit code, while
+// impact sets Score.Value. A Warning or Critical finding that subtracts
+// nothing makes the two disagree permanently -- the report reads healthy and
+// the exit code says otherwise -- so ActionableWithoutImpact exists to let a
+// test assert that no rule ships in that state.
 func scoreFindings(findings []model.Finding) model.Score {
 	spent := make(map[string]int)
 	score := 100
@@ -279,10 +288,10 @@ func cgroupFindings(cgroup *model.CgroupV2, _ *model.Pressure) []model.Finding {
 	return findings
 }
 
-// Nil validity retains compatibility with legacy hand-built reports and
-// schema-v1 JSON. Collectors use explicit false to suppress conclusions from
-// unavailable or malformed cgroup files.
-func cgroupValid(valid *bool) bool { return valid == nil || *valid }
+// cgroupValid delegates to model's three-state validity rule: collectors use
+// an explicit false to suppress conclusions drawn from unavailable or
+// malformed cgroup files.
+func cgroupValid(valid *bool) bool { return model.Measured(valid) }
 
 func containerFindings(runtimes []model.ContainerRuntime) []model.Finding {
 	var findings []model.Finding
@@ -352,17 +361,9 @@ func containerFindings(runtimes []model.ContainerRuntime) []model.Finding {
 }
 
 // specificLogKind marks classifications that identify a concrete failure.
-// The generic "error" and "failure" kinds match ordinary application wording
-// and cannot support a health verdict on their own.
-func specificLogKind(kind string) bool {
-	switch kind {
-	case "oom", "panic", "segmentation_fault", "uncaught_exception",
-		"data_corruption", "read_only_filesystem":
-		return true
-	default:
-		return false
-	}
-}
+// The rule lives with the container log vocabulary in model so analysis and
+// rendering cannot answer it differently.
+func specificLogKind(kind string) bool { return model.SpecificLogKind(kind) }
 
 func partitionLogEvents(events []model.LogEvent) (specific, generic []model.LogEvent) {
 	for _, event := range events {
@@ -421,17 +422,7 @@ func zfsFindings(pools []model.ZFSPool) []model.Finding {
 	return findings
 }
 
-func zfsPoolHasErrors(pool model.ZFSPool) bool {
-	if pool.ReadErrors > 0 || pool.WriteErrors > 0 || pool.ChecksumErrors > 0 {
-		return true
-	}
-	for _, vdev := range pool.VdevErrors {
-		if vdev.ReadErrors > 0 || vdev.WriteErrors > 0 || vdev.ChecksumErrors > 0 {
-			return true
-		}
-	}
-	return false
-}
+func zfsPoolHasErrors(pool model.ZFSPool) bool { return pool.HasErrors() }
 
 func zfsErrorFinding(pool model.ZFSPool) model.Finding {
 	summary := fmt.Sprintf("Pool %s root row has %d read, %d write, and %d checksum errors.", pool.Name, pool.ReadErrors, pool.WriteErrors, pool.ChecksumErrors)
@@ -450,12 +441,7 @@ func zfsErrorFinding(pool model.ZFSPool) model.Finding {
 }
 
 func zfsVdevApproximate(vdevs []model.ZFSVdevError) bool {
-	for _, vdev := range vdevs {
-		if vdev.Approximate {
-			return true
-		}
-	}
-	return false
+	return model.ZFSPool{VdevErrors: vdevs}.HasApproximateVdev()
 }
 
 func diskFindings(report *model.Report) []model.Finding {
@@ -598,15 +584,11 @@ func tcpFindings(tcp *model.TCP, resources *model.Resources, ipv6 *model.IPv6Che
 	return findings
 }
 
-// intervalSampled keeps pre-validity reports compatible: only an explicit
-// false means that counter deltas were unavailable at one sampling boundary.
-func intervalSampled(sampled *bool) bool { return sampled == nil || *sampled }
+// intervalSampled and memoryAvailable delegate to model, which owns the
+// three-state validity rule these markers encode.
+func intervalSampled(sampled *bool) bool { return model.IntervalSampled(sampled) }
 
-// memoryAvailable preserves compatibility with older reports, where the
-// absence of an explicit validity marker represented a measured value.
-func memoryAvailable(memory *model.Memory) bool {
-	return memory.AvailableValid == nil || *memory.AvailableValid
-}
+func memoryAvailable(memory *model.Memory) bool { return memory.MemoryAvailableMeasured() }
 
 func deviceHealthFindings(devices []model.DeviceHealth) []model.Finding {
 	var findings []model.Finding
@@ -680,7 +662,7 @@ func kernelFinding(event model.LogEvent, eventTime *time.Time) model.Finding {
 	// A link coming back up is the recovery half of a link_down/link_up
 	// pair, not a fault on its own -- reporting it as a Warning would
 	// penalize a host for a NIC that already fixed itself.
-	if event.Kind == "link_up" {
+	if event.Kind == model.KindLinkUp {
 		summary := event.Message
 		if event.AgeSeconds != nil {
 			summary = fmt.Sprintf("%s (recorded %s ago)", summary, humanDuration(time.Duration(*event.AgeSeconds)*time.Second))
@@ -696,22 +678,36 @@ func kernelFinding(event model.LogEvent, eventTime *time.Time) model.Finding {
 	suggestion := "Inspect the kernel journal and affected hardware or workload."
 
 	switch event.Kind {
-	case "oom":
+	case model.KindOOM:
 		suggestion = "Inspect the kernel journal and affected processes using the diagnostic command above."
-	case "panic":
+	case model.KindKernelPanic:
 		suggestion = "Inspect the panic message and system state using the diagnostic command above."
-	case "oops":
+	case model.KindKernelOops:
 		suggestion = "Inspect the oops details and kernel module state using the diagnostic command above."
-	case "cgroup_oom":
+	case model.KindCgroupOOM:
 		suggestion = "Inspect cgroup OOM events and container/workload memory limits."
-	case "hardware_error":
+	case model.KindHardwareError:
 		suggestion = "Inspect hardware error details and EDAC counters."
-	case "filesystem_corruption":
+	case model.KindFilesystemCorruption, model.KindFilesystemError:
 		suggestion = "Run filesystem check and restore from backup if necessary."
-	case "filesystem_readonly_remount":
+	case model.KindFilesystemReadonlyRemount:
 		suggestion = "Inspect filesystem error details and attempt remount."
-	case "disk_full":
+	case model.KindDiskFull:
 		suggestion = "Free disk space and investigate the cause."
+	case model.KindBlockedTask:
+		suggestion = "Inspect the blocked task's storage or NFS dependency and host I/O pressure."
+	case model.KindNVMeError, model.KindIOError:
+		suggestion = "Inspect the device's SMART/NVMe log, cabling, and the kernel I/O errors around this record."
+	case model.KindZFSError:
+		suggestion = "Run zpool status -v and inspect the affected device before relying on the pool."
+	case model.KindThermalThrottling:
+		suggestion = "Check cooling and airflow; sustained throttling means the hardware cannot shed its heat."
+	case model.KindSegfault:
+		suggestion = "Inspect the faulting program and its recent changes; a repeating segfault is a crash loop."
+	case model.KindNetdevWatchdog:
+		suggestion = "Inspect the NIC driver and firmware; a transmit timeout usually means a wedged queue."
+	case model.KindLinkDown:
+		suggestion = "Inspect the cable, transceiver, and the switch port for this interface."
 	}
 
 	if event.AgeSeconds != nil {
@@ -732,27 +728,47 @@ func kernelFinding(event model.LogEvent, eventTime *time.Time) model.Finding {
 	return findingWithEventTime("kernel-"+event.Kind, severity, "kernel", "Kernel event: "+event.Kind, summary, suggestion, cmd, eventTime, impact)
 }
 
+// kernelDiagnosticCommand builds a journal query narrowed to the event's own
+// signature. Every kind model.KernelEventKinds lists has a pattern here: the
+// generic fallback is an unfiltered tail of the current boot, which after a
+// panic-induced reboot contains nothing about the panic at all.
 func kernelDiagnosticCommand(kind string, eventTime *time.Time) string {
 	var pattern string
 	switch kind {
-	case "oom":
+	case model.KindOOM:
 		pattern = "oom-killer"
-	case "panic":
+	case model.KindKernelPanic:
 		pattern = "kernel panic"
-	case "oops":
-		pattern = "oops"
-	case "cgroup_oom":
+	case model.KindKernelOops:
+		pattern = "oops|unable to handle kernel"
+	case model.KindCgroupOOM:
 		pattern = "cgroup.*oom"
-	case "hardware_error":
+	case model.KindHardwareError:
 		pattern = "machine check|mce|hardware error"
-	case "filesystem_corruption":
-		pattern = "corrupted inode|bad block"
-	case "filesystem_readonly_remount":
+	case model.KindFilesystemCorruption:
+		pattern = "corrupted inode|bad block|corruption"
+	case model.KindFilesystemError:
+		pattern = "ext4-fs error|btrfs error"
+	case model.KindFilesystemReadonlyRemount:
 		pattern = "read-only|remount.*ro"
-	case "disk_full":
+	case model.KindDiskFull:
 		pattern = "no space|disk full|ENOSPC"
-	case "link_up", "link_down":
+	case model.KindLinkUp, model.KindLinkDown:
 		pattern = "link|carrier"
+	case model.KindBlockedTask:
+		pattern = "blocked for more than|task hung"
+	case model.KindNVMeError:
+		pattern = "nvme"
+	case model.KindIOError:
+		pattern = "i/o error|blk_update_request"
+	case model.KindNetdevWatchdog:
+		pattern = "netdev watchdog"
+	case model.KindZFSError:
+		pattern = "zfs"
+	case model.KindThermalThrottling:
+		pattern = "thermal"
+	case model.KindSegfault:
+		pattern = "segfault at"
 	default:
 		return "journalctl -k | tail -50"
 	}
@@ -792,9 +808,17 @@ func taskCeiling(resources *model.Resources) uint64 {
 	}
 }
 
+// criticalKernelEvent names the records that describe an incident the host did
+// not survive intact. An EXT4/Btrfs filesystem error belongs here alongside
+// XFS corruption: they are the same class of fault reported by different
+// drivers, and treating one as Critical and the other as a Warning was an
+// accident of which string each driver happens to print.
 func criticalKernelEvent(kind string) bool {
 	switch kind {
-	case "oom", "cgroup_oom", "hardware_error", "filesystem_corruption", "kernel_panic", "kernel_oops", "filesystem_readonly_remount", "disk_full":
+	case model.KindOOM, model.KindCgroupOOM, model.KindHardwareError,
+		model.KindFilesystemCorruption, model.KindFilesystemError,
+		model.KindKernelPanic, model.KindKernelOops,
+		model.KindFilesystemReadonlyRemount, model.KindDiskFull:
 		return true
 	default:
 		return false
@@ -847,6 +871,20 @@ func bytes(v uint64) string {
 	}
 	return fmt.Sprintf("%.1f TiB", value)
 }
+
+// ActionableWithoutImpact returns the IDs of findings that claim a severity
+// which changes the exit code while subtracting nothing from the score. The
+// set must stay empty; see scoreFindings for why.
+func ActionableWithoutImpact(findings []model.Finding) []string {
+	var offenders []string
+	for _, f := range findings {
+		if (f.Severity == model.SeverityWarning || f.Severity == model.SeverityCritical) && f.ScoreImpact <= 0 {
+			offenders = append(offenders, f.ID)
+		}
+	}
+	return offenders
+}
+
 func rank(s model.Severity) int {
 	switch s {
 	case model.SeverityCritical:
@@ -858,21 +896,43 @@ func rank(s model.Severity) int {
 	}
 	return 0
 }
+
+// label names the score band, but never more favourably than the highest
+// severity present allows. The label and the severity are read together --
+// severity also decides the process exit code -- so "EXCELLENT" alongside a
+// warning that exits 1 is a contradiction the caller cannot resolve.
 func label(score int, s model.Severity) string {
-	if s == model.SeverityCritical {
+	switch s {
+	case model.SeverityCritical:
 		return "CRITICAL"
+	case model.SeverityUnknown:
+		return "INSUFFICIENT DATA"
 	}
-	if score >= 90 {
-		return "EXCELLENT"
+	band := "POOR"
+	switch {
+	case score >= 90:
+		band = "EXCELLENT"
+	case score >= 75:
+		band = "GOOD"
+	case score >= 60:
+		band = "DEGRADED"
 	}
-	if score >= 75 {
+	// A warning is never "EXCELLENT", however little it cost the score.
+	if s == model.SeverityWarning && band == "EXCELLENT" {
 		return "GOOD"
 	}
-	if score >= 60 {
-		return "DEGRADED"
-	}
-	return "POOR"
+	return band
 }
+
+// pluralize renders a count with its noun, e.g. "1 failed unit" / "2 failed
+// units". Only regular plurals are needed here.
+func pluralize(n int, noun string) string {
+	if n == 1 {
+		return fmt.Sprintf("1 %s", noun)
+	}
+	return fmt.Sprintf("%d %ss", n, noun)
+}
+
 func max(a, b int) int {
 	if a > b {
 		return a

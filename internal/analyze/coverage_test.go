@@ -214,13 +214,15 @@ func TestKernelLinkUpStaysInformational(t *testing.T) {
 // analyze-level severity every kind resolves to, not just the "oom" case.
 func TestKernelEventKindsResolveExpectedSeverity(t *testing.T) {
 	cases := map[string]model.Severity{
-		"oom":                         model.SeverityCritical,
-		"cgroup_oom":                  model.SeverityCritical,
-		"kernel_panic":                model.SeverityCritical,
-		"kernel_oops":                 model.SeverityCritical,
-		"hardware_error":              model.SeverityCritical,
-		"filesystem_corruption":       model.SeverityCritical,
-		"filesystem_error":            model.SeverityWarning,
+		"oom":                   model.SeverityCritical,
+		"cgroup_oom":            model.SeverityCritical,
+		"kernel_panic":          model.SeverityCritical,
+		"kernel_oops":           model.SeverityCritical,
+		"hardware_error":        model.SeverityCritical,
+		"filesystem_corruption": model.SeverityCritical,
+		// An EXT4/Btrfs filesystem error is the same class of fault as XFS
+		// corruption; which string the driver prints does not change it.
+		"filesystem_error":            model.SeverityCritical,
 		"io_error":                    model.SeverityWarning,
 		"nvme_error":                  model.SeverityWarning,
 		"blocked_task":                model.SeverityWarning,

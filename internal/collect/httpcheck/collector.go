@@ -101,6 +101,11 @@ func (c *Collector) doGet(ctx context.Context, url string) (int, time.Duration, 
 	if proxyURL != nil {
 		client = proxyClient(c.proxyFor)
 	}
+	// Each probe builds its own transport, so each probe must release it.
+	// Without this the idle connection and its reader goroutine outlive the
+	// call; harmless for a one-shot CLI run, but this collector is meant to be
+	// reusable by the long-lived callers app.Run is deliberately written for.
+	defer closeIdle(client)
 	resp, err := client.Do(req)
 	latency := time.Since(start)
 	if err != nil {
@@ -137,4 +142,10 @@ func directClient() *http.Client {
 
 func proxyClient(proxy func(*http.Request) (*url.URL, error)) *http.Client {
 	return &http.Client{Transport: &http.Transport{Proxy: proxy}}
+}
+
+func closeIdle(client *http.Client) {
+	if transport, ok := client.Transport.(*http.Transport); ok {
+		transport.CloseIdleConnections()
+	}
 }

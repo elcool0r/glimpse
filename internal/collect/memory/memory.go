@@ -256,11 +256,9 @@ func ParseMemInfo(r io.Reader) (Info, error) {
 	return out, nil
 }
 
-// memoryAvailable keeps reports created before availability validity was added
-// compatible: only an explicit false means MemAvailable was unavailable.
-func memoryAvailable(m *model.Memory) bool {
-	return m.AvailableValid == nil || *m.AvailableValid
-}
+// memoryAvailable delegates to model, which owns the three-state validity
+// rule this marker encodes.
+func memoryAvailable(m *model.Memory) bool { return m.MemoryAvailableMeasured() }
 
 // consumedMemInfoKey lists the keys ParseMemInfo stores. Keeping it beside the
 // switch below makes the "unit must be kB" rule apply exactly to them.

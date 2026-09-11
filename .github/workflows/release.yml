@@ -61,6 +61,12 @@ jobs:
     name: Publish release
     needs: build
     runs-on: ubuntu-latest
+    # id-token is required to sign the build provenance attestation;
+    # attestations is what records it against this repository.
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -68,8 +74,21 @@ jobs:
           path: dist
           merge-multiple: true
 
+      # The README tells users to curl a binary into /usr/local/bin with sudo,
+      # and the result is frequently run as root. Without a published digest
+      # there is no way for them to tell a genuine artifact from a substituted
+      # one, so ship the checksums alongside the binaries.
+      - name: Generate checksums
+        working-directory: dist
+        run: sha256sum glimpse-linux-* > SHA256SUMS
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@977bb373b6df2d78c99998eaad6a4d9d3e72806d # v2.4.0
+        with:
+          subject-path: dist/glimpse-linux-*
+
       - name: Create GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@72f2c25fcb47643c292f7107632f7a47c1df5cd8 # v2.3.2
         with:
           files: dist/*
           generate_release_notes: true

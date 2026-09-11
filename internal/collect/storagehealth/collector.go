@@ -249,8 +249,31 @@ func (c *Collector) devices() ([]string, error) {
 	return devices, nil
 }
 
+// noSMARTPrefixes names block-device families that cannot answer a
+// SMART/NVMe health query: devices assembled from other devices (device
+// mapper, md, loop, zram, network block devices), and paravirtual or
+// removable-media devices whose host exposes no underlying vendor log
+// (virtio, Xen, SD/eMMC, optical). Probing them only spends the scan budget
+// on a guaranteed failure and files a coverage diagnostic for a device that
+// was never eligible.
+var noSMARTPrefixes = []string{
+	"loop", "ram", "zram", "dm-", "md", "sr", "fd", "nbd", "zd", "drbd", "rbd",
+	"vd", "xvd", "mmcblk",
+}
+
+// physicalDevice reports whether a /sys/block entry is worth asking for a
+// health log. It excludes the families above and admits everything else:
+// the previous form did the opposite, admitting only "sd", "hd" and "nvme"
+// prefixes, so every device naming scheme it had not been taught about was
+// dropped silently -- while DeviceHealthCoverage.DevicesEligible went on
+// reporting the resulting count as the complete inventory.
 func physicalDevice(name string) bool {
-	return strings.HasPrefix(name, "sd") || strings.HasPrefix(name, "hd") || strings.HasPrefix(name, "nvme")
+	for _, prefix := range noSMARTPrefixes {
+		if strings.HasPrefix(name, prefix) {
+			return false
+		}
+	}
+	return name != ""
 }
 
 func toModel(device Device) model.DeviceHealth {

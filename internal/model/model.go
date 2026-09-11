@@ -250,10 +250,10 @@ type DNSConfig struct {
 }
 
 // DNSResolution is the result of actually sending resolution queries, unlike
-// DNSConfig which only reads the configuration file. It exists only when the
-// user opted in (--check-dns-resolution): resolving a name against an
-// external server contacts the internet, which this tool does not do by
-// default.
+// DNSConfig which only reads the configuration file. It is part of the
+// active-check profile: resolving a name against an external server contacts
+// the internet, so it is absent from any run started with
+// --disable-external-checks.
 type DNSResolution struct {
 	Available bool                 `json:"available"`
 	Local     *DNSResolutionResult `json:"local,omitempty"`
@@ -837,6 +837,122 @@ type LogEvent struct {
 	Kind       string   `json:"kind"`
 	Message    string   `json:"message"`
 	AgeSeconds *float64 `json:"age_seconds,omitempty"`
+}
+
+// The *Valid and Sampled markers below use a deliberate three-state encoding:
+// nil means the report predates the marker (and the value was measured), an
+// explicit true means measured, and an explicit false means the collector
+// could not derive it. Every consumer needs that rule, so it lives here as
+// behaviour rather than as a comment each consumer reimplements -- the same
+// four-line predicate had been copied into analyze, render and collect, free
+// to drift apart with nothing to notice if one copy were missed.
+
+// Measured reports whether a three-state validity marker describes a value
+// that was actually measured.
+func Measured(marker *bool) bool { return marker == nil || *marker }
+
+// IntervalSampled reports whether counter deltas were derived across the
+// sampling window. Only an explicit false means they were not.
+func IntervalSampled(sampled *bool) bool { return Measured(sampled) }
+
+// MemoryAvailableMeasured reports whether MemAvailable was present in
+// /proc/meminfo, which is what makes AvailableFraction meaningful.
+func (m *Memory) MemoryAvailableMeasured() bool {
+	return m != nil && Measured(m.AvailableValid)
+}
+
+// HasErrors reports whether a ZFS pool recorded a read, write, or checksum
+// error on its root row or on any vdev.
+func (p ZFSPool) HasErrors() bool {
+	if p.ReadErrors > 0 || p.WriteErrors > 0 || p.ChecksumErrors > 0 {
+		return true
+	}
+	for _, vdev := range p.VdevErrors {
+		if vdev.ReadErrors > 0 || vdev.WriteErrors > 0 || vdev.ChecksumErrors > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// HasApproximateVdev reports whether any vdev row carried scaled counters
+// rather than exact ones.
+func (p ZFSPool) HasApproximateVdev() bool {
+	for _, vdev := range p.VdevErrors {
+		if vdev.Approximate {
+			return true
+		}
+	}
+	return false
+}
+
+// Kernel journal event kinds. These are the exact strings the kernel
+// collector emits and the analyzer branches on, and they are part of the JSON
+// contract. They live here rather than as literals in both packages because
+// the two vocabularies silently drifted once already: the analyzer matched
+// "panic" and "oops" while the collector emitted KindKernelPanic and
+// KindKernelOops, so the two most severe events glimpse can detect fell
+// through to the generic branch and were handed an unfiltered
+// `journalctl -k | tail -50` that, after a panic reboot, contains nothing
+// about the panic at all.
+const (
+	KindOOM                       = "oom"
+	KindCgroupOOM                 = "cgroup_oom"
+	KindKernelPanic               = "kernel_panic"
+	KindKernelOops                = "kernel_oops"
+	KindBlockedTask               = "blocked_task"
+	KindNVMeError                 = "nvme_error"
+	KindIOError                   = "io_error"
+	KindFilesystemReadonlyRemount = "filesystem_readonly_remount"
+	KindFilesystemCorruption      = "filesystem_corruption"
+	KindFilesystemError           = "filesystem_error"
+	KindHardwareError             = "hardware_error"
+	KindNetdevWatchdog            = "netdev_watchdog"
+	KindZFSError                  = "zfs_error"
+	KindThermalThrottling         = "thermal_throttling"
+	KindSegfault                  = "segfault"
+	KindLinkDown                  = "link_down"
+	KindLinkUp                    = "link_up"
+	KindDiskFull                  = "disk_full"
+)
+
+// KernelEventKinds is every kind the kernel collector can classify. Analysis
+// and rendering are expected to have an answer for each of them.
+var KernelEventKinds = []string{
+	KindOOM, KindCgroupOOM, KindKernelPanic, KindKernelOops, KindBlockedTask,
+	KindNVMeError, KindIOError, KindFilesystemReadonlyRemount, KindFilesystemCorruption,
+	KindFilesystemError, KindHardwareError, KindNetdevWatchdog, KindZFSError,
+	KindThermalThrottling, KindSegfault, KindLinkDown, KindLinkUp, KindDiskFull,
+}
+
+// Container log event kinds. This is a separate vocabulary from the kernel
+// kinds above -- it classifies application output, not kernel records -- and
+// the overlapping names are deliberate rather than interchangeable.
+const (
+	LogKindOOM                = "oom"
+	LogKindPanic              = "panic"
+	LogKindSegmentationFault  = "segmentation_fault"
+	LogKindUncaughtException  = "uncaught_exception"
+	LogKindDataCorruption     = "data_corruption"
+	LogKindReadOnlyFilesystem = "read_only_filesystem"
+	// LogKindFailure and LogKindError match ordinary application wording and
+	// cannot support a health verdict on their own.
+	LogKindFailure = "failure"
+	LogKindError   = "error"
+)
+
+// SpecificLogKind reports whether a container log classification identifies a
+// concrete failure rather than generic "error"/"failure" wording. Analysis
+// uses it to decide severity and rendering uses it to decide what belongs on
+// the timeline; both must agree, so the rule lives with the vocabulary.
+func SpecificLogKind(kind string) bool {
+	switch kind {
+	case LogKindOOM, LogKindPanic, LogKindSegmentationFault,
+		LogKindUncaughtException, LogKindDataCorruption, LogKindReadOnlyFilesystem:
+		return true
+	default:
+		return false
+	}
 }
 
 type Evidence struct {

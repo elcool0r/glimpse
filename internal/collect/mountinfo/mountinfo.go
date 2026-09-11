@@ -14,9 +14,20 @@ import (
 
 // Entry is one mounted filesystem.
 type Entry struct {
-	Source   string
-	Target   string
-	Type     string
+	Source string
+	Target string
+	Type   string
+	// DeviceID is mountinfo's "major:minor" field, which identifies the
+	// underlying filesystem rather than this particular mount of it. Two bind
+	// mounts of one device share a DeviceID and differ in Target and Root, so
+	// capacity must be counted once per DeviceID -- statfs returns the same
+	// numbers for every bind mount, and counting them per Target reported one
+	// full device as several independent full filesystems.
+	DeviceID string
+	// Root is the subtree of the filesystem that is mounted here ("/" for a
+	// whole-filesystem mount). It distinguishes a bind mount of a subdirectory
+	// from a second mount of the whole device.
+	Root     string
 	Options  []string
 	ReadOnly bool
 }
@@ -83,6 +94,8 @@ func parseLine(line string) (Entry, bool) {
 		Source:   Unescape(fields[separator+2]),
 		Target:   Unescape(fields[4]),
 		Type:     fields[separator+1],
+		DeviceID: fields[2],
+		Root:     Unescape(fields[3]),
 		Options:  options,
 		ReadOnly: readOnly,
 	}, true

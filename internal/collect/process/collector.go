@@ -149,13 +149,13 @@ func processes(in []Process, names map[int]string) []model.Process {
 func endpointDStateProcesses(before, after []Process, limit int) []model.Process {
 	baseline := make(map[int]Process, len(before))
 	for _, p := range before {
-		if p.State == 'D' {
+		if p.State == 'D' && !p.Own {
 			baseline[p.PID] = p
 		}
 	}
 	matches := make([]Process, 0)
 	for _, p := range after {
-		if p.State != 'D' {
+		if p.State != 'D' || p.Own {
 			continue
 		}
 		if prior, ok := baseline[p.PID]; ok && prior.StartTimeTicks == p.StartTimeTicks {
@@ -177,7 +177,7 @@ func endpointDStateProcesses(before, after []Process, limit int) []model.Process
 func zombies(in []Process, limit int) []model.Process {
 	zombieList := make([]Process, 0)
 	for _, p := range in {
-		if p.State == 'Z' {
+		if p.State == 'Z' && !p.Own {
 			zombieList = append(zombieList, p)
 		}
 	}

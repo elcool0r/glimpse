@@ -208,9 +208,19 @@ func dnsResolutionFindings(resolution *model.DNSResolution) []model.Finding {
 		return []model.Finding{findingWithDiagnostic("dns-resolution-failed", model.SeverityCritical, "network", "DNS resolution is not working",
 			detail, "Inspect the resolver configuration, local DNS service, and network path to any DNS server.", cmd, 25)}
 	case localAttempted && !localOK:
+		// Only the first case establishes that the external resolver also
+		// failed, so reaching here means either it succeeded or it was never
+		// attempted. Both the nil dereference and the "the same query
+		// succeeded" claim have to account for the second case: the external
+		// probe is optional, and asserting a success that was never observed
+		// sends the reader looking for a fault that is not there.
+		detail := fmt.Sprintf("Resolving %s against the configured nameserver (%s) failed.", resolution.Local.Domain, resolution.Local.Server)
+		if externalAttempted && externalOK {
+			detail = fmt.Sprintf("Resolving %s against the configured nameserver (%s) failed, but the same query succeeded against %s.", resolution.Local.Domain, resolution.Local.Server, resolution.External.Server)
+		}
 		cmd := fmt.Sprintf("dig @%s %s +short", resolution.Local.Server, resolution.Local.Domain)
 		return []model.Finding{findingWithDiagnostic("dns-resolution-local-failed", model.SeverityWarning, "network", "Local DNS server is not resolving names",
-			fmt.Sprintf("Resolving %s against the configured nameserver (%s) failed, but the same query succeeded against %s.", resolution.Local.Domain, resolution.Local.Server, resolution.External.Server),
+			detail,
 			"Inspect the local DNS server or forwarder; clients depending on it cannot resolve names.", cmd, 15)}
 	case externalAttempted && !externalOK:
 		cmd := fmt.Sprintf("dig @%s %s +short", resolution.External.Server, resolution.External.Domain)

@@ -151,8 +151,8 @@ func appendNewEvents(events []model.LogEvent, found []model.LogEvent) []model.Lo
 }
 
 func canonicalEventKey(kind string) string {
-	if kind == "oom" || kind == "cgroup_oom" {
-		return "oom"
+	if kind == model.KindOOM || kind == model.KindCgroupOOM {
+		return model.KindOOM
 	}
 	return kind
 }
@@ -208,7 +208,7 @@ var virtualInterfacePrefixes = []string{
 func filterVirtualLinkEvents(events []model.LogEvent) []model.LogEvent {
 	kept := make([]model.LogEvent, 0, len(events))
 	for _, event := range events {
-		if (event.Kind == "link_up" || event.Kind == "link_down") && isVirtualInterfaceMessage(event.Message) {
+		if (event.Kind == model.KindLinkUp || event.Kind == model.KindLinkDown) && isVirtualInterfaceMessage(event.Message) {
 			continue
 		}
 		kept = append(kept, event)
@@ -303,41 +303,41 @@ func eventKind(line string) string {
 	lower := strings.ToLower(line)
 	switch {
 	case strings.Contains(lower, "memory cgroup out of memory") || strings.Contains(lower, "cgroup out of memory"):
-		return "cgroup_oom"
+		return model.KindCgroupOOM
 	case strings.Contains(lower, "out of memory") || strings.Contains(lower, "oom-killer") || strings.Contains(lower, "killed process"):
-		return "oom"
+		return model.KindOOM
 	case strings.Contains(lower, "kernel panic"):
-		return "kernel_panic"
+		return model.KindKernelPanic
 	case strings.Contains(lower, "kernel oops") || strings.Contains(lower, "oops:") || strings.Contains(lower, "unable to handle kernel"):
-		return "kernel_oops"
+		return model.KindKernelOops
 	case strings.Contains(lower, "blocked for more than") || strings.Contains(lower, "task hung"):
-		return "blocked_task"
+		return model.KindBlockedTask
 	case strings.Contains(lower, "nvme") && (strings.Contains(lower, "reset") || strings.Contains(lower, "i/o error") || strings.Contains(lower, "timeout")):
-		return "nvme_error"
+		return model.KindNVMeError
 	case strings.Contains(lower, "i/o error") || strings.Contains(lower, "buffer i/o error") || strings.Contains(lower, "blk_update_request"):
-		return "io_error"
+		return model.KindIOError
 	case strings.Contains(lower, "remounting filesystem read-only") || strings.Contains(lower, "re-mounting filesystem read-only") || strings.Contains(lower, "remounting filesystem read only"):
-		return "filesystem_readonly_remount"
+		return model.KindFilesystemReadonlyRemount
 	case strings.Contains(lower, "xfs") && strings.Contains(lower, "corruption"):
-		return "filesystem_corruption"
+		return model.KindFilesystemCorruption
 	case strings.Contains(lower, "ext4-fs error") || strings.Contains(lower, "btrfs error"):
-		return "filesystem_error"
+		return model.KindFilesystemError
 	case strings.Contains(lower, "machine check") || strings.Contains(lower, "hardware error"):
-		return "hardware_error"
+		return model.KindHardwareError
 	case strings.Contains(lower, "netdev watchdog"):
-		return "netdev_watchdog"
+		return model.KindNetdevWatchdog
 	case strings.Contains(lower, "zfs") && (strings.Contains(lower, "error") || strings.Contains(lower, "fault") || strings.Contains(lower, "degrad")):
-		return "zfs_error"
+		return model.KindZFSError
 	case strings.Contains(lower, "thermal") && (strings.Contains(lower, "throttl") || strings.Contains(lower, "critical")):
-		return "thermal_throttling"
+		return model.KindThermalThrottling
 	case strings.Contains(lower, "segfault at"):
-		return "segfault"
+		return model.KindSegfault
 	case strings.Contains(lower, "nic link is down") || strings.Contains(lower, "link is down"):
-		return "link_down"
+		return model.KindLinkDown
 	case strings.Contains(lower, "nic link is up") || strings.Contains(lower, "link is up"):
-		return "link_up"
+		return model.KindLinkUp
 	case strings.Contains(lower, "no space left on device"):
-		return "disk_full"
+		return model.KindDiskFull
 	default:
 		return ""
 	}
