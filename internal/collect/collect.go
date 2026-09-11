@@ -92,6 +92,37 @@ type StaticCollector interface {
 	Static()
 }
 
+// Boundary identifies which of the two collection boundaries an observation
+// is being taken for.
+type Boundary int
+
+const (
+	// BoundaryBaseline is the observation taken before the sampling window.
+	// Only the values a DeltaCollector actually reads from `first` survive
+	// merge; everything else collected here is discarded.
+	BoundaryBaseline Boundary = iota
+	// BoundaryFinal is the observation taken after the sampling window. It is
+	// the one merge reports, so it must be complete.
+	BoundaryFinal
+)
+
+// BoundaryCollector is an optional extension for a collector that needs a
+// counter baseline but whose full observation is expensive.
+//
+// StaticCollector and DeltaCollector are mutually exclusive by construction:
+// a collector that derives deltas is never treated as static, because merge
+// needs both of its observations. That forced a collector needing one cheap
+// counter at the baseline to repeat all of its expensive work there too --
+// the container integration read every container's logs twice per report and
+// merge discarded the first read entirely.
+//
+// Implementations must still return, at BoundaryBaseline, everything their
+// own Delta reads from the first observation. Anything else may be skipped.
+type BoundaryCollector interface {
+	Collector
+	CollectAt(context.Context, Boundary) (Data, error)
+}
+
 // TrendCollector is an optional extension for inexpensive dynamic collectors.
 // The application records bounded intermediate observations and asks the
 // collector to convert them to sparkline-ready trends after sampling.

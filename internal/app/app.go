@@ -71,12 +71,12 @@ func Run(ctx context.Context, config Config, collectors []collect.Collector) mod
 	// Static collectors expose gauges, not counter boundaries; merge only reads
 	// their final observation, so collecting them here would be pure cost.
 	excluded := make([]bool, len(collectors))
-	first, firstStatus := collectBoundary(ctx, collectors, boundary, skipStatic, excluded)
+	first, firstStatus := collectBoundary(ctx, collectors, boundary, skipStatic, collect.BoundaryBaseline, excluded)
 	samplingStarted := time.Now()
 	sampleDeadline := samplingStarted.Add(config.Duration)
 	intermediate, sampledStatus := sampleTrends(ctx, config, collectors, samplingStarted, sampleDeadline, observation, excluded)
 	emitProgress(config, Progress{Phase: "final", Elapsed: time.Since(started), Duration: config.Duration, Collectors: len(collectors)})
-	last, lastStatus := collectBoundary(ctx, collectors, boundary, collectEvery, excluded)
+	last, lastStatus := collectBoundary(ctx, collectors, boundary, collectEvery, collect.BoundaryFinal, excluded)
 	samplingEnded := time.Now()
 	metrics, deltaStatus := merge(collectors, first, last, excluded)
 	metrics.Trends = buildTrends(collectors, append(append([][]collect.Data{first}, intermediate...), last), excluded)
@@ -122,10 +122,10 @@ const (
 
 // collectBoundary runs one boundary under its own budget so a slow optional
 // integration cannot consume the time the rest of the report needs.
-func collectBoundary(parent context.Context, collectors []collect.Collector, budget time.Duration, mode boundaryMode, excluded []bool) ([]collect.Data, []model.CollectionStatus) {
+func collectBoundary(parent context.Context, collectors []collect.Collector, budget time.Duration, mode boundaryMode, boundary collect.Boundary, excluded []bool) ([]collect.Data, []model.CollectionStatus) {
 	ctx, cancel := context.WithTimeout(parent, budget)
 	defer cancel()
-	data, status, unfinished := collectAll(ctx, collectors, mode, excluded)
+	data, status, unfinished := collectAll(ctx, collectors, mode, boundary, excluded)
 	excludeUnfinished(excluded, unfinished)
 	return data, status
 }
@@ -289,7 +289,7 @@ func buildTrends(collectors []collect.Collector, samples [][]collect.Data, exclu
 	return trends
 }
 
-func collectAll(ctx context.Context, collectors []collect.Collector, mode boundaryMode, excluded []bool) ([]collect.Data, []model.CollectionStatus, []bool) {
+func collectAll(ctx context.Context, collectors []collect.Collector, mode boundaryMode, boundary collect.Boundary, excluded []bool) ([]collect.Data, []model.CollectionStatus, []bool) {
 	data := make([]collect.Data, len(collectors))
 	status := make([]model.CollectionStatus, len(collectors))
 	if ctx.Err() != nil {
@@ -320,7 +320,7 @@ func collectAll(ctx context.Context, collectors []collect.Collector, mode bounda
 		running[i] = true
 		remaining++
 		go func(i int, collector collect.Collector) {
-			data, err := collector.Collect(ctx)
+			data, err := collectAt(ctx, collector, boundary)
 			results <- collectionResult{index: i, data: data, err: err, finished: time.Now()}
 		}(i, collector)
 	}
@@ -332,6 +332,15 @@ func collectAll(ctx context.Context, collectors []collect.Collector, mode bounda
 		}
 	}
 	return data, result, unfinished
+}
+
+// collectAt lets a collector skip work whose result this boundary discards.
+// A collector that does not opt in is observed identically at both boundaries.
+func collectAt(ctx context.Context, collector collect.Collector, boundary collect.Boundary) (collect.Data, error) {
+	if aware, ok := collector.(collect.BoundaryCollector); ok {
+		return aware.CollectAt(ctx, boundary)
+	}
+	return collector.Collect(ctx)
 }
 
 func countSelected(selected []bool) int {

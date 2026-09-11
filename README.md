@@ -45,11 +45,20 @@ CRIT  Failed systemd units
 
 ```bash
 curl -LO https://github.com/elcool0r/glimpse/releases/latest/download/glimpse-linux-amd64
+curl -LO https://github.com/elcool0r/glimpse/releases/latest/download/SHA256SUMS
+sha256sum --check --ignore-missing SHA256SUMS
 chmod +x glimpse-linux-amd64
 sudo mv glimpse-linux-amd64 /usr/local/bin/glimpse
 ```
 
 (swap `amd64` for `arm64` on an ARM host)
+
+Releases also carry a GitHub build-provenance attestation, so you can confirm
+the binary was built by this repository's release workflow:
+
+```bash
+gh attestation verify glimpse-linux-amd64 --repo elcool0r/glimpse
+```
 
 **Or with Go:**
 
@@ -64,6 +73,10 @@ git clone https://github.com/elcool0r/glimpse.git
 cd glimpse
 go build -o glimpse ./cmd/glimpse
 ```
+
+Linux only (`GOOS=linux`), on amd64 or arm64: glimpse reads `/proc` and `/sys`
+directly, so there is nothing meaningful for it to report elsewhere. Building
+for another OS produces a binary that says so and exits `3`.
 
 Requires Go 1.24+ to build. The binary has no runtime dependencies — optional integrations (SMART, ZFS, containers, etc.) are used automatically when the relevant command is present, and skipped gracefully when it isn't.
 

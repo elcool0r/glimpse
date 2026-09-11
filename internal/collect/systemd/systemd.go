@@ -46,7 +46,16 @@ func (c *Collector) Name() string { return "systemd" }
 // restarted since boot as perpetually suspicious.
 type snapshot struct{ restarts map[string]uint64 }
 
+// Collect performs the full observation. It is the BoundaryFinal behaviour;
+// callers that go through the sampling lifecycle reach CollectAt instead.
 func (c *Collector) Collect(parent context.Context) (collect.Data, error) {
+	return c.CollectAt(parent, collect.BoundaryFinal)
+}
+
+// CollectAt skips the `--failed` query at the baseline boundary and ignores
+// the timestamp properties there. Delta reads only NRestarts from the first
+// observation; everything else the baseline gathers is discarded by merge.
+func (c *Collector) CollectAt(parent context.Context, boundary collect.Boundary) (collect.Data, error) {
 	lookup := c.lookPath
 	if lookup == nil {
 		lookup = exec.LookPath
@@ -64,20 +73,24 @@ func (c *Collector) Collect(parent context.Context) (collect.Data, error) {
 		run = runCommand
 	}
 
-	failedCtx, cancel := context.WithTimeout(parent, timeout)
-	failedOutput, failedErr := run(failedCtx, path, "--failed", "--no-legend", "--plain", "--no-pager")
-	cancel()
-	// A disconnected user/container bus is an unavailable capability, not a
-	// health error. Context cancellation remains meaningful to the caller.
-	if failedErr != nil {
-		if parent.Err() != nil {
-			return collect.Data{}, parent.Err()
+	full := boundary == collect.BoundaryFinal
+	var failedUnits []string
+	if full {
+		failedCtx, cancel := context.WithTimeout(parent, timeout)
+		failedOutput, failedErr := run(failedCtx, path, "--failed", "--no-legend", "--plain", "--no-pager")
+		cancel()
+		// A disconnected user/container bus is an unavailable capability, not a
+		// health error. Context cancellation remains meaningful to the caller.
+		if failedErr != nil {
+			if parent.Err() != nil {
+				return collect.Data{}, parent.Err()
+			}
+			return collect.Data{Systemd: &model.Systemd{Available: false}, Diagnostics: []model.CollectionStatus{{Status: "unavailable", Detail: failedErr.Error()}}}, nil
 		}
-		return collect.Data{Systemd: &model.Systemd{Available: false}, Diagnostics: []model.CollectionStatus{{Status: "unavailable", Detail: failedErr.Error()}}}, nil
+		failedUnits = ParseFailedUnits(string(failedOutput))
 	}
 
 	var diagnostics []model.CollectionStatus
-	failedUnits := ParseFailedUnits(string(failedOutput))
 	restarts := map[string]uint64{}
 	failedSince := map[string]time.Time{}
 	var recentStarts []model.SystemdUnitStart
@@ -89,6 +102,13 @@ func (c *Collector) Collect(parent context.Context) (collect.Data, error) {
 	switch {
 	case listErr != nil && parent.Err() != nil:
 		return collect.Data{}, parent.Err()
+	case listErr != nil && !full:
+		// At the baseline boundary the restart counters are this collector's
+		// only output that survives merge, and list-units is how the units to
+		// query are discovered. Reporting the same unavailable shape the final
+		// boundary reports for `--failed` keeps a dead bus from producing two
+		// differently-worded diagnostics for one cause.
+		return collect.Data{Systemd: &model.Systemd{Available: false}, Diagnostics: []model.CollectionStatus{{Status: "unavailable", Detail: listErr.Error()}}}, nil
 	case listErr != nil:
 		diagnostics = append(diagnostics, model.CollectionStatus{Status: "unavailable", Detail: "list-units: " + listErr.Error()})
 	default:
@@ -124,10 +144,12 @@ func (c *Collector) Collect(parent context.Context) (collect.Data, error) {
 			case showErr != nil:
 				diagnostics = append(diagnostics, model.CollectionStatus{Status: "unavailable", Detail: "show: " + showErr.Error()})
 			default:
-				restarts = parseRestarts(string(showOutput))
 				showText := string(showOutput)
-				recentStarts = recentUnitStarts(parseActiveEnterTimestamps(showText), time.Now())
-				failedSince = parseUnitTimestamps(showText, "StateChangeTimestamp")
+				restarts = parseRestarts(showText)
+				if full {
+					recentStarts = recentUnitStarts(parseActiveEnterTimestamps(showText), time.Now())
+					failedSince = parseUnitTimestamps(showText, "StateChangeTimestamp")
+				}
 			}
 		}
 	}
@@ -217,34 +239,51 @@ func parseActiveEnterTimestamps(output string) map[string]time.Time {
 
 func parseUnitTimestamps(output, property string) map[string]time.Time {
 	result := make(map[string]time.Time)
-	var currentID string
-	for _, line := range strings.Split(output, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			currentID = ""
+	for _, block := range showBlocks(output) {
+		id, value := block["Id"], block[property]
+		if id == "" || value == "" {
 			continue
 		}
-		key, value, ok := strings.Cut(line, "=")
-		if !ok {
+		fields := strings.Fields(value)
+		if len(fields) < 3 {
 			continue
 		}
-		switch key {
-		case "Id":
-			currentID = value
-		case property:
-			if currentID == "" || value == "" {
-				continue
-			}
-			fields := strings.Fields(value)
-			if len(fields) < 3 {
-				continue
-			}
-			if t, err := time.ParseInLocation(activeEnterLayout, strings.Join(fields[:3], " "), time.Local); err == nil {
-				result[currentID] = t
-			}
+		if t, err := time.ParseInLocation(activeEnterLayout, strings.Join(fields[:3], " "), time.Local); err == nil {
+			result[id] = t
 		}
 	}
 	return result
+}
+
+// showBlocks splits `systemctl show <units...>` output into one key/value map
+// per unit. systemd separates units with a blank line but does not promise
+// any particular order for the properties within a block, and the previous
+// line-at-a-time readers required Id to arrive before the property they were
+// looking for: had systemd ever emitted NRestarts first, restart detection
+// would have returned an empty result on every run, with no error and no
+// diagnostic to show for it. Assembling the block first makes the position of
+// Id genuinely irrelevant, which is what the comments already claimed.
+func showBlocks(output string) []map[string]string {
+	var blocks []map[string]string
+	current := map[string]string{}
+	flush := func() {
+		if len(current) > 0 {
+			blocks = append(blocks, current)
+			current = map[string]string{}
+		}
+	}
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			flush()
+			continue
+		}
+		if key, value, ok := strings.Cut(line, "="); ok {
+			current[key] = value
+		}
+	}
+	flush()
+	return blocks
 }
 
 func runCommand(ctx context.Context, name string, args ...string) ([]byte, error) {
@@ -254,15 +293,24 @@ func runCommand(ctx context.Context, name string, args ...string) ([]byte, error
 
 // ParseFailedUnits parses the stable first column of `systemctl --failed`
 // output. Decorative headings and an empty result are ignored.
+//
+// The columns are UNIT, LOAD, ACTIVE, SUB, DESCRIPTION. Filtering on LOAD ==
+// "loaded" silently dropped genuinely failed units: a unit whose file was
+// removed or made invalid while it was failed reports LOAD=not-found (or
+// bad-setting) alongside ACTIVE=failed, and those are exactly the ones worth
+// surfacing. `--no-legend --plain` already removes the header and the status
+// bullet, and requiring a dot in the unit name rejects anything else, so the
+// LOAD column is not needed as a guard. ACTIVE is checked instead, which is
+// the state `--failed` actually selects on.
 func ParseFailedUnits(output string) []string {
 	units := make([]string, 0)
 	seen := make(map[string]struct{})
 	for _, line := range strings.Split(output, "\n") {
 		fields := strings.Fields(line)
-		if len(fields) < 2 || !strings.Contains(fields[0], ".") {
+		if len(fields) < 3 || !strings.Contains(fields[0], ".") {
 			continue
 		}
-		if fields[1] != "loaded" {
+		if fields[2] != "failed" {
 			continue
 		}
 		if _, exists := seen[fields[0]]; exists {
@@ -289,32 +337,18 @@ func parseUnitNames(output string) []string {
 }
 
 // parseRestarts reads `systemctl show <units...> --property=Id,NRestarts`
-// output: one block of "Key=Value" lines per unit, separated by a blank
-// line. Parsing by key rather than relying on the property order keeps this
-// resilient to systemd emitting properties in a different order.
+// output: one block of "Key=Value" lines per unit, separated by a blank line.
+// The block is assembled before either key is read, so the order systemd
+// happens to emit properties in cannot affect the result.
 func parseRestarts(output string) map[string]uint64 {
 	restarts := make(map[string]uint64)
-	var currentID string
-	for _, line := range strings.Split(output, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			currentID = ""
+	for _, block := range showBlocks(output) {
+		id := block["Id"]
+		if id == "" {
 			continue
 		}
-		key, value, ok := strings.Cut(line, "=")
-		if !ok {
-			continue
-		}
-		switch key {
-		case "Id":
-			currentID = value
-		case "NRestarts":
-			if currentID == "" {
-				continue
-			}
-			if n, err := strconv.ParseUint(value, 10, 64); err == nil {
-				restarts[currentID] = n
-			}
+		if n, err := strconv.ParseUint(block["NRestarts"], 10, 64); err == nil {
+			restarts[id] = n
 		}
 	}
 	return restarts

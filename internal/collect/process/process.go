@@ -24,6 +24,14 @@ type Process struct {
 	StartTimeTicks uint64
 	CPUFraction    float64
 	CPUAvailable   bool
+	// Own marks glimpse itself or one of its direct children. Optional
+	// integrations are executed concurrently with this scan, so a command that
+	// has exited but has not yet been reaped is legitimately in Z state, and a
+	// command blocked on failing hardware is legitimately in D state, for as
+	// long as the scan takes. Counting those as host faults made glimpse
+	// report its own subprocess handling as a finding -- observably so: the
+	// evidence line named glimpse as the zombie's parent.
+	Own bool
 }
 type Snapshot struct {
 	At                time.Time
@@ -108,6 +116,7 @@ func Collect(ctx context.Context, procRoot string, limit int) (Snapshot, error) 
 	if err != nil {
 		return Snapshot{}, err
 	}
+	self := os.Getpid()
 	pageSize := int64(os.Getpagesize())
 	var all []Process
 	summary := Snapshot{}
@@ -133,15 +142,20 @@ func Collect(ctx context.Context, procRoot string, limit int) (Snapshot, error) 
 		if parseErr != nil {
 			continue
 		}
+		p.Own = p.PID == self || p.ParentPID == self
 		summary.Processes++
-		switch p.State {
-		case 'R':
+		switch {
+		case p.State == 'R':
 			summary.Running++
-		case 'D':
+		// glimpse's own transient children are still processes on this host and
+		// stay in the total, but they are its own artifacts and must not feed
+		// the zombie or blocked-task counts that findings are derived from.
+		case p.Own:
+		case p.State == 'D':
 			summary.Blocked++
-		case 'Z':
+		case p.State == 'Z':
 			summary.Zombies++
-		case 'S', 'I':
+		case p.State == 'S' || p.State == 'I':
 			summary.Sleeping++
 		}
 		all = append(all, p)

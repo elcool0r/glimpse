@@ -69,6 +69,19 @@ func IsReal(m Mount) bool {
 	return m.Target != "" && !strings.HasPrefix(m.Target, "/proc/") && !strings.HasPrefix(m.Target, "/sys/")
 }
 
+// mountKey identifies the filesystem a mount exposes. It falls back to the
+// mount point when the source did not supply a device ID, which keeps
+// hand-built test fixtures and any future non-mountinfo source working
+// exactly as they did before.
+func mountKey(m Mount) string {
+	if m.DeviceID == "" {
+		return targetKey(m)
+	}
+	return "dev\x00" + m.DeviceID + "\x00" + m.Root
+}
+
+func targetKey(m Mount) string { return "target\x00" + m.Target }
+
 // Statfs can block on network and FUSE filesystems, so only known local types
 // are queried during a bounded health snapshot.
 var localTypes = map[string]struct{}{
@@ -108,6 +121,14 @@ func collectWithStatfsWithExclusions(ctx context.Context, procRoot string, statf
 	if err != nil {
 		return nil, nil, err
 	}
+	// Deduplication is by underlying filesystem, not by mount point. statfs
+	// returns identical capacity for every bind mount of one device, so keying
+	// on Target turned a single full device bind-mounted at three paths into
+	// three independent "filesystem nearly full" criticals that read like
+	// three separate problems. The device identity is mountinfo's
+	// major:minor plus the mounted subtree: two bind mounts of different
+	// subdirectories of one filesystem still share its capacity, while the
+	// same path seen twice is the same mount.
 	seen := make(map[string]struct{})
 	result := make([]Usage, 0, len(mounts))
 	excludedTypes := make(map[string]int)
@@ -122,10 +143,20 @@ func collectWithStatfsWithExclusions(ctx context.Context, procRoot string, statf
 			excludedTypes[mount.Type]++
 			continue
 		}
-		if _, ok := seen[mount.Target]; ok {
+		if _, ok := seen[mountKey(mount)]; ok {
 			continue
 		}
-		seen[mount.Target] = struct{}{}
+		// statfs is keyed on the path, so a target that appears twice (a
+		// stacked mount, as /dev/shm and /dev/pts commonly are) can only ever
+		// return one answer -- the topmost mount's -- however many devices are
+		// layered there. Both keys are needed: the device key collapses bind
+		// mounts of one filesystem, and the target key collapses stacked
+		// mounts of different filesystems.
+		if _, ok := seen[targetKey(mount)]; ok {
+			continue
+		}
+		seen[mountKey(mount)] = struct{}{}
+		seen[targetKey(mount)] = struct{}{}
 		var st syscall.Statfs_t
 		if err := statfs(mount.Target, &st); err != nil {
 			continue

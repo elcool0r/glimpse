@@ -16,12 +16,16 @@ jobs:
       matrix:
         goarch: [amd64, arm64]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: "1.24"
           check-latest: true
+          # glimpse has no module dependencies, so there is no go.sum for
+          # setup-go to hash. Leaving its cache on made every run log a
+          # "Dependencies file is not found" warning while caching nothing.
+          cache: false
 
       # Runs natively on the runner's own architecture (amd64), regardless of
       # which arch this matrix leg is cross-compiling for below -- a cross-
@@ -51,7 +55,7 @@ jobs:
           mkdir -p dist
           go build -trimpath -ldflags="-s -w" -o "dist/glimpse-linux-${{ matrix.goarch }}" ./cmd/glimpse
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-linux-${{ matrix.goarch }}
           path: dist/glimpse-linux-${{ matrix.goarch }}
@@ -61,15 +65,38 @@ jobs:
     name: Publish release
     needs: build
     runs-on: ubuntu-latest
+    # id-token is required to sign the build provenance attestation;
+    # attestations is what records it against this repository.
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: release-linux-*
           path: dist
           merge-multiple: true
 
+      # The README tells users to curl a binary into /usr/local/bin with sudo,
+      # and the result is frequently run as root. Without a published digest
+      # there is no way for them to tell a genuine artifact from a substituted
+      # one, so ship the checksums alongside the binaries.
+      - name: Generate checksums
+        working-directory: dist
+        run: sha256sum glimpse-linux-* > SHA256SUMS
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: dist/glimpse-linux-*
+
+      # Third-party actions are pinned to a commit, because a tag they control
+      # can be moved to point at anything. GitHub-owned actions/* above track a
+      # major tag instead: they share the runner's trust domain, so pinning
+      # them buys little, and a stale pin is its own failure mode.
       - name: Create GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@72f2c25fcb47643c292f7107632f7a47c1df5cd8 # v2.3.2
         with:
           files: dist/*
           generate_release_notes: true

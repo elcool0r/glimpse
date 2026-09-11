@@ -65,7 +65,19 @@ type runtimeCommand struct {
 	path string
 }
 
+// Collect observes both runtimes in full. It is the BoundaryFinal behaviour;
+// callers that go through the sampling lifecycle reach CollectAt instead.
 func (c *Collector) Collect(parent context.Context) (collect.Data, error) {
+	return c.CollectAt(parent, collect.BoundaryFinal)
+}
+
+// CollectAt skips log collection at the baseline boundary. Delta reads only
+// the restart counters from the first observation, so everything else the
+// baseline gathers is discarded by merge -- and reading up to maxLogContainers
+// container logs is by far the most expensive thing this collector does
+// (logTotalTimeout alone is 16s). Doing it twice could add more wall time than
+// the entire default sampling window, for evidence that is then thrown away.
+func (c *Collector) CollectAt(parent context.Context, boundary collect.Boundary) (collect.Data, error) {
 	lookup := c.lookPath
 	if lookup == nil {
 		lookup = exec.LookPath
@@ -105,6 +117,7 @@ func (c *Collector) Collect(parent context.Context) (collect.Data, error) {
 	// unexamined on hosts that run both engines.
 	remainingLogContainers := maxLogContainers
 	remainingLogBudget := logTotal
+	collectLogs := boundary == collect.BoundaryFinal
 	for runtimeIndex, runtimeCommand := range runtimes {
 		runtime := runtimeCommand.name
 		path := runtimeCommand.path
@@ -150,7 +163,7 @@ func (c *Collector) Collect(parent context.Context) (collect.Data, error) {
 		// even when a runtime is under load or its log storage is slow.
 		remainingRuntimes := len(runtimes) - runtimeIndex
 		logsChecked, logsAttempted := 0, 0
-		if remainingLogContainers > 0 && remainingLogBudget > 0 {
+		if collectLogs && remainingLogContainers > 0 && remainingLogBudget > 0 {
 			// Ceiling division reserves at least an equal share for every later
 			// runtime. The final runtime receives the remainder.
 			logLimit := (remainingLogContainers + remainingRuntimes - 1) / remainingRuntimes
@@ -159,8 +172,10 @@ func (c *Collector) Collect(parent context.Context) (collect.Data, error) {
 				logBudget = remainingLogBudget
 			}
 			logCtx, logCancel := context.WithTimeout(parent, logBudget)
+			logStarted := time.Now()
 			outcome := c.collectLogs(logCtx, runLogs, runtime, endpoint, path, containers, logLimit)
 			logCancel()
+			logElapsed := time.Since(logStarted)
 			logsChecked, logsAttempted = outcome.read, outcome.attempted
 			// A container whose logs could not be read has not been checked.
 			// Counting it as checked claimed coverage that did not exist.
@@ -171,7 +186,13 @@ func (c *Collector) Collect(parent context.Context) (collect.Data, error) {
 				diagnostics = append(diagnostics, model.CollectionStatus{Collector: c.Name(), Status: "unavailable", Detail: fmt.Sprintf("%s logs truncated at %d KiB for %d container(s); evidence may be incomplete", runtime, maxLogBytes>>10, outcome.truncated)})
 			}
 			remainingLogContainers -= logsAttempted
-			remainingLogBudget -= logBudget
+			// Charge what this runtime actually spent, not the share it was
+			// offered: a fast first runtime must not deprive the second one of
+			// budget it never needed.
+			if logElapsed > logBudget {
+				logElapsed = logBudget
+			}
+			remainingLogBudget -= logElapsed
 		}
 		if parent.Err() != nil {
 			return collect.Data{Containers: result, Snapshot: snapshot{restarts: restarts}, Diagnostics: diagnostics}, parent.Err()
@@ -184,7 +205,7 @@ func (c *Collector) Collect(parent context.Context) (collect.Data, error) {
 			Runtime: runtime, Containers: containers,
 			ContainersDiscovered: discovered, ContainersInspected: len(ids), ContainerInspectionLimited: inspectionLimited,
 			LogsChecked: logsChecked, LogCandidates: logCandidates,
-			LogWindow: "last hour", LogCheckLimited: logsChecked < logCandidates,
+			LogWindow: "last hour", LogCheckLimited: collectLogs && logsChecked < logCandidates,
 		})
 	}
 	// Missing runtimes are normal on a host that uses the other engine. Only
@@ -536,14 +557,14 @@ type logPattern struct {
 // application error/failure messages. Generic matches are filtered for common
 // success phrases such as "completed without error" below.
 var containerLogPatterns = []logPattern{
-	{kind: "oom", match: regexp.MustCompile(`(?i)\b(?:out of memory|oom[- ]kill(?:ed)?|cannot allocate memory)\b`)},
-	{kind: "panic", match: regexp.MustCompile(`(?i)(?:\bpanic:|\bfatal error:)`)},
-	{kind: "segmentation_fault", match: regexp.MustCompile(`(?i)\b(?:segmentation fault|sigsegv)\b`)},
-	{kind: "uncaught_exception", match: regexp.MustCompile(`(?i)\b(?:uncaught exception|traceback \(most recent call last\))`)},
-	{kind: "data_corruption", match: regexp.MustCompile(`(?i)\b(?:database corruption|corrupt(?:ed)? (?:database|data|file))\b`)},
-	{kind: "read_only_filesystem", match: regexp.MustCompile(`(?i)\bread-only file system\b`)},
-	{kind: "failure", match: regexp.MustCompile(`(?i)\b(?:failed|failure|failures)\b`)},
-	{kind: "error", match: regexp.MustCompile(`(?i)\berrors?\b`)},
+	{kind: model.LogKindOOM, match: regexp.MustCompile(`(?i)\b(?:out of memory|oom[- ]kill(?:ed)?|cannot allocate memory)\b`)},
+	{kind: model.LogKindPanic, match: regexp.MustCompile(`(?i)(?:\bpanic:|\bfatal error:)`)},
+	{kind: model.LogKindSegmentationFault, match: regexp.MustCompile(`(?i)\b(?:segmentation fault|sigsegv)\b`)},
+	{kind: model.LogKindUncaughtException, match: regexp.MustCompile(`(?i)\b(?:uncaught exception|traceback \(most recent call last\))`)},
+	{kind: model.LogKindDataCorruption, match: regexp.MustCompile(`(?i)\b(?:database corruption|corrupt(?:ed)? (?:database|data|file))\b`)},
+	{kind: model.LogKindReadOnlyFilesystem, match: regexp.MustCompile(`(?i)\bread-only file system\b`)},
+	{kind: model.LogKindFailure, match: regexp.MustCompile(`(?i)\b(?:failed|failure|failures)\b`)},
+	{kind: model.LogKindError, match: regexp.MustCompile(`(?i)\berrors?\b`)},
 }
 
 var benignGenericLogPatterns = []*regexp.Regexp{
@@ -582,7 +603,7 @@ func ClassifyLogEventsAt(text string, collectedAt time.Time) []model.LogEvent {
 			if !pattern.match.MatchString(messageLine) {
 				continue
 			}
-			if (pattern.kind == "error" || pattern.kind == "failure") && benignGenericLogLine(messageLine) {
+			if (pattern.kind == model.LogKindError || pattern.kind == model.LogKindFailure) && benignGenericLogLine(messageLine) {
 				break
 			}
 			message := truncateLogLine(messageLine)

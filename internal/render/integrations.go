@@ -159,7 +159,7 @@ func renderIntegrations(w io.Writer, width int, r model.Report, separator string
 				}
 				checkLine(w, width, "    ", "Data integrity", errorsSeverity, color, errorsDetail)
 				for _, vdev := range pool.VdevErrors {
-					vdevDetail := fmt.Sprintf("%s: read %d%swrite %d%schecksum %d", vdev.State, vdev.ReadErrors, separator, vdev.WriteErrors, separator, vdev.ChecksumErrors)
+					vdevDetail := fmt.Sprintf("%s: read %d%swrite %d%schecksum %d", cleanText(vdev.State), vdev.ReadErrors, separator, vdev.WriteErrors, separator, vdev.ChecksumErrors)
 					if vdev.Approximate {
 						vdevDetail += separator + "approximate counters"
 					}
@@ -342,7 +342,7 @@ func renderIntegrations(w io.Writer, width int, r model.Report, separator string
 			if verbose {
 				dnsDetail := dnsText
 				if dnsSeverity == model.SeverityOK && state.DNS != nil && len(state.DNS.Nameservers) > 0 {
-					dnsDetail = "Nameservers: " + strings.Join(state.DNS.Nameservers, separator)
+					dnsDetail = "Nameservers: " + strings.Join(cleanTexts(state.DNS.Nameservers), separator)
 				}
 				checkLine(w, width, "    ", "DNS configured", dnsSeverity, color, dnsDetail)
 				routesSeverity := model.SeverityInfo
@@ -405,9 +405,9 @@ func renderIntegrations(w io.Writer, width int, r model.Report, separator string
 						return "no local nameserver configured"
 					}
 					if result.Resolved {
-						return fmt.Sprintf("resolved %s via %s in %.0fms", result.Domain, result.Server, result.LatencyMillis)
+						return fmt.Sprintf("resolved %s via %s in %.0fms", cleanText(result.Domain), cleanText(result.Server), result.LatencyMillis)
 					}
-					return fmt.Sprintf("failed to resolve %s via %s: %s", result.Domain, result.Server, result.Error)
+					return fmt.Sprintf("failed to resolve %s via %s: %s", cleanText(result.Domain), cleanText(result.Server), cleanText(result.Error))
 				}
 				checkLine(w, width, "    ", "Local resolution", localSeverity, color, detail(resolution.Local))
 				checkLine(w, width, "    ", "External resolution", externalSeverity, color, detail(resolution.External))
@@ -511,13 +511,13 @@ func renderIntegrations(w io.Writer, width int, r model.Report, separator string
 						return "not attempted"
 					}
 					if result.Succeeded {
-						detail := fmt.Sprintf("%s -> %d in %.0fms", result.URL, result.StatusCode, result.LatencyMillis)
+						detail := fmt.Sprintf("%s -> %d in %.0fms", cleanText(result.URL), result.StatusCode, result.LatencyMillis)
 						if result.ProxyUsed {
 							detail += separator + "proxy used"
 						}
 						return detail
 					}
-					return fmt.Sprintf("%s failed: %s", result.URL, result.Error)
+					return fmt.Sprintf("%s failed: %s", cleanText(result.URL), cleanText(result.Error))
 				}
 				checkLine(w, width, "    ", "HTTP", httpSeverity, color, detail(check.HTTP))
 				checkLine(w, width, "    ", "HTTPS", httpsSeverity, color, detail(check.HTTPS))
@@ -601,7 +601,7 @@ func renderIntegrations(w io.Writer, width int, r model.Report, separator string
 						holders = append(holders, fmt.Sprintf("%s (pid %d, fd %s)", cleanText(name), h.PID, strings.Join(h.FDs, ",")))
 					}
 					detail := fmt.Sprintf("%s at %s -- held by %s", size(f.Bytes), cleanText(f.Path), strings.Join(holders, "; "))
-					checkLine(w, width, "    ", fmt.Sprintf("dev %s inode %d", f.Device, f.Inode), severity, color, detail)
+					checkLine(w, width, "    ", fmt.Sprintf("dev %s inode %d", cleanText(f.Device), f.Inode), severity, color, detail)
 				}
 			}
 		}
@@ -652,7 +652,7 @@ func renderIntegrations(w io.Writer, width int, r model.Report, separator string
 					if count > 0 {
 						detail = fmt.Sprintf("%d match(es)", count)
 					}
-					checkLine(w, width, "    ", strings.ReplaceAll(kind, "_", " "), lineSeverity, color, detail)
+					checkLine(w, width, "    ", cleanText(strings.ReplaceAll(kind, "_", " ")), lineSeverity, color, detail)
 				}
 				// Any kind the collector reports that this renderer does not yet
 				// know about still needs to be visible rather than silently dropped.
@@ -662,7 +662,10 @@ func renderIntegrations(w io.Writer, width int, r model.Report, separator string
 				}
 				sort.Strings(unknown)
 				for _, kind := range unknown {
-					checkLine(w, width, "    ", strings.ReplaceAll(kind, "_", " "), findingSeverity(r.Findings, "kernel-"+kind), color, fmt.Sprintf("%d match(es)", counts[kind]))
+					// The collector's kind vocabulary is fixed, but an unknown kind
+					// reaching here means it came from somewhere this renderer does
+					// not control, so it is treated as untrusted text.
+					checkLine(w, width, "    ", cleanText(strings.ReplaceAll(kind, "_", " ")), findingSeverity(r.Findings, "kernel-"+kind), color, fmt.Sprintf("%d match(es)", counts[kind]))
 				}
 			}
 		}
@@ -853,14 +856,9 @@ func securityCheckSeverity(r model.Report, security *model.Security) model.Sever
 	return severity
 }
 
-func cgroupValid(valid *bool) bool { return valid == nil || *valid }
+func cgroupValid(valid *bool) bool { return model.Measured(valid) }
 
-func zfsPoolHasErrors(pool model.ZFSPool) bool {
-	if pool.ReadErrors > 0 || pool.WriteErrors > 0 || pool.ChecksumErrors > 0 {
-		return true
-	}
-	return zfsVdevHasErrors(pool.VdevErrors)
-}
+func zfsPoolHasErrors(pool model.ZFSPool) bool { return pool.HasErrors() }
 
 func zfsVdevHasErrors(vdevs []model.ZFSVdevError) bool {
 	for _, vdev := range vdevs {
@@ -872,12 +870,7 @@ func zfsVdevHasErrors(vdevs []model.ZFSVdevError) bool {
 }
 
 func zfsVdevApproximate(vdevs []model.ZFSVdevError) bool {
-	for _, vdev := range vdevs {
-		if vdev.Approximate {
-			return true
-		}
-	}
-	return false
+	return model.ZFSPool{VdevErrors: vdevs}.HasApproximateVdev()
 }
 
 // kernelPatternKinds mirrors the pattern kinds kernel.eventKind can return, so

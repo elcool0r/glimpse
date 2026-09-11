@@ -3,8 +3,9 @@
 // collector sends real queries to real servers -- one to whatever the host
 // has configured as its local nameserver, and one to the external resolver
 // at 1.1.1.1. Because that means outbound network contact, including to the
-// public internet, this collector only ever runs when the user explicitly
-// opts in (--check-dns-resolution); it is never part of the default profile.
+// public internet, it belongs to the active-check profile: like the other
+// active checks it is on by default and --disable-external-checks turns the
+// whole group off.
 package dnsresolution
 
 import (

@@ -352,7 +352,7 @@ func Write(w io.Writer, r model.Report, o Options) {
 				writeWrapped(w, width, "    ", metadata(fmt.Sprintf("Event: %s", f.EventTime.Local().Format("2006-01-02 15:04:05")), o.Color))
 			}
 			if f.DiagnosticCommand != "" {
-				writeWrapped(w, width, "    ", diagnosticCommand(f.DiagnosticCommand, o.Color))
+				writeWrapped(w, width, "    ", diagnosticCommand(cleanText(f.DiagnosticCommand), o.Color))
 			}
 		}
 	} else if r.Score.Status != model.SeverityUnknown && len(infoFindings) == 0 {
@@ -511,6 +511,13 @@ func metadata(text string, color bool) string {
 	return "\x1b[34m" + text + "\x1b[0m"
 }
 
+// diagnosticCommand renders the suggested next step. The command text is
+// assembled by the analyzer from host-supplied names -- mount points, unit
+// names, container names, pool names -- so callers must pass it through
+// cleanText first: the kernel escapes only space, tab, newline and backslash
+// in /proc/self/mountinfo, so a raw ESC in a directory name reaches this
+// string intact, and an unescaped newline breaks the indent writeWrapped
+// maintains.
 func diagnosticCommand(cmd string, color bool) string {
 	label := "Diagnostic: "
 	if !color {
@@ -828,13 +835,11 @@ func busiestNetwork(interfaces []model.Network) model.Network {
 
 // intervalSampled keeps reports produced before R10 compatible: only an
 // explicit false means the counter interval was unavailable.
-func intervalSampled(sampled *bool) bool { return sampled == nil || *sampled }
+func intervalSampled(sampled *bool) bool { return model.IntervalSampled(sampled) }
 
 // memoryAvailable keeps reports encoded before R21 compatible: only an
 // explicit false means MemAvailable was unavailable.
-func memoryAvailable(memory *model.Memory) bool {
-	return memory.AvailableValid == nil || *memory.AvailableValid
-}
+func memoryAvailable(memory *model.Memory) bool { return memory.MemoryAvailableMeasured() }
 
 func memorySummary(memory *model.Memory, separator string) string {
 	if !memoryAvailable(memory) {
@@ -921,7 +926,15 @@ func taskCeiling(resources *model.Resources) uint64 {
 	}
 }
 
+// writeWrapped is the single sink for every line this package emits, which is
+// what makes it the right place to enforce sanitization. Applying cleanText at
+// each call site instead left one path unprotected out of roughly sixty -- the
+// "Diagnostic:" line, printed for every WARN and CRIT finding, whose text the
+// analyzer assembles from mount points, unit names, container names and pool
+// names. A field added later would have needed someone to remember; here it is
+// covered by construction.
 func writeWrapped(w io.Writer, width int, indent, text string) {
+	text = SafeDisplay(text)
 	available := width - displayWidth(indent)
 	if available < 1 {
 		available = 1
@@ -1009,7 +1022,72 @@ func SafeText(s string) string {
 	return strings.TrimSpace(b.String())
 }
 
+// SafeDisplay sanitizes a line that may legitimately contain the renderer's
+// own color codes. It keeps well-formed SGR sequences (ESC [ digits/; m) --
+// the only escape this package emits -- and applies SafeText's rules to
+// everything else, so host-supplied text cannot smuggle a cursor-movement or
+// screen-clearing sequence in alongside them.
+func SafeDisplay(s string) string {
+	if !strings.ContainsFunc(s, needsSanitizing) {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); {
+		if length, ok := sgrSequence(s[i:]); ok {
+			b.WriteString(s[i : i+length])
+			i += length
+			continue
+		}
+		r, size := utf8.DecodeRuneInString(s[i:])
+		i += size
+		switch {
+		case r == '\n' || r == '\r' || r == '\t':
+			b.WriteByte(' ')
+		case unicode.IsControl(r) || unicode.Is(unicode.Cf, r):
+			b.WriteRune('\ufffd')
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+func needsSanitizing(r rune) bool {
+	return unicode.IsControl(r) || unicode.Is(unicode.Cf, r)
+}
+
+// sgrSequence reports the length of a leading "ESC [ <digits and semicolons> m"
+// sequence. Anything else beginning with ESC is not something this package
+// wrote and is sanitized like any other control character.
+func sgrSequence(s string) (int, bool) {
+	if !strings.HasPrefix(s, "\x1b[") {
+		return 0, false
+	}
+	for i := 2; i < len(s) && i <= 12; i++ {
+		switch {
+		case s[i] == 'm':
+			return i + 1, true
+		case s[i] == ';' || (s[i] >= '0' && s[i] <= '9'):
+		default:
+			return 0, false
+		}
+	}
+	return 0, false
+}
+
 func cleanText(s string) string { return SafeText(s) }
+
+// cleanTexts sanitizes a list before it is joined for display. Joining first
+// and sanitizing the result would also work, but sanitizing the elements keeps
+// the separator out of the hostile text's reach.
+func cleanTexts(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		out = append(out, SafeText(value))
+	}
+	return out
+}
 
 func displayWidth(s string) int {
 	w := 0

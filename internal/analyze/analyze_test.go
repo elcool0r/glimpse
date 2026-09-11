@@ -261,7 +261,7 @@ func TestPackageManagerRebootFindingIsRecommended(t *testing.T) {
 	required := true
 	report := model.Report{Metrics: model.Metrics{Security: &model.Security{RebootRequired: &required, RebootFromPackages: true}}}
 	findings := AnalyzeSecurity(&report)
-	if len(findings) != 1 || findings[0].Title != "recommended Reboot is pending" {
+	if len(findings) != 1 || findings[0].Title != "Reboot is recommended by a pending package" {
 		t.Fatalf("unexpected reboot finding: %+v", findings)
 	}
 }
