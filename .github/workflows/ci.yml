@@ -14,12 +14,16 @@ jobs:
     name: Test & vet
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: "1.24"
           check-latest: true
+          # glimpse has no module dependencies, so there is no go.sum for
+          # setup-go to hash. Leaving its cache on made every run log a
+          # "Dependencies file is not found" warning while caching nothing.
+          cache: false
 
       - name: Check formatting
         run: |
@@ -51,12 +55,16 @@ jobs:
       GOARCH: ${{ matrix.goarch }}
       CGO_ENABLED: 0
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: "1.24"
           check-latest: true
+          # glimpse has no module dependencies, so there is no go.sum for
+          # setup-go to hash. Leaving its cache on made every run log a
+          # "Dependencies file is not found" warning while caching nothing.
+          cache: false
 
       - name: Build glimpse (linux/${{ matrix.goarch }})
         run: go build -trimpath -ldflags="-s -w" -o "glimpse-linux-${{ matrix.goarch }}" ./cmd/glimpse

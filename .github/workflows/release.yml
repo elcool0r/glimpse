@@ -16,12 +16,16 @@ jobs:
       matrix:
         goarch: [amd64, arm64]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: "1.24"
           check-latest: true
+          # glimpse has no module dependencies, so there is no go.sum for
+          # setup-go to hash. Leaving its cache on made every run log a
+          # "Dependencies file is not found" warning while caching nothing.
+          cache: false
 
       # Runs natively on the runner's own architecture (amd64), regardless of
       # which arch this matrix leg is cross-compiling for below -- a cross-
@@ -83,10 +87,14 @@ jobs:
         run: sha256sum glimpse-linux-* > SHA256SUMS
 
       - name: Attest build provenance
-        uses: actions/attest-build-provenance@977bb373b6df2d78c99998eaad6a4d9d3e72806d # v2.4.0
+        uses: actions/attest-build-provenance@v3
         with:
           subject-path: dist/glimpse-linux-*
 
+      # Third-party actions are pinned to a commit, because a tag they control
+      # can be moved to point at anything. GitHub-owned actions/* above track a
+      # major tag instead: they share the runner's trust domain, so pinning
+      # them buys little, and a stale pin is its own failure mode.
       - name: Create GitHub release
         uses: softprops/action-gh-release@72f2c25fcb47643c292f7107632f7a47c1df5cd8 # v2.3.2
         with:
