@@ -55,7 +55,7 @@ jobs:
           mkdir -p dist
           go build -trimpath -ldflags="-s -w" -o "dist/glimpse-linux-${{ matrix.goarch }}" ./cmd/glimpse
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-linux-${{ matrix.goarch }}
           path: dist/glimpse-linux-${{ matrix.goarch }}
@@ -72,7 +72,7 @@ jobs:
       id-token: write
       attestations: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: release-linux-*
           path: dist
